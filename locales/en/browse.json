@@ -343,6 +343,10 @@
     "value": "one more character",
     "description": "browse search one_more"
   },
+  "browse.search.press_ok": {
+    "value": "Press OK to type",
+    "description": "Hint beside the empty search field while it is focused but the TV keyboard is closed; OK is the remote's centre button"
+  },
   "browse.search.recents": {
     "value": "RECENT SEARCHES",
     "description": "browse search recents"

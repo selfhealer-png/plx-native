@@ -240,6 +240,20 @@ fn field<H: SearchLike>(screen: &SearchScreen, f: &mut DrawFrame<'_, '_, H>, p: 
                 0.0,
             );
         }
+        // Nothing on the page says the field is a field: it is bare type with no box, and the
+        // keyboard rises only on OK. Beside the placeholder, while focus rests on it, say so.
+        if press_ok_shown(blank, screen.editing, hot) {
+            let y = plx_gfx::text::baseline_y(theme::size::BODY, 0, theme::size::HERO, 1, text_y);
+            p.alpha(hot).text(
+                plx_platform::i18n::msg::browse_search_press_ok_c().as_ptr(),
+                rect.x + run_dx + data.run_w + GHOST_GAP,
+                y,
+                theme::size::BODY,
+                theme::TEXT_SECONDARY,
+                0,
+                0,
+            );
+        }
         if ghost_shown(&data.query) {
             let y = plx_gfx::text::baseline_y(theme::size::BODY, 0, theme::size::HERO, 1, text_y);
             p.text(
@@ -474,6 +488,11 @@ fn run_caret_w(blank: bool, head_w: f32) -> f32 {
     } else {
         head_w
     }
+}
+
+/// The "Press OK to type" hint: an empty field that holds focus with the keyboard still down.
+fn press_ok_shown(blank: bool, editing: bool, hot: f32) -> bool {
+    blank && !editing && hot > 0.0
 }
 
 fn ghost_shown(q: &str) -> bool {
@@ -796,6 +815,15 @@ mod tests {
         assert!(!caret_shown(true, false));
         assert!(!caret_shown(false, true));
         assert!(!caret_shown(false, false));
+    }
+
+    #[test]
+    fn the_press_ok_hint_shows_only_on_a_focused_empty_field_with_the_keyboard_down() {
+        assert!(press_ok_shown(true, false, 1.0));
+        assert!(press_ok_shown(true, false, 0.4), "it fades in with focus");
+        assert!(!press_ok_shown(true, true, 1.0), "the keyboard is already up");
+        assert!(!press_ok_shown(false, false, 1.0), "a typed query replaces the placeholder");
+        assert!(!press_ok_shown(true, false, 0.0), "focus is elsewhere on the page");
     }
 
     #[test]
