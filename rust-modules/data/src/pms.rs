@@ -802,7 +802,115 @@ fn fetch_source(c: &plx_plex::plex::Client, sid: ServerId) -> Option<SourceBuild
     // THIS SOURCE (`?`) — nothing of it commits and it retries on its own backoff. Losing the most
     // important shelf to a transient error would be worse than briefly showing the previous one.
     let cw = c.continue_watching(HUB_FETCH_COUNT)?;
-    Some(project(&mc, &cw, sid))
+    let mut build = project(&mc, &cw, sid);
+    // The Watchlist leads this source's shelves when the account has one and this server holds
+    // any of it. Unlike Continue Watching its failure costs only the shelf, never the source.
+    if let Some(shelf) = watchlist_shelf(c, sid) {
+        build.shelves.insert(0, shelf);
+    }
+    Some(build)
+}
+
+/// How long one Watchlist answer, and one server's matches against it, are reused. Home refetches
+/// after every playback; the Watchlist changes on a phone, rarely, and each match is a request.
+#[cfg(not(any(test, feature = "test-support")))]
+const WATCHLIST_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The account's Watchlist as join guids, newest first, keyed on the token it was fetched with so a
+/// profile switch never reads the previous profile's list.
+#[cfg(not(any(test, feature = "test-support")))]
+static WATCHLIST: LazyLock<Mutex<Option<(String, std::time::Instant, Arc<Vec<String>>)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Each server's last Watchlist shelf, against the list it was matched from (`Arc` identity).
+#[cfg(not(any(test, feature = "test-support")))]
+type WatchlistMatch = (std::time::Instant, Arc<Vec<String>>, Option<Shelf>);
+#[cfg(not(any(test, feature = "test-support")))]
+static WATCHLIST_SHELVES: LazyLock<Mutex<std::collections::HashMap<ServerId, WatchlistMatch>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// WORKER THREAD: the account's Watchlist, from the cache while it is fresh. `None` without a
+/// plex.tv account token (a server-token boot has no Watchlist to read) or on a failed fetch.
+#[cfg(not(any(test, feature = "test-support")))]
+fn watchlist_guids() -> Option<Arc<Vec<String>>> {
+    let s = plx_plex::plex::session::peek();
+    if s.account_token.is_empty() {
+        return None;
+    }
+    let mut cache = WATCHLIST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((tok, at, list)) = cache.as_ref() {
+        if *tok == s.account_token && at.elapsed() < WATCHLIST_TTL {
+            return Some(Arc::clone(list));
+        }
+    }
+    let rows = plx_plex::plex::account::AccountClient::new(&s.client_id, Some(&s.account_token))
+        .watchlist(MAX_SHELF_ITEMS)?;
+    let list: Arc<Vec<String>> = Arc::new(
+        rows.iter().map(|r| r.join_guid()).filter(|g| !g.is_empty()).collect(),
+    );
+    *cache = Some((s.account_token.clone(), std::time::Instant::now(), Arc::clone(&list)));
+    Some(list)
+}
+
+/// WORKER THREAD: this server's Watchlist shelf — every Watchlist title it holds, in Watchlist
+/// order, as ordinary library rows (so a card opens the local detail page and plays). `None` when
+/// there is no Watchlist, it is empty, or this server holds none of it. A title this server does
+/// not hold is simply absent here; a friend's server that holds it contributes its own shelf.
+#[cfg(not(any(test, feature = "test-support")))]
+fn watchlist_shelf(c: &plx_plex::plex::Client, sid: ServerId) -> Option<Shelf> {
+    let list = watchlist_guids()?;
+    {
+        let memo = WATCHLIST_SHELVES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, from, shelf)) = memo.get(&sid) {
+            if Arc::ptr_eq(from, &list) && at.elapsed() < WATCHLIST_TTL {
+                return shelf.clone();
+            }
+        }
+    }
+    let mut items = Vec::new();
+    let mut failed = 0usize;
+    for guid in list.iter() {
+        let Some(mc) = c.find_by_guid(guid) else {
+            failed += 1;
+            continue;
+        };
+        if let Some(m) = mc
+            .metadata
+            .iter()
+            .filter(|it| listable(&it.kind))
+            .map(|it| parse_item(it, sid))
+            .find(|m| !m.title.is_empty() && !m.thumb.is_empty())
+        {
+            items.push(Arc::new(m));
+        }
+    }
+    plx_base::eventlog::log(&format!(
+        "watchlist: source matched={} of {} failed={failed}",
+        items.len(),
+        list.len()
+    ));
+    let shelf = (!items.is_empty()).then(|| Shelf {
+        title: plx_platform::i18n::msg::browse_home_watchlist().to_string(),
+        hub_id: "home.watchlist".to_string(),
+        key: String::new(),
+        total: items.len(),
+        items,
+    });
+    // A pass in which every lookup failed says nothing about this server, so it is not memoised.
+    if failed < list.len() || list.is_empty() {
+        WATCHLIST_SHELVES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sid, (std::time::Instant::now(), Arc::clone(&list), shelf.clone()));
+    }
+    shelf
+}
+
+/// HOST SUITE: the Watchlist reaches plex.tv over libcurl, which the host test binary cannot link
+/// (the same cut `person::fetch_profile` makes). Every Home test therefore sees no Watchlist shelf.
+#[cfg(any(test, feature = "test-support"))]
+fn watchlist_shelf(_c: &plx_plex::plex::Client, _sid: ServerId) -> Option<Shelf> {
+    None
 }
 
 /// Project one source's `/hubs` + `/hubs/continueWatching` responses into its [`SourceBuild`].
