@@ -4425,6 +4425,7 @@ impl View for TransportButton {
         let id = match self.which {
             1 => Icon::Audio,
             2 => Icon::More,
+            3 => Icon::PlayNext,
             _ => Icon::Cc,
         };
         let s = (r.w * DISC_ICON_RATIO).round();

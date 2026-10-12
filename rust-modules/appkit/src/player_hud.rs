@@ -478,8 +478,64 @@ pub const CTRL_Y: f32 = BTN_Y;
 /// track and `…` panels were aligned to the same 80 (`track_menu`/`more_menu`). All three moved onto
 /// `MARGIN_X` together on 2026-08-23 — they are one right edge by design, so they take one number.
 pub const CTRL_RIGHT: f32 = SCR_W - plx_ui::consts::MARGIN_X;
-/// how many control discs the row holds: Subtitles, Audio, More
+/// how many control discs the row holds without Next episode: Subtitles, Audio, More. Next
+/// episode leads the row (one more) while the queue has a successor — a fourth disc the upstream
+/// product rules out (`ui/src/CLAUDE.md`, product idiom 3); this fork's owner asked for it.
 const BTN_N: i32 = 3;
+/// **What a disc POSITION is.** Positions run left to right and the focus row walks them in that
+/// order (`GroupKind::Row`), so Next episode, drawn leftmost, must be position 0 when it is there
+/// and every other disc moves one along. Everything that turns a position into a meaning (the
+/// glyph, OK) asks [`disc_at`] rather than assuming 0 = Subtitles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Disc {
+    Next,
+    Subtitles,
+    Audio,
+    More,
+}
+
+impl Disc {
+    /// The glyph id [`plx_ui::widgets::TransportButton`] draws: 0 Cc, 1 Audio, 2 More, 3 Next.
+    fn glyph(self) -> i32 {
+        match self {
+            Disc::Subtitles => 0,
+            Disc::Audio => 1,
+            Disc::More => 2,
+            Disc::Next => 3,
+        }
+    }
+}
+
+thread_local! {
+    /// Whether the row leads with Next episode — `route::up_next` as [`slot`] last sampled it. The
+    /// frame samples it once beside the slot, so the draw, the focus stops and OK agree. Per
+    /// thread because the HUD lives on the UI thread and host tests each run on their own.
+    static NEXT_DISC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Does the disc row lead with Next episode this frame?
+pub fn next_disc() -> bool {
+    NEXT_DISC.with(|c| c.get())
+}
+
+/// How many discs the row holds this frame.
+fn disc_count() -> i32 {
+    BTN_N + i32::from(next_disc())
+}
+
+/// What sits at disc position `pos` this frame, or `None` past the last.
+pub fn disc_at(pos: i32) -> Option<Disc> {
+    let lead = i32::from(next_disc());
+    if lead == 1 && pos == 0 {
+        return Some(Disc::Next);
+    }
+    match pos - lead {
+        0 => Some(Disc::Subtitles),
+        1 => Some(Disc::Audio),
+        2 => Some(Disc::More),
+        _ => None,
+    }
+}
 
 /// The CONTROL ROW's focus pop — one spring per item ([`plx_ui::widgets::CtlPop`]), so the
 /// control being left shrinks while the arriving one grows instead of both snapping.
@@ -494,6 +550,9 @@ const BTN_N: i32 = 3;
 /// — it is drawn entirely from the caller's arguments — so this and the resume clock beside it are
 /// the whole of the route's retained motion state, and phase 9 gave them the one owner the rest of
 /// the route already has.
+// Sized to the three discs, not four: the pop's springs are written into the player's canon
+// (`CtlPop::write_motion`), so a fourth would move every recorded player digest. With Next episode
+// leading, the rightmost position (More) answers `scale` 1.0 (no grow; the focus face still shows).
 pub type RowPop = plx_ui::widgets::CtlPop<{ BTN_N as usize }>;
 
 /// **Everything the transport row remembers between frames**: the control row's per-item focus pop
@@ -608,9 +667,8 @@ impl TransportRow {
     }
 }
 
-/// Index of the `…` overflow disc within the row — the LAST one. Exported because `app.rs` routes
-/// its OK and its click, and a second literal `2` over there is exactly the drift `ControlSlot`
-/// was introduced to stop.
+/// Index of the `…` overflow disc within the row WITHOUT Next episode — the last one. OK routes
+/// through [`disc_at`], which also knows when Next episode has moved it along.
 pub const BTN_MORE: i32 = BTN_N - 1;
 /// width the disc row occupies, the floor for anything replacing it
 pub const CTRL_ROW_W: f32 = 3.0 * BTN_S + 2.0 * BTN_GAP;
@@ -670,7 +728,7 @@ impl ControlSlot {
     /// a hand-written `btn = 0` pin beside a `clamp(0, 1)`.
     pub fn items(self) -> c_int {
         match self {
-            ControlSlot::Discs => BTN_N,
+            ControlSlot::Discs => disc_count(),
             // Watch Credits + Next Episode — the one stand-in with a pair
             ControlSlot::UpNext(_) => 2,
             ControlSlot::Skip(_) => 1,
@@ -683,6 +741,9 @@ impl ControlSlot {
     pub fn primary_btn(self) -> c_int {
         match self {
             ControlSlot::UpNext(_) => crate::up_next::PRIMARY_BTN,
+            // Subtitles, not Next episode: a row that appears must not park on the one disc whose
+            // OK leaves the episode.
+            ControlSlot::Discs => i32::from(next_disc()),
             _ => 0,
         }
     }
@@ -761,6 +822,7 @@ pub fn slot_for(marker: Option<plx_data::metadata::Marker>, has_next: bool, mode
 /// the same frame then declined to draw.
 pub fn slot(ps: &plx_media::route::PlaybackSession, meta: plx_data::metadata::MetadataView<'_>) -> ControlSlot {
     let has_next = plx_media::route::up_next(ps).is_some();
+    NEXT_DISC.with(|c| c.set(has_next));
     let mode = plx_media::route::next_episode_mode();
     // The data layer does not read the player: the playhead is sampled here, once, and handed in.
     let head = plx_data::metadata::Playhead {
@@ -1277,7 +1339,8 @@ pub fn disc_hit_rect(idx: i32) -> Rect {
 /// left *Watch Credits* (drawn left of it) unclickable and made a click on *Next Episode* land on
 /// item 0, *Watch Credits* (issue #162's audit).
 pub fn ctrl_row_hit_rect() -> Rect {
-    Rect::new(CTRL_RIGHT - CTRL_ROW_W, CTRL_Y, CTRL_ROW_W, CTRL_H)
+    let w = CTRL_ROW_W.max(CTRL_RIGHT - btn_x(0));
+    Rect::new(CTRL_RIGHT - w, CTRL_Y, w, CTRL_H)
 }
 
 /// One bottom tab's rect, matching the left-to-right layout [`draw_hud`] lays the pills out with.
@@ -1340,7 +1403,7 @@ fn draw_failed_readout(
 /// the existing ones left instead of moving the row's right margin, which is what keeps the discs
 /// and every stand-in (`ctrl_slot`) sharing one edge.
 fn btn_x(idx: i32) -> f32 {
-    CTRL_RIGHT - BTN_S - (BTN_N - 1 - idx) as f32 * (BTN_S + BTN_GAP)
+    CTRL_RIGHT - BTN_S - (disc_count() - 1 - idx) as f32 * (BTN_S + BTN_GAP)
 }
 
 /// which control button a pointer at (cx,cy) is over: 0 = Subtitles, 1 = Audio, 2 = More, or None.
@@ -1352,7 +1415,7 @@ pub fn icon_hit(slot: ControlSlot, cx: f32, cy: f32) -> Option<i32> {
     if !slot.is_discs() || cy < BTN_Y || cy > BTN_Y + BTN_S {
         return None;
     }
-    (0..BTN_N).find(|&idx| {
+    (0..disc_count()).find(|&idx| {
         let x = btn_x(idx);
         cx >= x && cx <= x + BTN_S
     })
@@ -1865,9 +1928,10 @@ pub fn draw_hud(
                 crate::skip_pill::draw(row, p, pr, focus == 1, measure);
             }
             ControlSlot::Discs => {
-                for i in 0..BTN_N {
+                for i in 0..disc_count() {
                     let pop = row.scale(i);
-                    TransportButton::new(i, Rect::new(btn_x(i), BTN_Y, BTN_S, BTN_S))
+                    let glyph = disc_at(i).map_or(0, Disc::glyph);
+                    TransportButton::new(glyph, Rect::new(btn_x(i), BTN_Y, BTN_S, BTN_S))
                         .focused(focus == 1 && btn == i)
                         // The whole control row stands on the VIDEO PLANE — see `ControlGround`. It is
                         // the HUD's own bottom ramp (drawn at the top of this function) that makes the
@@ -2137,6 +2201,33 @@ mod tests {
     /// The control row's precedence, which used to live in the ORDER of five separate if-chains
     /// across `player_hud` and `app.rs` — the draw, the OK handler, the pointer handler, the
     /// LEFT/RIGHT clamp and `icon_hit` — with nothing keeping them in step and nothing to test.
+    /// **Next episode leads the disc row while the queue has a successor**: it is position 0, the
+    /// three discs move one along and keep their meaning, the row stays right-anchored (More keeps
+    /// its edge), a row that appears parks on Subtitles, and every position hit-tests to itself.
+    #[test]
+    fn next_episode_leads_the_disc_row_only_while_one_is_queued() {
+        NEXT_DISC.with(|c| c.set(false));
+        assert_eq!(ControlSlot::Discs.items(), 3);
+        assert_eq!((disc_at(0), disc_at(2), disc_at(3)), (Some(Disc::Subtitles), Some(Disc::More), None));
+        let more_x = btn_x(2);
+
+        NEXT_DISC.with(|c| c.set(true));
+        assert_eq!(ControlSlot::Discs.items(), 4);
+        assert_eq!(
+            (0..4).map(disc_at).collect::<Vec<_>>(),
+            [Some(Disc::Next), Some(Disc::Subtitles), Some(Disc::Audio), Some(Disc::More)]
+        );
+        assert_eq!(btn_x(3), more_x, "More keeps the row's right edge");
+        assert!(btn_x(0) < btn_x(1), "Next episode is drawn left of Subtitles");
+        assert_eq!(ControlSlot::Discs.primary_btn(), 1, "the row parks on Subtitles, not Next");
+        let cy = BTN_Y + BTN_S * 0.5;
+        for i in 0..4 {
+            assert_eq!(icon_hit(ControlSlot::Discs, btn_x(i) + BTN_S * 0.5, cy), Some(i));
+        }
+        assert!(ctrl_row_hit_rect().x <= btn_x(0), "the group's extent covers the leading disc");
+        NEXT_DISC.with(|c| c.set(false));
+    }
+
     #[test]
     fn the_control_row_picks_the_most_specific_occupant() {
         // no segment under the playhead → the ordinary Subtitles + Audio pair

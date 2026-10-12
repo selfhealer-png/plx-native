@@ -1038,7 +1038,15 @@ pub(crate) unsafe fn activate_player_row(
             pages,
             bridge,
         );
-    } else if btn == plx_appkit::player_hud::BTN_MORE {
+    } else if plx_appkit::player_hud::disc_at(btn) == Some(plx_appkit::player_hud::Disc::Next) {
+        // The leading disc: start the queue's next episode now, through the same `play_up_next`
+        // the credits countdown uses. It closes the overlays and starts a new playback, so this
+        // press is done here.
+        if !play_up_next(ps, pa, HUD_LINGER_MS, pages, bridge) {
+            log("player: next episode asked for, none queued");
+        }
+        return;
+    } else if plx_appkit::player_hud::disc_at(btn) == Some(plx_appkit::player_hud::Disc::More) {
         // …so the discs are what row 1 holds — the complement of the arm above, and the row's only
         // other occupant. OK on a control disc PRESENTS its panel on this page's own stack.
         super::bridge::open_player_overlay(ps, bridge.metadata_view(), pages, plx_screens::player::overlay::OverlayKind::More { quality: false });
@@ -1047,7 +1055,9 @@ pub(crate) unsafe fn activate_player_row(
             ps,
             bridge.metadata_view(),
             pages,
-            plx_screens::player::overlay::OverlayKind::Tracks { tab: if btn == 0 { 1 } else { 0 } },
+            plx_screens::player::overlay::OverlayKind::Tracks {
+                tab: if plx_appkit::player_hud::disc_at(btn) == Some(plx_appkit::player_hud::Disc::Subtitles) { 1 } else { 0 },
+            },
         );
     }
     if let Some(player) = super::bridge::player_mut(pages) {

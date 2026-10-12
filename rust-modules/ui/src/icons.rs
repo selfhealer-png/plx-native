@@ -140,6 +140,9 @@ pub enum Icon {
     /// [`Icon::Restart`] before reconciling them — they were reconciled once, on 2026-08-21, and it
     /// was wrong.
     PlayStart,
+    /// A play triangle into a trailing bar — **"Next episode"**, [`Icon::PlayStart`] mirrored, worn
+    /// by the player transport's leading disc while the queue has a successor.
+    PlayNext,
     /// An X — "remove this" (the item menu's Remove from Continue Watching row).
     Close,
     /// A horizontal ellipsis — "more options". The player transport's third control disc, which
@@ -293,6 +296,7 @@ fn src(id: Icon) -> &'static str {
         Icon::Show => include_str!("../../../assets/icons/show.svg"),
         Icon::Collection => include_str!("../../../assets/icons/collection.svg"),
         Icon::PlayStart => include_str!("../../../assets/icons/play-start.svg"),
+        Icon::PlayNext => include_str!("../../../assets/icons/play-next.svg"),
         Icon::Close => include_str!("../../../assets/icons/close.svg"),
         Icon::More => include_str!("../../../assets/icons/more.svg"),
         Icon::Search => include_str!("../../../assets/icons/search.svg"),
