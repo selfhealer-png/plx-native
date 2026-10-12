@@ -241,7 +241,8 @@ fn probe_jail() {
 ///
 /// If BOTH legs fail the user stays exactly where they were, which is the right last resort: the
 /// alternative is ending the process, and "must not terminate the application" is the whole of what
-/// was asked for. `SDL_MinimizeWindow` returns void, so the app cannot even know the second leg
+/// was asked for. **Except on webOS 3.x** ([`after_refusal`]): there no launcher id answers and the
+/// minimize leg is measured to do nothing, so staying put would leave BACK dead, and the app quits. `SDL_MinimizeWindow` returns void, so the app cannot even know the second leg
 /// failed — the log line says what was ASKED, never that it worked, and the screenshot is what
 /// says whether it did.
 ///
@@ -270,6 +271,9 @@ pub fn go_home() {
         if probe { ls2_probe(); }
         else if !launch_home() {
             if sam_only { plx_base::eventlog::log("gohome: no fallback — the trigger forced SAM only"); }
+            else if after_refusal(crate::tv::device::info().major) == HomeFallback::Quit {
+                HOME_QUIT.store(true, std::sync::atomic::Ordering::Release);
+            }
             else { HOME_MINIMIZE.store(true, std::sync::atomic::Ordering::Release); }
         }
         HOME_PENDING.store(false, std::sync::atomic::Ordering::Release);
@@ -281,11 +285,30 @@ pub fn go_home() {
 
 static HOME_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HOME_MINIMIZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HOME_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// LS2 waits on its own context off-thread; only the SDL fallback returns to the frame thread.
 pub fn poll_home() {
     if HOME_MINIMIZE.swap(false, std::sync::atomic::Ordering::AcqRel) { minimize(); }
+    if HOME_QUIT.swap(false, std::sync::atomic::Ordering::AcqRel) { quit(); }
 }
+
+/// The webOS 3.x last resort: post `SDL_QUIT`, which the frame loop already answers by ending the
+/// run (`app.running = false`) and leaving through the ordinary shutdown path. This departs from
+/// the "must not terminate" rule above on purpose, and only where nothing else leaves the screen.
+#[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+fn quit() {
+    // `SDL_Event` is a 56-byte union whose first `Uint32` is the type; `SDL_QUIT` is 0x100.
+    let mut ev = [0u8; 56];
+    ev[..4].copy_from_slice(&0x100u32.to_ne_bytes());
+    let pushed = unsafe { SDL_PushEvent(ev.as_ptr().cast()) };
+    plx_base::eventlog::log(&format!(
+        "gohome: fallback=quit on webOS 3.x (no launcher id answered) pushed={pushed}"
+    ));
+}
+
+#[cfg(any(feature = "hostsim", test, feature = "test-support"))]
+fn quit() {}
 
 /// The Home launcher's app id.
 ///
@@ -293,14 +316,34 @@ pub fn poll_home() {
 /// `luna-send … /launch '{"id":"com.webos.app.home"}'` recipe), which is why the reply is graded
 /// rather than assumed: a wrong id comes back `returnValue: false` and falls through to the
 /// minimize leg instead of leaving the user on a screen whose BACK did nothing.
-const HOME_APP_ID: &str = "com.webos.app.home";
+///
+/// **A list, tried in order, because webOS 3.4 has no `com.webos.app.home`.** A 2016 set on 3.4.3
+/// answers it `{"errorCode":-101,"errorText":"not exist"}`, and its `SDL_MinimizeWindow` does
+/// nothing either, so BACK at a root did nothing at all. The other ids are the community's names
+/// for the older launcher and are unverified; each wrong one costs one ~15 ms rejection.
+const HOME_APP_IDS: [&str; 3] =
+    ["com.webos.app.home", "com.webos.app.launcher", "com.webos.app.homelauncher"];
 
 #[cfg(any(feature = "hostsim", test, feature = "test-support"))]
 fn launch_home() -> bool {
     plx_base::eventlog::log(&format!(
-        "gohome: no LS2 bus off-device — the root press would launch {HOME_APP_ID} on a television"
+        "gohome: no LS2 bus off-device — the root press would launch {} on a television",
+        HOME_APP_IDS[0]
     ));
     true
+}
+
+/// What a root press does once every launcher id was refused: on webOS 4 and later, minimize (the
+/// device-verified fallback); on 3.x, where minimize is measured to do nothing, quit. Pure, so the
+/// rule is graded on the host.
+fn after_refusal(major: u32) -> HomeFallback {
+    if major > 0 && major < 4 { HomeFallback::Quit } else { HomeFallback::Minimize }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HomeFallback {
+    Minimize,
+    Quit,
 }
 
 #[cfg(any(feature = "hostsim", test, feature = "test-support"))]
@@ -390,9 +433,24 @@ pub fn system_locale() -> crate::tv::LocaleReply {
     crate::tv::LocaleReply::NoPlatform
 }
 
+/// Every launcher id in [`HOME_APP_IDS`] until SAM accepts one. A bus failure (setup, timeout)
+/// stops the walk: the next id would meet the same bus.
 #[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
 fn launch_home() -> bool {
-    let payload = format!("{{\"id\":\"{HOME_APP_ID}\"}}");
+    for id in HOME_APP_IDS {
+        match launch_id(id) {
+            Some(true) => return true,
+            Some(false) => continue,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// One SAM `launch`: `Some(accepted)` for any reply, `None` when the bus never answered.
+#[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
+fn launch_id(id: &str) -> Option<bool> {
+    let payload = format!("{{\"id\":\"{id}\"}}");
     let started = std::time::Instant::now();
     let outcome = ls2::call_once("luna://com.webos.applicationManager/launch", &payload);
     let ms = started.elapsed().as_millis();
@@ -405,8 +463,8 @@ fn launch_home() -> bool {
             let ok =
                 reply.contains("\"returnValue\":true") || reply.contains("\"returnValue\": true");
             let verdict = if ok { "accepted" } else { "rejected" };
-            plx_base::eventlog::log(&format!("gohome: SAM {verdict} in {ms}ms → {reply}"));
-            ok
+            plx_base::eventlog::log(&format!("gohome: SAM {verdict} {id} in {ms}ms → {reply}"));
+            Some(ok)
         }
         // **Four different failures used to arrive as one sentence**, which is exactly the kind of
         // log that wastes a device session: "SAM did not answer" read the same whether the bus
@@ -414,7 +472,7 @@ fn launch_home() -> bool {
         // time out. They are three different bugs and only one of them is about SAM.
         Err(ls2::Fail::Setup { stage, detail, .. }) if detail.is_empty() => {
             plx_base::eventlog::log(&format!("gohome: LS2 setup failed stage={stage} after {ms}ms"));
-            false
+            None
         }
         // The hub's own words, when it gave any. The register refusal that shipped with this
         // branch (`Can not find service "" permissions`) was legible ONLY in ls-hubd's log,
@@ -423,11 +481,11 @@ fn launch_home() -> bool {
             plx_base::eventlog::log(&format!(
                 "gohome: LS2 setup failed stage={stage} after {ms}ms — {detail}"
             ));
-            false
+            None
         }
         Err(ls2::Fail::Timeout) => {
             plx_base::eventlog::log(&format!("gohome: SAM timed out in {ms}ms"));
-            false
+            None
         }
     }
 }
@@ -452,6 +510,7 @@ static WINDOW: std::sync::atomic::AtomicPtr<std::os::raw::c_void> =
 #[cfg(all(not(feature = "hostsim"), not(any(test, feature = "test-support"))))]
 extern "C" {
     fn SDL_MinimizeWindow(win: *mut std::os::raw::c_void);
+    fn SDL_PushEvent(event: *const std::os::raw::c_void) -> std::os::raw::c_int;
 }
 
 /// Hand this module the SDL window, once, at boot — `textinput::bind`'s shape and for its reason:
@@ -929,6 +988,17 @@ pub mod ls2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// webOS 3.x quits when no launcher id answers, because its minimize is measured to do
+    /// nothing; 4+ keeps the device-verified minimize; an unknown release keeps it too.
+    #[test]
+    fn a_refused_root_press_quits_only_on_webos_3() {
+        assert_eq!(after_refusal(3), HomeFallback::Quit);
+        assert_eq!(after_refusal(1), HomeFallback::Quit);
+        assert_eq!(after_refusal(4), HomeFallback::Minimize);
+        assert_eq!(after_refusal(10), HomeFallback::Minimize);
+        assert_eq!(after_refusal(0), HomeFallback::Minimize, "release unknown");
+    }
 
     #[test]
     fn storage_activation_reply_keeps_only_status_and_numeric_error_code() {

@@ -885,7 +885,7 @@ fn watchlist_shelf(c: &plx_plex::plex::Client, sid: ServerId) -> Option<Shelf> {
         }
     }
     plx_base::eventlog::log(&format!(
-        "watchlist: source matched={} of {} failed={failed}",
+        "watchlist: source {sid:?} matched={} of {} failed={failed}",
         items.len(),
         list.len()
     ));
