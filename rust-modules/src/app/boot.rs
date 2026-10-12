@@ -385,6 +385,37 @@ pub(crate) unsafe fn hide_cursor() {
         }
     }
 }
+/// Every 30th heartbeat, one `mem:` line: this process's resident and peak memory and what the
+/// television still has available, all in KiB from `/proc`.
+///
+/// A 2016 set on webOS 3.4.3 lost the app mid-playback with nothing in any log — no `SIGNAL`
+/// record, no teardown, the event log simply stopping — which is the shape of a SIGKILL from
+/// outside, most likely the low-memory killer, and the app recorded no memory figure to say so.
+/// Best effort: a field `/proc` does not have reads as `-`.
+pub(crate) fn mem_heartbeat() {
+    static BEATS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if BEATS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30 != 0 {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let field = |text: &str, key: &str| -> String {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or("-")
+            .to_string()
+    };
+    plx_base::eventlog::log(&format!(
+        "mem: rss={} hwm={} avail={} free={} swap_free={}",
+        field(&status, "VmRSS:"),
+        field(&status, "VmHWM:"),
+        field(&meminfo, "MemAvailable:"),
+        field(&meminfo, "MemFree:"),
+        field(&meminfo, "SwapFree:"),
+    ));
+}
+
 /// Advance the once-per-second LOOP-RATE window: bump `iters_ct` and, when a full second has
 /// elapsed, recompute `loop_shown`, reset the window, and return `true` so the caller logs the
 /// heartbeat with its own route/overlay tag. Shared by the player and home/detail draw paths.
