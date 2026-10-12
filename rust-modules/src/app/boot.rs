@@ -385,8 +385,9 @@ pub(crate) unsafe fn hide_cursor() {
         }
     }
 }
-/// The window to ask for: 1920x1080 (the canvas) on webOS 4 and later, **1280x720 on webOS 1-3**,
-/// and whatever `/tmp/plxnative-drawable=<W>x<H>` says when that trigger is armed (debug builds).
+/// The window to ask for: whatever `/tmp/plxnative-drawable=<W>x<H>` says when that trigger is
+/// armed (debug builds), else the size chosen in Settings, else (Automatic) 1920x1080 on webOS 4
+/// and later and **1280x720 on webOS 1-3**.
 ///
 /// Why 3.x draws smaller. On a 2016 set (webOS 3.4.3, Mali-T760) Home is fill-rate bound: frame
 /// prep is about 1.5 ms, half of all frames ran over 16.7 ms, poster uploads barely moved it and
@@ -406,6 +407,15 @@ fn requested_drawable() -> Option<(c_int, c_int)> {
         if ok.is_some() {
             return ok;
         }
+    }
+    // Settings > System > Interface resolution: an explicit size beats the release rule. The
+    // session is loaded before the window (`bootstrap::capture_home` runs first); an unsettled
+    // read is Automatic.
+    let chosen = plx_plex::plex::session::peek_settled()
+        .map_or(plx_plex::plex::session::UiResolution::Auto, |s| s.ui_resolution());
+    if let Some((w, h)) = chosen.size() {
+        log(&format!("surface: Settings asks for {w}x{h}"));
+        return (w != SCR_W || h != SCR_H).then_some((w, h));
     }
     let major = plx_platform::tv::device::info().major;
     let small = (1..=3).contains(&major);

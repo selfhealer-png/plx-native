@@ -47,6 +47,7 @@ use plx_ui::screen::{
     Placed, RenderStrategy, ReturnState, Screen, ScreenEvent, Step,
 };
 use plx_ui::table::Row;
+use plx_plex::plex::session::UiResolution;
 use plx_ui::table_screen::{Header, TableScreen};
 use plx_ui::{theme, Painter, Rect};
 
@@ -954,6 +955,8 @@ enum RootId {
     Language,
     AutoSignIn,
     TrailerAutoplay,
+    Watchlist,
+    Resolution,
     /// One server's switch. Its key is [`PLAINTEXT_KEY_BASE`] plus its position in the section
     /// ([`root_form`] assigns it); its identity is the machine, so a rebuild keeps the row.
     Plaintext(ServerMachineId),
@@ -977,6 +980,8 @@ impl FormId for RootId {
             RootId::Privacy => 7,
             RootId::Legal => 8,
             RootId::About => 9,
+            RootId::Watchlist => 10,
+            RootId::Resolution => 11,
             // the base; `root_form` adds the position (`item_keyed`)
             RootId::Plaintext(_) => PLAINTEXT_KEY_BASE,
         })
@@ -991,6 +996,10 @@ enum Action {
     Door,
     AutoSignIn,
     TrailerAutoplay,
+    /// The Watchlist shelf on Home, on or off.
+    Watchlist,
+    /// The interface resolution: one press selects the next option (applied at the next launch).
+    Resolution,
     /// A server's "connect without encryption" switch.
     Plaintext(ServerMachineId),
 }
@@ -1004,6 +1013,8 @@ pub struct RootPage {
     session_snapshot: std::sync::Arc<plx_plex::plex::session::Session>,
     pending_auto: Option<(bool, plx_base::storage_worker::TypedTicket<bool>)>,
     pending_trailer: Option<(bool, plx_base::storage_worker::TypedTicket<bool>)>,
+    pending_watchlist: Option<(bool, plx_base::storage_worker::TypedTicket<bool>)>,
+    pending_resolution: Option<(UiResolution, plx_base::storage_worker::TypedTicket<bool>)>,
     /// The servers the signed-in account answered plx_platform::i18n::msg::settings_plaintext_question() for, then the
     /// ones discovery offers it for and nobody has answered, by row — the `(machine_id, allowed)`
     /// each switch shows.
@@ -1075,6 +1086,8 @@ struct RootInputs {
     library_count: i64,
     auto_sign_in: bool,
     trailer_autoplay: bool,
+    watchlist: bool,
+    resolution: UiResolution,
     language: plx_platform::i18n::Preference,
     /// Unencrypted-connection switches, in row order — empty when signed out or when nobody has
     /// an answered/offered plaintext question.
@@ -1085,6 +1098,15 @@ struct RootInputs {
 /// [`RootInputs`]. `RootPage::rebuild` gathers the inputs and calls this; the text-fit tests
 /// (`settings_text_fit_tests.rs`) call it directly, over every `RootInputs` combination worth
 /// checking, without a real signed-in session. Reordering the page is moving a line here.
+/// What the Interface resolution row reads. The sizes are numbers, not words, so only
+/// Automatic is translated.
+fn resolution_label(mode: UiResolution) -> String {
+    match mode.size() {
+        None => plx_platform::i18n::msg::settings_resolution_auto().to_string(),
+        Some((w, h)) => format!("{w} × {h}"),
+    }
+}
+
 fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
     let signed_in = inputs.signed_in;
     // Order: Libraries, Playback (player experience only), System (Language, Automatically Sign
@@ -1102,6 +1124,14 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
                 .detail(plx_platform::i18n::msg::settings_libraries_detail())
                 .value(plx_platform::i18n::msg::settings_libraries_count(inputs.library_count))
                 .chevron(true),
+        )
+        .item(
+            RootId::Watchlist,
+            RowKind::Toggle,
+            Action::Watchlist,
+            Row::new(plx_platform::i18n::msg::settings_watchlist_title())
+                .detail(plx_platform::i18n::msg::settings_watchlist_detail())
+                .toggle(inputs.watchlist),
         );
     let playback = FormSection::new(plx_platform::i18n::msg::settings_playback_section())
         .item(
@@ -1148,6 +1178,14 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
             Row::new(plx_platform::i18n::msg::settings_trailers_title())
                 .detail(plx_platform::i18n::msg::settings_trailers_detail())
                 .toggle(inputs.trailer_autoplay),
+        )
+        .item(
+            RootId::Resolution,
+            RowKind::Button,
+            Action::Resolution,
+            Row::new(plx_platform::i18n::msg::settings_resolution_title())
+                .detail(plx_platform::i18n::msg::settings_resolution_detail())
+                .value(resolution_label(inputs.resolution)),
         );
     let has_plaintext = signed_in && !inputs.plaintext.is_empty();
     let mut plaintext = FormSection::new(plx_platform::i18n::msg::settings_plaintext_section()).visible(has_plaintext);
@@ -1208,6 +1246,7 @@ impl RootPage {
             session_watch: Default::default(),
             session_snapshot: Default::default(),
             pending_auto: None, pending_trailer: None,
+            pending_watchlist: None, pending_resolution: None,
             plaintext_rows: Vec::new(),
             pending_plaintext: None,
             alert: PlaintextAlert::new(ALERT_GROUP, super::registry::ALERT, super::registry::ALERT + 1),
@@ -1234,6 +1273,8 @@ impl RootPage {
         let signed_in = sess.account(plx_plex::plex::session::current().as_ref()).signed_in;
         let auto_sign_in = self.pending_auto.as_ref().map_or_else(|| sess.auto_sign_in(), |(value, _)| *value);
         let trailer_autoplay = self.pending_trailer.as_ref().map_or_else(|| sess.trailer_autoplay(), |(value, _)| *value);
+        let watchlist = self.pending_watchlist.as_ref().map_or_else(|| sess.watchlist_shown(), |(value, _)| *value);
+        let resolution = self.pending_resolution.as_ref().map_or_else(|| sess.ui_resolution(), |(value, _)| *value);
         let multi_user = sess.home_users.len() > 1;
         self.state.auto_sign_in = auto_sign_in;
         self.state.trailer_autoplay = trailer_autoplay;
@@ -1241,7 +1282,7 @@ impl RootPage {
         let plaintext = if signed_in { self.plaintext_inputs() } else { Vec::new() };
         let form = root_form(&RootInputs {
             signed_in, multi_user, library_count: directory.pinned_count() as i64,
-            auto_sign_in, trailer_autoplay, language: self.state.language, plaintext,
+            auto_sign_in, trailer_autoplay, watchlist, resolution, language: self.state.language, plaintext,
         });
         let keep = self.form.selected_id().cloned();
         self.form.table.compact = false;
@@ -1346,6 +1387,26 @@ impl RootPage {
                 }
                 self.rebuild(directory);
             }
+            Action::Watchlist => {
+                let on = !self.pending_watchlist.as_ref()
+                    .map_or_else(|| self.session_snapshot.watchlist_shown(), |(value, _)| *value);
+                if let Ok(ticket) = plx_plex::plex::session::queue_update_ticket(move |current|
+                    (current.watchlist_shown() != on).then(|| current.with_watchlist_shown(on))) {
+                    self.pending_watchlist = Some((on, ticket));
+                    plx_data::pms::watchlist_setting_changed();
+                }
+                self.rebuild(directory);
+            }
+            Action::Resolution => {
+                let next = self.pending_resolution.as_ref()
+                    .map_or_else(|| self.session_snapshot.ui_resolution(), |(value, _)| *value)
+                    .next();
+                if let Ok(ticket) = plx_plex::plex::session::queue_update_ticket(move |current|
+                    (current.ui_resolution() != next).then(|| current.with_ui_resolution(next))) {
+                    self.pending_resolution = Some((next, ticket));
+                }
+                self.rebuild(directory);
+            }
             Action::Plaintext(ServerMachineId(machine)) => {
                 use plx_plex::plex::session::PlaintextChoice;
                 let Some(on) = self.plaintext_rows.iter().find(|(m, _)| *m == machine).map(|(_, on)| *on) else {
@@ -1414,7 +1475,7 @@ impl Machine<InnerHost> for RootPage {
             }
             ScreenEvent::Tick(t) => {
                 let mut landed = self.session_watch.changed();
-                for pending in [&mut self.pending_auto, &mut self.pending_trailer] {
+                for pending in [&mut self.pending_auto, &mut self.pending_trailer, &mut self.pending_watchlist] {
                     if pending.as_ref().is_some_and(|(_, ticket)| !matches!(ticket.try_recv(),
                         Err(std::sync::mpsc::TryRecvError::Empty))) {
                         // Read AFTER the receipt: the worker may have installed Locked/Blocked
@@ -1425,6 +1486,14 @@ impl Machine<InnerHost> for RootPage {
                             *pending = None;
                             landed = true;
                         }
+                    }
+                }
+                if self.pending_resolution.as_ref().is_some_and(|(_, ticket)| !matches!(ticket.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty))) {
+                    if let Some(snapshot) = plx_plex::plex::session::peek_settled() {
+                        self.session_snapshot = snapshot;
+                        self.pending_resolution = None;
+                        landed = true;
                     }
                 }
                 // An offer or an answer landed (`grant::revision`): the switches re-read.

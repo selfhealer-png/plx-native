@@ -636,6 +636,14 @@ pub struct Session {
     /// committed replay fixtures included — serializes exactly as it did before.
     #[serde(default, deserialize_with = "de_soft_deck_press", skip_serializing_if = "is_default_deck_press")]
     pub deck_press: DeckPress,
+    /// **Hide the Watchlist shelf on Home.** Stored as the negative so absence (every session
+    /// written before the shelf existed) and a derived `Default` both mean SHOWN. Install-wide.
+    #[serde(default, deserialize_with = "de_soft_bool", skip_serializing_if = "is_false")]
+    pub hide_watchlist: bool,
+    /// **The window the interface draws into** — see [`UiResolution`]. Applied at the next launch,
+    /// because the window is created once. Skipped at the default (Automatic).
+    #[serde(default, deserialize_with = "de_soft_ui_resolution", skip_serializing_if = "is_default_ui_resolution")]
+    pub ui_resolution: UiResolution,
     /// **Device-wide ambient memory**: the last hero `UltraBlurColors` envelope Home actually
     /// rendered on this television, so a route in the Settings/first-run family that opens
     /// BEFORE Home has fetched anything this boot — first-run consent moved ahead of the
@@ -748,6 +756,10 @@ struct CanonicalSessionPreferences {
     skip_interval: SkipInterval,
     #[serde(default, deserialize_with = "de_soft_deck_press", skip_serializing_if = "is_default_deck_press")]
     deck_press: DeckPress,
+    #[serde(default, deserialize_with = "de_soft_bool", skip_serializing_if = "is_false")]
+    hide_watchlist: bool,
+    #[serde(default, deserialize_with = "de_soft_ui_resolution", skip_serializing_if = "is_default_ui_resolution")]
+    ui_resolution: UiResolution,
     #[serde(default, deserialize_with = "de_soft_vec", skip_serializing_if = "Vec::is_empty")]
     plaintext_consent: Vec<PlaintextConsent>,
     #[serde(default, deserialize_with = "de_soft_vec", skip_serializing_if = "Vec::is_empty")]
@@ -786,6 +798,8 @@ impl Default for CanonicalSessionPreferences {
             next_episode_mode: NextEpisodeMode::Countdown,
             skip_interval: SkipInterval::Seconds10,
             deck_press: DeckPress::Details,
+            hide_watchlist: false,
+            ui_resolution: UiResolution::Auto,
             plaintext_consent: Vec::new(),
             server_key_pins: Vec::new(),
             audio_enhancements: crate::plex::AudioEnhancements::NONE,
@@ -838,6 +852,8 @@ fn split_public(session: &Session) -> Result<plx_platform::storage::state::Publi
         next_episode_mode: session.next_episode_mode,
         skip_interval: session.skip_interval,
         deck_press: session.deck_press,
+        hide_watchlist: session.hide_watchlist,
+        ui_resolution: session.ui_resolution,
         plaintext_consent: session.plaintext_consent.clone(),
         server_key_pins: session.server_key_pins.clone(),
         audio_enhancements: session.audio_enhancements,
@@ -912,6 +928,8 @@ pub fn join_canonical(
         next_episode_mode: preferences.next_episode_mode,
         skip_interval: preferences.skip_interval,
         deck_press: preferences.deck_press,
+        hide_watchlist: preferences.hide_watchlist,
+        ui_resolution: preferences.ui_resolution,
         plaintext_consent: preferences.plaintext_consent,
         server_key_pins: preferences.server_key_pins,
         audio_enhancements: preferences.audio_enhancements,
@@ -945,6 +963,8 @@ fn public_session(public: &plx_platform::storage::state::PublicPayload) -> Sessi
         next_episode_mode: preferences.next_episode_mode,
         skip_interval: preferences.skip_interval,
         deck_press: preferences.deck_press,
+        hide_watchlist: preferences.hide_watchlist,
+        ui_resolution: preferences.ui_resolution,
         plaintext_consent: preferences.plaintext_consent,
         server_key_pins: preferences.server_key_pins,
         audio_enhancements: preferences.audio_enhancements,
@@ -1421,6 +1441,45 @@ impl DeckPress {
     /// triangle, its press and its menu's Play row are all derived from.
     pub fn press_plays(self) -> bool {
         self == DeckPress::Play
+    }
+}
+
+/// **The window the interface asks for.** The UI is authored at 1920x1080 and `surface` fits that
+/// canvas into whatever drawable webOS grants; a smaller one fills fewer pixels and the compositor
+/// upscales. `Auto` is 1920x1080 on webOS 4+ and 1280x720 on webOS 1-3, where a 2016 set measured
+/// fill-rate bound at 1080p (`app::boot::requested_drawable`).
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiResolution {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "1080p")]
+    Full1080,
+    #[serde(rename = "900p")]
+    Hd900,
+    #[serde(rename = "720p")]
+    Hd720,
+}
+
+impl UiResolution {
+    /// Every option, the order the setting cycles through them in.
+    pub const LADDER: [UiResolution; 4] =
+        [UiResolution::Auto, UiResolution::Full1080, UiResolution::Hd900, UiResolution::Hd720];
+
+    /// The next option, wrapping — what one press of the setting's row selects.
+    pub fn next(self) -> UiResolution {
+        let i = Self::LADDER.iter().position(|&m| m == self).unwrap_or(0);
+        Self::LADDER[(i + 1) % Self::LADDER.len()]
+    }
+
+    /// The explicit size, or `None` for `Auto` (the caller decides from the webOS release).
+    pub fn size(self) -> Option<(i32, i32)> {
+        match self {
+            UiResolution::Auto => None,
+            UiResolution::Full1080 => Some((1920, 1080)),
+            UiResolution::Hd900 => Some((1600, 900)),
+            UiResolution::Hd720 => Some((1280, 720)),
+        }
     }
 }
 
@@ -2380,6 +2439,25 @@ fn is_default_deck_press(mode: &DeckPress) -> bool {
     *mode == DeckPress::default()
 }
 
+/// The interface resolution is a preference too: a spelling this build does not know is Automatic.
+fn de_soft_ui_resolution<'de, D>(d: D) -> Result<UiResolution, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Ok(v) = serde_json::Value::deserialize(d) else {
+        return Ok(UiResolution::default());
+    };
+    Ok(serde_json::from_value::<UiResolution>(v).unwrap_or_default())
+}
+
+fn is_default_ui_resolution(mode: &UiResolution) -> bool {
+    *mode == UiResolution::default()
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// The audio-enhancement toggle is a preference too: an unknown shape degrades to both flags
 /// off rather than failing the enclosing [`Session`].
 fn de_soft_audio_enhancements<'de, D>(d: D) -> Result<crate::plex::AudioEnhancements, D::Error>
@@ -2617,6 +2695,27 @@ impl Session {
     pub fn with_deck_press(&self, mode: DeckPress) -> Self {
         let mut next = self.clone();
         next.deck_press = mode;
+        next
+    }
+
+    /// Whether Home shows the Watchlist shelf (the default).
+    pub fn watchlist_shown(&self) -> bool {
+        !self.hide_watchlist
+    }
+
+    pub fn with_watchlist_shown(&self, on: bool) -> Self {
+        let mut next = self.clone();
+        next.hide_watchlist = !on;
+        next
+    }
+
+    pub fn ui_resolution(&self) -> UiResolution {
+        self.ui_resolution
+    }
+
+    pub fn with_ui_resolution(&self, mode: UiResolution) -> Self {
+        let mut next = self.clone();
+        next.ui_resolution = mode;
         next
     }
 
@@ -6156,5 +6255,44 @@ mod server_key_pin_tests {
         plx_base::storage_worker::drain_for_test();
         let _ = peek();
         assert_eq!(plx_net::net::keypin::pin_for_test(&key), None, "the late probe did not repopulate it");
+    }
+}
+
+/// `Session::ui_resolution` / `hide_watchlist`: soft-parse, omit-at-default (so committed replay
+/// fixtures serialize unchanged), round-trip through the canonical split.
+#[cfg(test)]
+mod ui_preference_tests {
+    use super::*;
+
+    #[test]
+    fn the_resolution_ladder_cycles_and_names_its_sizes() {
+        assert_eq!(UiResolution::Auto.next(), UiResolution::Full1080);
+        assert_eq!(UiResolution::Hd720.next(), UiResolution::Auto, "wraps");
+        assert_eq!(UiResolution::Auto.size(), None);
+        assert_eq!(UiResolution::Hd900.size(), Some((1600, 900)));
+    }
+
+    #[test]
+    fn both_settings_are_absent_at_their_defaults_and_survive_a_round_trip() {
+        let session = Session::default();
+        assert!(session.watchlist_shown(), "absence means shown");
+        assert_eq!(session.ui_resolution(), UiResolution::Auto);
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("hide_watchlist") && !json.contains("ui_resolution"), "{json}");
+
+        let set = session.with_watchlist_shown(false).with_ui_resolution(UiResolution::Hd720);
+        let round: Session = serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+        assert!(!round.watchlist_shown());
+        assert_eq!(round.ui_resolution(), UiResolution::Hd720);
+        let (public, protected) = split_canonical(&set).unwrap();
+        let joined = join_canonical(&public, &protected).unwrap();
+        assert!(!joined.watchlist_shown());
+        assert_eq!(joined.ui_resolution(), UiResolution::Hd720);
+    }
+
+    #[test]
+    fn an_unknown_resolution_spelling_is_automatic() {
+        let s: Session = serde_json::from_str(r#"{"client_id":"c","ui_resolution":"8k"}"#).unwrap();
+        assert_eq!(s.ui_resolution(), UiResolution::Auto);
     }
 }

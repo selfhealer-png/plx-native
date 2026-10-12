@@ -705,6 +705,7 @@ fn turning_an_unencrypted_connection_on_asks_the_shared_question_first() {
 fn inputs_for(signed_in: bool) -> RootInputs {
     RootInputs {
         signed_in, multi_user: true, library_count: 3, auto_sign_in: false, trailer_autoplay: true,
+        watchlist: true, resolution: UiResolution::Auto,
         language: plx_platform::i18n::Preference::System, plaintext: Vec::new(),
     }
 }
@@ -819,7 +820,8 @@ fn a_rebuild_keeps_the_row_by_id_and_a_vanished_row_falls_to_its_neighbour() {
 
     for (from, lands) in [
         (RootId::AudioSubtitles, RootId::Language),
-        (RootId::TrailerAutoplay, RootId::Privacy),
+        // Interface resolution is device-wide, so it stays signed out and is the next row.
+        (RootId::TrailerAutoplay, RootId::Resolution),
         (RootId::Favourites, RootId::Playback),
         (RootId::About, RootId::About),
     ] {

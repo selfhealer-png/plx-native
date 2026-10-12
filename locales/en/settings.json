@@ -55,6 +55,26 @@
     "value": "After a moment on a title, play its trailer with sound.",
     "description": "Settings, account, onboarding or privacy UI: settings.trailers.detail"
   },
+  "settings.watchlist.title": {
+    "value": "Watchlist on Home",
+    "description": "Settings toggle: show a Home shelf of the plex.tv Watchlist titles your servers hold"
+  },
+  "settings.watchlist.detail": {
+    "value": "Show your Plex Watchlist titles that your servers have.",
+    "description": "Settings detail line under settings.watchlist.title"
+  },
+  "settings.resolution.title": {
+    "value": "Interface resolution",
+    "description": "Settings row: the size the interface is drawn at; lower is smoother on older TVs"
+  },
+  "settings.resolution.detail": {
+    "value": "Lower is smoother on older TVs. Applies after restarting the app.",
+    "description": "Settings detail line under settings.resolution.title"
+  },
+  "settings.resolution.auto": {
+    "value": "Automatic",
+    "description": "Value of settings.resolution.title: chosen from the TV's webOS version"
+  },
   "settings.about.title": {
     "value": "About PlxNative",
     "description": "Settings, account, onboarding or privacy UI: settings.about.title"

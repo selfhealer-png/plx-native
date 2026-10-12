@@ -849,6 +849,12 @@ pub fn take_watchlist_ready() -> bool {
     WATCHLIST_READY.swap(false, Ordering::AcqRel)
 }
 
+/// The Watchlist setting changed: ask for the same Home refetch a finished match does, so the
+/// shelf appears or goes without waiting for the next ordinary refresh.
+pub fn watchlist_setting_changed() {
+    WATCHLIST_READY.store(true, Ordering::Release);
+}
+
 /// WORKER THREAD: the account's Watchlist, from the cache while it is fresh. `None` on a failed
 /// fetch.
 #[cfg(not(any(test, feature = "test-support")))]
@@ -876,7 +882,8 @@ fn watchlist_guids(token: &str, client_id: &str) -> Option<Arc<Vec<String>>> {
 #[cfg(not(any(test, feature = "test-support")))]
 fn watchlist_shelf(c: &'static plx_plex::plex::Client, sid: ServerId) -> Option<Shelf> {
     let s = plx_plex::plex::session::peek();
-    if s.account_token.is_empty() {
+    // Settings > Libraries > Watchlist on Home. Off costs nothing: no plex.tv fetch, no lookups.
+    if s.account_token.is_empty() || !s.watchlist_shown() {
         return None;
     }
     let (shelf, fresh) = {
