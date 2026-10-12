@@ -385,6 +385,22 @@ pub(crate) unsafe fn hide_cursor() {
         }
     }
 }
+/// `/tmp/plxnative-drawable=<W>x<H>` — EXPERIMENT: ask for a smaller window than the 1920x1080
+/// canvas, so GL fills fewer pixels and the compositor upscales. On a 3.4.3 set Home is fill-rate
+/// bound (frame prep about 1.5 ms, half of all frames over 16.7 ms, unchanged with the tab glass
+/// off), and 1280x720 is 2.25x fewer pixels. `surface::probe` reads back what was granted, and
+/// `scale`/`viewport` letterbox the canvas into it; that path had never run on a television, and
+/// text is softer below 1:1. Bounded to 640x360..=1920x1080 so a typo cannot ask for nonsense.
+#[cfg(not(feature = "hostsim"))]
+fn requested_drawable() -> Option<(c_int, c_int)> {
+    let v = plx_base::devtrig::read("drawable")?;
+    let (w, h) = v.trim().split_once('x')?;
+    let (w, h): (c_int, c_int) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    let ok = (640..=SCR_W).contains(&w) && (360..=SCR_H).contains(&h);
+    log(&format!("surface: drawable experiment {w}x{h} requested={}", if ok { "yes" } else { "refused" }));
+    ok.then_some((w, h))
+}
+
 /// Every 30th heartbeat, one `mem:` line: this process's resident and peak memory and what the
 /// television still has available, all in KiB from `/proc`.
 ///
@@ -745,7 +761,10 @@ pub(crate) unsafe fn construct(
         (0x2FFF_0000u32 as c_int, 0x2FFF_0000u32 as c_int, w, h)
     };
     #[cfg(not(feature = "hostsim"))]
-    let (wx, wy, ww_req, wh_req) = (0, 0, SCR_W, SCR_H);
+    let (wx, wy, ww_req, wh_req) = {
+        let (w, h) = requested_drawable().unwrap_or((SCR_W, SCR_H));
+        (0, 0, w, h)
+    };
     // The title is furniture a television never draws (no window manager, no decoration) and
     // the first thing a desktop shows, so the two builds spell it differently: the device keeps
     // the process-shaped name every log, `pidof` recipe and skill already uses.
