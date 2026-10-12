@@ -68,7 +68,7 @@
     "description": "Settings row: the size the interface is drawn at; lower is smoother on older TVs"
   },
   "settings.resolution.detail": {
-    "value": "Lower is smoother on older TVs. Applies after restarting the app.",
+    "value": "Lower is smoother. Applies after restarting.",
     "description": "Settings detail line under settings.resolution.title"
   },
   "settings.resolution.auto": {

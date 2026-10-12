@@ -1124,14 +1124,6 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
                 .detail(plx_platform::i18n::msg::settings_libraries_detail())
                 .value(plx_platform::i18n::msg::settings_libraries_count(inputs.library_count))
                 .chevron(true),
-        )
-        .item(
-            RootId::Watchlist,
-            RowKind::Toggle,
-            Action::Watchlist,
-            Row::new(plx_platform::i18n::msg::settings_watchlist_title())
-                .detail(plx_platform::i18n::msg::settings_watchlist_detail())
-                .toggle(inputs.watchlist),
         );
     let playback = FormSection::new(plx_platform::i18n::msg::settings_playback_section())
         .item(
@@ -1178,6 +1170,17 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
             Row::new(plx_platform::i18n::msg::settings_trailers_title())
                 .detail(plx_platform::i18n::msg::settings_trailers_detail())
                 .toggle(inputs.trailer_autoplay),
+        )
+        // After the root's first rows on purpose: tests (and muscle memory) count DOWNs from
+        // Favorite libraries to Audio & subtitles, so new rows join the end of System.
+        .item_if(
+            signed_in,
+            RootId::Watchlist,
+            RowKind::Toggle,
+            Action::Watchlist,
+            Row::new(plx_platform::i18n::msg::settings_watchlist_title())
+                .detail(plx_platform::i18n::msg::settings_watchlist_detail())
+                .toggle(inputs.watchlist),
         )
         // Signed-in only, like the switches above: the signed-out root is the sign-in path's own
         // short list, and nothing about drawing size belongs on it.
