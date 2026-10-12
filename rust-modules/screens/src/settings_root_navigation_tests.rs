@@ -820,8 +820,7 @@ fn a_rebuild_keeps_the_row_by_id_and_a_vanished_row_falls_to_its_neighbour() {
 
     for (from, lands) in [
         (RootId::AudioSubtitles, RootId::Language),
-        // Interface resolution is device-wide, so it stays signed out and is the next row.
-        (RootId::TrailerAutoplay, RootId::Resolution),
+        (RootId::TrailerAutoplay, RootId::Privacy),
         (RootId::Favourites, RootId::Playback),
         (RootId::About, RootId::About),
     ] {

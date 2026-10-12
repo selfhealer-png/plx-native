@@ -1179,7 +1179,10 @@ fn root_form(inputs: &RootInputs) -> Form<RootId, Action, SettingsPage> {
                 .detail(plx_platform::i18n::msg::settings_trailers_detail())
                 .toggle(inputs.trailer_autoplay),
         )
-        .item(
+        // Signed-in only, like the switches above: the signed-out root is the sign-in path's own
+        // short list, and nothing about drawing size belongs on it.
+        .item_if(
+            signed_in,
             RootId::Resolution,
             RowKind::Button,
             Action::Resolution,
