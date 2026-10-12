@@ -2575,7 +2575,7 @@ fn on_grid(s: &mut HomeScreen) {
     s.layout_grid();
 }
 
-fn heading_key(s: &HomeScreen, row: usize) -> FocusKey<u32> {
+fn more_key(s: &HomeScreen, row: usize) -> FocusKey<u32> {
     FocusKey { entry: s.entry, elem: heading_elem(s.rows[row].group) }
 }
 
@@ -2594,7 +2594,7 @@ fn move_from(
 }
 
 #[test]
-fn only_a_promoted_collection_shelf_gets_a_linked_heading() {
+fn only_a_promoted_collection_shelf_ends_in_a_more_card() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -2604,56 +2604,22 @@ fn only_a_promoted_collection_shelf_gets_a_linked_heading() {
     assert!(s.linked(0).is_none() && s.linked(2).is_none());
     let linked = s.linked(1).expect("the custom.collection row links to its collection");
     assert_eq!((linked.sec, linked.rk.as_str()), (1, "50001"));
-    assert_eq!(s.locate(heading_elem(s.rows[0].group)), None,
-        "an unlinked shelf has no heading stop to land on");
-    assert_eq!(s.locate(heading_key(&s, 1).elem), Some(Located::Heading(1)));
+    // The collection row is its six members, then MORE; the plain rows are their members alone.
+    assert_eq!(s.rows[1].elems.len(), 7);
+    assert_eq!(s.more_col(1), Some(6));
+    assert_eq!(s.rows[0].elems.len(), 6);
+    assert_eq!((s.more_col(0), s.more_col(2)), (None, None));
+    assert_eq!(s.locate(more_key(&s, 1).elem), Some(Located::Item(1, 6)),
+        "MORE is an ordinary card of its row");
+    // No heading is a focus group any more: every group is a hero, a shelf or the alert.
     let mut groups = Vec::new();
     let context = cx(snapshot.view(), None);
     Focusable::<TestHost>::groups(&s, &context, &mut groups);
-    let headings: Vec<_> = groups.iter().filter(|g| g.id.0 & HEADING_BASE != 0).collect();
-    assert_eq!(headings.len(), 1, "exactly one heading stop: the collection's");
-    assert_eq!(headings[0].id, heading_group(s.rows[1].group));
-    assert_eq!(headings[0].len, 1);
-    // Member cards stay exactly as they were: no collection tile, no SEE ALL tile.
-    assert_eq!(s.rows[1].elems.len(), 6);
+    assert!(groups.iter().all(|g| g.id.0 & HEADING_BASE == 0), "no heading stop");
 }
 
 #[test]
-fn up_from_any_collection_card_reaches_the_heading_and_down_returns_to_that_card() {
-    let _guard = plx_base::testlock::serial();
-    let mut state = plx_data::pms::PmsState::default();
-    let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
-    let snapshot = collection_home(&mut state, &adapter);
-    let mut s = screen(snapshot.view());
-    on_grid(&mut s);
-    let owner = InputOwner::Entry(s.entry);
-    let card = FocusKey { entry: s.entry, elem: s.rows[1].elems[4] };
-    let mut engine = FocusEngine::new();
-    engine.set(owner, card, Some(s.rows[1].group), By::Restore);
-
-    let Outcome::Moved { to, .. } = move_from(&s, snapshot.view(), &mut engine, Dir::Up) else {
-        panic!("UP from a collection card must move");
-    };
-    assert_eq!(to, heading_key(&s, 1), "UP lands on the linked heading, not the shelf above");
-    for dir in [Dir::Left, Dir::Right] {
-        assert_eq!(move_from(&s, snapshot.view(), &mut engine, dir), Outcome::Nothing,
-            "LEFT/RIGHT are inert on the heading");
-    }
-    let Outcome::Moved { to, .. } = move_from(&s, snapshot.view(), &mut engine, Dir::Down) else {
-        panic!("DOWN from the heading must return to the shelf");
-    };
-    assert_eq!(to, card, "DOWN restores the remembered card, not the one under the heading");
-
-    // UP from the heading goes on to the shelf above.
-    engine.set(owner, heading_key(&s, 1), Some(heading_group(s.rows[1].group)), By::Restore);
-    let Outcome::Moved { to, .. } = move_from(&s, snapshot.view(), &mut engine, Dir::Up) else {
-        panic!("UP from the heading must reach the shelf above");
-    };
-    assert!(s.rows[0].elems.contains(&to.elem));
-}
-
-#[test]
-fn down_from_the_shelf_above_stops_on_the_heading_and_plain_shelves_keep_projection() {
+fn down_goes_shelf_to_shelf_past_a_collection_heading_and_right_reaches_more() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -2667,28 +2633,35 @@ fn down_from_the_shelf_above_stops_on_the_heading_and_plain_shelves_keep_project
     let Outcome::Moved { to, .. } = move_from(&s, snapshot.view(), &mut engine, Dir::Down) else {
         panic!("DOWN from the shelf above must move");
     };
-    assert_eq!(to, heading_key(&s, 1));
+    assert!(s.rows[1].elems.contains(&to.elem), "DOWN lands on the collection's cards, not a heading");
 
-    // The plain shelf below the collection is entered from its cards and has no heading stop.
+    // RIGHT along the collection row ends on MORE.
+    engine.set(owner, FocusKey { entry: s.entry, elem: s.rows[1].elems[5] },
+        Some(s.rows[1].group), By::Restore);
+    let Outcome::Moved { to, .. } = move_from(&s, snapshot.view(), &mut engine, Dir::Right) else {
+        panic!("RIGHT from the last member must reach MORE");
+    };
+    assert_eq!(to, more_key(&s, 1));
+
+    // UP from the plain shelf below enters the collection's cards too.
     engine.set(owner, FocusKey { entry: s.entry, elem: s.rows[2].elems[0] },
         Some(s.rows[2].group), By::Restore);
     let Outcome::Moved { to, .. } = move_from(&s, snapshot.view(), &mut engine, Dir::Up) else {
         panic!("UP from the plain shelf must move");
     };
-    assert!(s.rows[1].elems.contains(&to.elem),
-        "UP from a plain shelf enters the collection's cards, not its heading");
+    assert!(s.rows[1].elems.contains(&to.elem));
 }
 
 #[test]
-fn ok_on_the_linked_heading_opens_the_collection_page() {
+fn ok_on_more_opens_the_collection_page() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
     let snapshot = collection_home(&mut state, &adapter);
     let mut s = screen(snapshot.view());
     on_grid(&mut s);
-    let heading = heading_key(&s, 1);
-    let (_, out, _) = step(&mut s, snapshot.view(), Some(heading), &ScreenEvent::Activate(heading.elem));
+    let more = more_key(&s, 1);
+    let (_, out, _) = step(&mut s, snapshot.view(), Some(more), &ScreenEvent::Activate(more.elem));
     let pushed: Vec<_> = out.iter().filter_map(|stamped| match &stamped.fx {
         Fx::App(AppFx::Content(ContentReq::Push(arg))) => Some(arg.clone()),
         _ => None,
@@ -2697,35 +2670,11 @@ fn ok_on_the_linked_heading_opens_the_collection_page() {
     assert!(matches!(&pushed[0], ContentArg::Collection(id)
         if id.rk == "50001" && id.sec == 1 && id.tag == 0 && id.name == "Toy Story Collection"), "{:?}", pushed[0]);
     assert!(!has_home(&out, |r| matches!(r, HomeReq::Detail { .. } | HomeReq::Play { .. })),
-        "the heading opens the collection, never a member");
+        "MORE opens the collection, never a member");
 }
 
 #[test]
-fn the_heading_keeps_focus_on_the_grid_and_reveals_its_row() {
-    let _guard = plx_base::testlock::serial();
-    let mut state = plx_data::pms::PmsState::default();
-    let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
-    let snapshot = collection_home(&mut state, &adapter);
-    let mut s = screen(snapshot.view());
-    on_grid(&mut s);
-    let from = FocusKey { entry: s.entry, elem: s.rows[1].elems[0] };
-    let heading = heading_key(&s, 1);
-    step(&mut s, snapshot.view(), Some(heading),
-        &ScreenEvent::FocusMoved { from: Some(from), to: heading, by: By::Dir });
-    assert_eq!(s.snap_target, 1.0, "a heading is on the shelves, not the hero");
-    assert!(s.visible_activation.is_none());
-    // BACK from the heading folds to the hero like any shelf focus.
-    let back = ScreenEvent::Input(InputEvent {
-        at: Tick::default(),
-        source: Source::Sdl,
-        kind: InputKind::Key { key: Key::Back, sym: 0, wcode: 0, edge: Edge::Down, at_edge: false },
-    });
-    let (_, out, _) = step(&mut s, snapshot.view(), Some(heading), &back);
-    assert!(has_home(&out, |r| matches!(r, HomeReq::FoldToHero)));
-}
-
-#[test]
-fn the_linked_heading_is_a_hover_focus_stop_that_wins_over_the_cards() {
+fn more_is_a_pointer_stop_and_the_heading_is_not() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
@@ -2737,40 +2686,30 @@ fn the_linked_heading_is_a_hover_focus_stop_that_wins_over_the_cards() {
     let mut frame = DrawFrame::new(&context, Painter::root());
     s.record_stops(&mut frame, snapshot.view());
     let stops = frame.into_stops();
-    let heading = heading_key(&s, 1);
-    let stop = stops.iter().find(|stop| stop.key == heading).expect("the heading registers a stop");
-    assert_eq!(stop.hover, Hover::Focus);
-    assert!(stops.iter().all(|stop| stop.key.elem != heading_elem(s.rows[0].group)),
-        "an unlinked heading is not a pointer target");
-    let placed = Focusable::<TestHost>::place(&s, &heading.elem, &context, At::Drawn).unwrap();
-    assert_eq!((stop.rect.x, stop.rect.y, stop.rect.w, stop.rect.h),
-        (placed.rect.x, placed.rect.y, placed.rect.w, placed.rect.h), "the hit rect is the drawn face");
-    let mut map = HitMap::new();
-    map.fill(stops);
-    map.swap();
-    let resolution = map.resolve(Some(heading.entry), PointerKind::Click,
-        placed.rect.cx(), placed.rect.cy(), Some(card));
-    assert_eq!(resolution.hit, Some(heading));
+    let more = more_key(&s, 1);
+    assert_eq!(stops.iter().filter(|stop| stop.key.elem & HEADING_BASE != 0).count(),
+        usize::from(stops.iter().any(|stop| stop.key == more)),
+        "the only HEADING_BASE key with a stop is the MORE card itself");
 }
 
 #[test]
-fn back_from_the_collection_page_returns_focus_to_the_heading() {
+fn back_from_the_collection_page_returns_focus_to_more() {
     let _guard = plx_base::testlock::serial();
     let mut state = plx_data::pms::PmsState::default();
     let adapter = std::sync::Arc::new(plx_data::pms::PmsAdapter::default());
     let snapshot = collection_home(&mut state, &adapter);
     let original = screen(snapshot.view());
-    let heading = heading_key(&original, 1);
+    let more = more_key(&original, 1);
     let PageMemory::Home(memory) = <HomeScreen as Screen<TestHost>>::memory(&original) else {
         unreachable!()
     };
-    // An evicted page remounts from its memory; the return state names the heading key.
+    // An evicted page remounts from its memory; the return state names the MORE card's key.
     let mut restored = HomeScreen::new(EntryId(7), InstanceId(9));
     restored.restore(&memory);
     restored.sync_catalog(&cx(snapshot.view(), None));
-    let context = cx(snapshot.view(), Some(heading));
-    assert_eq!(Focusable::<TestHost>::reconcile(&restored, heading, &context), heading,
-        "the heading is a stable key: the restored page lands back on it");
+    let context = cx(snapshot.view(), Some(more));
+    assert_eq!(Focusable::<TestHost>::reconcile(&restored, more, &context), more,
+        "MORE is a stable key: the restored page lands back on it");
 }
 
 /// A shelf whose cards are still below the screen's bottom edge already has its heading on screen:

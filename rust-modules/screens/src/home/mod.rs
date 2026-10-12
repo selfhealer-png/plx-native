@@ -25,7 +25,7 @@ use plx_ui::hero_logo::{self, HeroLogo, LogoRung};
 use plx_ui::hold_hint::{HintInput, HoldHint};
 use plx_ui::icons::Icon;
 use plx_ui::label::{Label, VAlign};
-use plx_ui::linked_heading::{self, LinkedHeading};
+use plx_ui::linked_heading::LinkedHeading;
 use plx_ui::landing_hero::{
     base_scrim_ramp, stack_top as hero_stack_top, COL_W as HERO_COL_W,
     TEXT_BOTTOM as HERO_TEXT_BOTTOM,
@@ -60,10 +60,10 @@ const FIRST_HUB_GROUP: u32 = 0x100;
 const HERO_PLAY_ELEM: u32 = 0;
 const HERO_INFO_ELEM: u32 = 1;
 const FIRST_ITEM_ELEM: u32 = 0x1000;
-/// A collection shelf's linked heading (`ui::linked_heading`) is keyed off its shelf's group: the
-/// heading's group AND its one element are `HEADING_BASE | shelf group`. Both derive from the
-/// interned hub group, so they survive reorder and page memory without a registry of their own;
-/// item elements and hub groups stay below this bit.
+/// A collection shelf's trailing MORE card is keyed off its shelf's group: its element is
+/// `HEADING_BASE | shelf group` (the key the row's linked heading held before the heading stopped
+/// being a stop), so it survives reorder and page memory without a registry of its own; item
+/// elements and hub groups stay below this bit.
 const HEADING_BASE: u32 = 0x8000_0000;
 const HERO_NBTN: usize = 2;
 /// "Connect without encryption?" over the failure read-out (`screens::plaintext_question`): its
@@ -136,19 +136,13 @@ struct HubProjection {
 enum Located {
     Hero(usize),
     Item(usize, usize),
-    /// A collection shelf's linked heading, by row.
-    Heading(usize),
 }
 
 impl Located {
-    /// On the shelves (a card or a linked heading) rather than the hero.
+    /// On the shelves rather than the hero.
     fn on_grid(self) -> bool {
-        matches!(self, Self::Item(..) | Self::Heading(_))
+        matches!(self, Self::Item(..))
     }
-}
-
-fn heading_group(shelf: GroupId) -> GroupId {
-    GroupId(HEADING_BASE | shelf.0)
 }
 
 fn heading_elem(shelf: GroupId) -> u32 {
@@ -710,6 +704,13 @@ impl HomeScreen {
                         sid, id, key, hub.title, hub.items.first().map_or(0, |item| item.sec)),
                 _ => None,
             };
+            // A collection row ends in a MORE card that opens the whole collection: the heading
+            // above it is plain text, so DOWN goes shelf to shelf. It takes the row's last slot
+            // when the row is full, so the motion arrays (MAX_ITEMS) still reach it.
+            if link.is_some() {
+                elems.truncate(MAX_ITEMS - 1);
+                elems.push(heading_elem(group));
+            }
             rows.push(HubProjection {
                 identity,
                 group,
@@ -897,11 +898,6 @@ impl HomeScreen {
             HERO_INFO_ELEM => return Some(Located::Hero(1)),
             _ => {}
         }
-        if elem & HEADING_BASE != 0 {
-            return self.rows.iter().position(|row| {
-                heading_elem(row.group) == elem && row.link.is_some()
-            }).map(Located::Heading);
-        }
         self.elem_at
             .get(&elem)
             .map(|&(row, col)| Located::Item(row as usize, col as usize))
@@ -916,26 +912,24 @@ impl HomeScreen {
     fn focused_grid(&self, focus: Option<FocusKey<u32>>) -> Option<(usize, usize)> {
         match self.focused_loc(focus)? {
             Located::Item(row, col) => Some((row, col)),
-            Located::Hero(_) | Located::Heading(_) => None,
+            Located::Hero(_) => None,
         }
     }
 
-    /// The row a focused linked heading heads.
-    fn focused_heading(&self, focus: Option<FocusKey<u32>>) -> Option<usize> {
-        match self.focused_loc(focus)? {
-            Located::Heading(row) => Some(row),
-            Located::Hero(_) | Located::Item(..) => None,
-        }
-    }
-
-    /// The row whose label band is open (or opening) for `focus` — the focused card's row, `None`
-    /// on a linked heading, and `fallback` (the row a hero→grid door would open) otherwise.
+    /// The row whose label band is open (or opening) for `focus` — the focused card's row, and
+    /// `fallback` (the row a hero→grid door would open) otherwise.
     fn band_row(&self, focus: Option<FocusKey<u32>>, fallback: usize) -> Option<usize> {
         match self.focused_loc(focus) {
             Some(Located::Item(row, _)) => Some(row),
-            Some(Located::Heading(_)) => None,
             Some(Located::Hero(_)) | None => Some(fallback),
         }
+    }
+
+    /// The column of `row`'s trailing MORE card, when the row is a linked collection shelf.
+    fn more_col(&self, row: usize) -> Option<usize> {
+        let projection = self.rows.get(row)?;
+        projection.link.as_ref()?;
+        projection.elems.len().checked_sub(1)
     }
 
     /// Where a row's linked heading leads, if it has one.
@@ -949,20 +943,6 @@ impl HomeScreen {
         self.linked(row)?;
         let hub = self.hub(view, row)?;
         Some(LinkedHeading::heading(hub.title, hub.source).total(hub.total))
-    }
-
-    /// The heading's face: its cap top rides the row exactly as an unlinked heading does.
-    fn heading_rect(&self, view: HubsView<'_>, row: usize, measure: &dyn Measure, at: At,
-        focus: Option<FocusKey<u32>>) -> Option<Rect> {
-        let heading = self.heading_widget(view, row)?;
-        let m = heading.measure(measure);
-        let focused = self.focused_heading(focus) == Some(row);
-        let y = match at {
-            At::Drawn => heading_y(self.grid.base_y(row), self.grid.lift(row)),
-            At::SpringTarget => GRID_TOP_Y + shelf_top_banded(row, self.band_row(focus, row))
-                - self.grid.scroll_target - TITLE_DY,
-        };
-        Some(heading.face_rect(MARGIN_X, y, f32::from(focused), &m))
     }
 
     fn visible_focus(&self, focus: Option<FocusKey<u32>>) -> Option<FocusKey<u32>> {
@@ -1013,8 +993,7 @@ impl HomeScreen {
             shelf.on(&ScreenEvent::Tick(t), cx, &src, fx);
         }
         self.grid.shelves = shelves;
-        let revealed = focused.map(|(row, _)| (row, Some(row)))
-            .or_else(|| self.focused_heading(cx.focus.current).map(|row| (row, None)));
+        let revealed = focused.map(|(row, _)| (row, Some(row)));
         if let Some((row, band_row)) = revealed.filter(|(r, _)| *r < self.rows.len()) {
             let (lo, hi) = row_reveal_band(shelf_top_banded(row, band_row));
             self.grid.scroll_target = ui_cards::reveal(
@@ -1413,9 +1392,9 @@ impl HomeScreen {
                 )
             }
             Located::Hero(_) => return,
-            Located::Heading(row) => {
-                // OK on a linked heading opens the collection it names. BACK from that page
-                // returns here: the heading is an ordinary engine key the return state restores.
+            // OK on a collection row's MORE card opens the collection it names. BACK from that
+            // page returns here: the card is an ordinary engine key the return state restores.
+            Located::Item(row, col) if self.more_col(row) == Some(col) => {
                 if let Some(link) = self.linked(row) {
                     fx.push(Fx::App(AppFx::Content(ContentReq::Push(ContentArg::Collection(
                         link.clone(),
@@ -1490,8 +1469,8 @@ impl HomeScreen {
             });
         }
         plx_ui::profile::phase("hm.grid", || {
-            let heading = self.focused_heading(visible_focus);
-            self.draw_grid(f, view, &env, p, heading)
+            let _ = visible_focus;
+            self.draw_grid(f, view, &env, p, None)
         });
         plx_ui::profile::phase("hm.status", || self.draw_status(view, &env, p, focus));
         plx_ui::testpat::underlay(p);
@@ -1745,17 +1724,6 @@ impl HomeScreen {
                 if let Some(shelf) = self.grid.shelves.get(row_index) {
                     shelf.record_stops(f, f.painter, &src, self.section(row_index));
                 }
-                // After the row's tiles, so a popped tile's glow never wins the heading's hit.
-                if let (Some(heading), Some(rect)) = (
-                    self.heading_widget(view, row_index),
-                    self.heading_rect(view, row_index, f.measure, At::Drawn, focus),
-                ) {
-                    let visible = rect.y >= plx_ui::widgets::TOP_BAR_BOTTOM
-                        && rect.y + rect.h <= SCR_H;
-                    if visible {
-                        heading.stop(f, rect, FocusKey { entry: self.entry, elem: heading_elem(row.group) });
-                    }
-                }
             }
         }
     }
@@ -1772,8 +1740,8 @@ impl HomeScreen {
         let view = H::hubs(cx);
         match self.focused_loc(focus)? {
             Located::Hero(_) => self.selected_hero(view).map(|h| h.item),
+            Located::Item(row, col) if self.more_col(row) == Some(col) => None,
             Located::Item(row, col) => self.item_at(view, row, col),
-            Located::Heading(_) => None,
         }
     }
 
@@ -1966,29 +1934,10 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
         let band_row = self.band_row(cx.focus.current, 0);
         for (row, projection) in self.rows.iter().enumerate() {
             let top = GRID_TOP_Y + shelf_top_banded(row, band_row) - self.grid.scroll_target;
-            let linked = self.linked(row).is_some();
-            if linked {
-                if let Some(rect) =
-                    self.heading_rect(view, row, cx.measure, At::SpringTarget, cx.focus.current)
-                {
-                    out.push(linked_heading::group_spec(heading_group(projection.group), rect));
-                }
-            }
             out.push(GroupSpec {
                 id: projection.group,
                 kind: GroupKind::Row { wrap: false },
-                // DOWN from the linked heading returns to the card this shelf remembered;
-                // every other door keeps the shelf's nearest-column projection.
-                seat: if linked {
-                    linked_heading::shelf_seat(
-                        &cx.focus,
-                        heading_elem(projection.group),
-                        projection.group,
-                        Seat::Nearest,
-                    )
-                } else {
-                    Seat::Nearest
-                },
+                seat: Seat::Nearest,
                 reachable: AxisMask::BOTH,
                 edge: [
                     EdgeRule::Geometric,
@@ -2015,7 +1964,6 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
         match self.locate(*key)? {
             Located::Hero(index) => (index < hero_group_len(H::hubs(cx))).then_some(HERO_GROUP),
             Located::Item(row, _) => self.rows.get(row).map(|r| r.group),
-            Located::Heading(row) => self.rows.get(row).map(|r| heading_group(r.group)),
         }
     }
 
@@ -2043,8 +1991,7 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
                     .copied(),
                 _ => None,
             },
-            // One element, LEFT/RIGHT inert; UP/DOWN are the group's doors.
-            Some(Located::Heading(_)) | None => None,
+            None => None,
         };
         next.map(|elem| {
             Step::Move(FocusKey {
@@ -2088,20 +2035,6 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
                     index: Some(index as u32),
                 })
             }
-            Located::Heading(row) => {
-                let rect = self.heading_rect(view, row, cx.measure, at, cx.focus.current)?;
-                Some(Placed {
-                    rect,
-                    rest_rect: rect,
-                    clip: Rect::new(
-                        0.0,
-                        plx_ui::widgets::TOP_BAR_BOTTOM,
-                        SCR_W,
-                        SCR_H - plx_ui::widgets::TOP_BAR_BOTTOM,
-                    ),
-                    index: None,
-                })
-            }
             Located::Item(row, _) => {
                 let shelf = self.grid.shelves.get(row)?;
                 if matches!(at, At::Drawn) {
@@ -2142,7 +2075,7 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
         if let Some(located) = self.locate(want.elem) {
             let valid = match located {
                 Located::Hero(index) => index < hero_group_len(H::hubs(cx)),
-                Located::Item(_, _) | Located::Heading(_) => true,
+                Located::Item(_, _) => true,
             };
             if valid {
                 return want;
@@ -2184,12 +2117,6 @@ impl<H: HomeLike> Focusable<H> for HomeScreen {
             return FocusKey {
                 entry: self.entry,
                 elem: HERO_PLAY_ELEM,
-            };
-        }
-        if let Some(row) = self.rows.iter().find(|r| heading_group(r.group) == group) {
-            return FocusKey {
-                entry: self.entry,
-                elem: heading_elem(row.group),
             };
         }
         let Some((row_index, row)) = self.rows.iter().enumerate().find(|(_, r)| r.group == group)
@@ -2344,7 +2271,7 @@ impl<H: HomeLike> Machine<H> for HomeScreen {
                 }
                 match to_loc {
                     Some(Located::Hero(_)) => self.snap_target = 0.0,
-                    Some(Located::Item(_, _) | Located::Heading(_)) => self.snap_target = 1.0,
+                    Some(Located::Item(_, _)) => self.snap_target = 1.0,
                     None => {}
                 }
                 if matches!(by, By::Restore) && self.restore_reveal {
@@ -2499,20 +2426,6 @@ impl<H: HomeLike> Screen<H> for HomeScreen {
             dir: Dir::Up,
             to: plx_ui::containers::tabs::STRIP,
         });
-        // A collection shelf's linked heading sits between the shelf above and its own cards:
-        // UP from any card reaches it, DOWN returns to the remembered card, and it is the next
-        // stop DOWN from the shelf above. The engine takes the FIRST matching link, so these
-        // precede the first shelf's UP door to the hero.
-        for (row, projection) in self.rows.iter().enumerate() {
-            if projection.link.is_none() {
-                continue;
-            }
-            let heading = heading_group(projection.group);
-            out.extend(linked_heading::links(heading, projection.group));
-            let above = row.checked_sub(1).map_or(HERO_GROUP, |r| self.rows[r].group);
-            out.push(Link { from: heading, dir: Dir::Up, to: above });
-            out.push(Link { from: above, dir: Dir::Down, to: heading });
-        }
         if let Some(first) = self.rows.first() {
             out.push(Link {
                 from: HERO_GROUP,
@@ -2948,7 +2861,27 @@ struct HomeCards<'a> {
 
 impl<'a> HomeCards<'a> {
     fn item(&self, i: usize) -> Option<&'a PmsMovie> {
+        if self.is_more(i) {
+            return None;
+        }
         self.home.item_at(self.view, self.row, i)
+    }
+
+    /// Card `i` is the row's trailing MORE card.
+    fn is_more(&self, i: usize) -> bool {
+        self.home.more_col(self.row) == Some(i)
+    }
+}
+
+/// The MORE card's face: the neutral collection tile (`ui::collection_tile`) under the shared
+/// MORE mark, carrying the collection's member count where the hub states one. Not a
+/// placeholder: absence is drawn on `CARD_ABSENT` and is never counted as loading.
+fn more_facts(total: usize) -> plx_ui::tile::TileFacts<'static> {
+    plx_ui::tile::TileFacts {
+        kind: plx_ui::tile::TileKind::Collection,
+        title: plx_platform::i18n::msg::browse_action_more(),
+        child_count: total as i64,
+        ..plx_ui::tile::TileFacts::default()
     }
 }
 
@@ -2975,6 +2908,10 @@ impl<H: HomeLike> CardSource<H> for HomeCards<'_> {
     }
 
     fn art(&self, i: usize) -> Art<'_> {
+        if self.is_more(i) {
+            let total = self.view.hub(self.row).map_or(0, |hub| hub.total);
+            return Art::Poster(Some(more_facts(total)));
+        }
         Art::Poster(self.item(i).map(tile_facts::of))
     }
 
@@ -2991,7 +2928,7 @@ impl<H: HomeLike> CardSource<H> for HomeCards<'_> {
     }
 
     fn loaded(&self, i: usize) -> bool {
-        self.item(i).is_some()
+        self.is_more(i) || self.item(i).is_some()
     }
 
     fn hover(&self, _i: usize) -> Hover {
