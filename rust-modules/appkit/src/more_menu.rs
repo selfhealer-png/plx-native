@@ -89,10 +89,6 @@ pub enum Action {
     /// as in `account_menu` because the account menu is unreachable during playback, and playback
     /// is what a Cloud Test Lab session is usually reproducing.
     SendDiagnostics,
-    /// Start the queue's next episode now, wherever the playhead is — the same descriptor and the
-    /// same `play_up_next` the credits countdown uses, offered only while one is queued. There is
-    /// no on-screen prompt for it: it lives here so it is reachable only with the controls up.
-    NextEpisode,
 }
 
 /// **A drill-in page of the More menu** — the form's `Dest`. The root is the empty page stack, not
@@ -182,7 +178,6 @@ impl FormId for Action {
             Action::None => 0,
             Action::ToggleStats => 1,
             Action::SendDiagnostics => 2,
-            Action::NextEpisode => 5,
             Action::SetQuality(Quality::Auto) => 10,
             Action::SetQuality(Quality::Original) => 11,
             Action::SetQuality(Quality::P1080High) => 12,
@@ -197,7 +192,7 @@ impl FormId for Action {
 impl FormId for MoreRow {
     fn key(&self) -> RowKey {
         match self {
-            // free in `Action`'s key space (0..=2, 5 and 10..=16)
+            // free in `Action`'s key space (0..=2 and 10..=16)
             MoreRow::OpenQuality => RowKey(3),
             MoreRow::Act(a) => a.key(),
         }
@@ -219,15 +214,8 @@ fn root_form(
     forced: bool,
     current: plx_media::route::Quality,
 ) -> MoreForm {
-    let next = FormSection::new("").item_if(
-        rows.contains(&Action::NextEpisode),
-        MoreRow::Act(Action::NextEpisode),
-        RowKind::Button,
-        Action::NextEpisode,
-        row_for(ps, Action::NextEpisode),
-    );
     let mut options = FormSection::new(plx_platform::i18n::msg::widgets_menu_options());
-    for a in rows.iter().copied().filter(|a| !matches!(a, Action::SetQuality(_) | Action::NextEpisode)) {
+    for a in rows.iter().copied().filter(|a| !matches!(a, Action::SetQuality(_))) {
         options = options.item(MoreRow::Act(a), RowKind::Button, a, row_for(ps, a));
     }
     let quality = FormSection::new("").item_if(
@@ -237,7 +225,7 @@ fn root_form(
         Action::None,
         Row::new(plx_platform::i18n::msg::widgets_menu_quality()).value(current.label()),
     );
-    Form::new().section(next).section(quality).section(options)
+    Form::new().section(quality).section(options)
 }
 
 /// The Quality PAGE: one checked-rung row per rung of `rows`, the current one checked.
@@ -260,7 +248,7 @@ fn quality_form(
 impl MoreMenuState {
     fn open_focused(ps: &plx_media::route::PlaybackSession, quality: Option<plx_media::route::Quality>) -> Self {
         let forced = plx_media::route::forced_direct_play(ps);
-        let rows = rows_for_session(ps, forced);
+        let rows = rows_for(forced);
         let current = plx_media::route::quality();
         let mut form = FormTable::new(plx_ui::table_screen::BAND_BASE);
         form.table.compact = true; // a short action list — BODY labels, like the profile menu
@@ -361,7 +349,7 @@ impl MoreMenuState {
     /// follows, and the card animates to it ([`Self::update`]). Returns whether it rebuilt.
     pub fn refresh(&mut self, ps: &plx_media::route::PlaybackSession) -> bool {
         let forced = plx_media::route::forced_direct_play(ps);
-        self.refresh_to(ps, forced, rows_for_session(ps, forced), plx_media::route::quality())
+        self.refresh_to(ps, forced, rows_for(forced), plx_media::route::quality())
     }
 
     /// [`Self::refresh`] against explicit answers (what a test or a probe supplies in place of the
@@ -629,15 +617,6 @@ where
 /// the server to convert, and Force forbids conversion, so under it no rung can change what plays:
 /// a row that cannot change the outcome is not offered (the same rule as the failure read-out's
 /// `player::failure_actions`). Pure over the flag so both shapes are testable without a session.
-/// [`rows_for`], with Next episode first while the queue has one (`route::up_next`).
-fn rows_for_session(ps: &plx_media::route::PlaybackSession, forced: bool) -> Vec<Action> {
-    let mut v = rows_for(forced);
-    if plx_media::route::up_next(ps).is_some() {
-        v.insert(0, Action::NextEpisode);
-    }
-    v
-}
-
 fn rows_for(forced: bool) -> Vec<Action> {
     let mut v: Vec<Action> = if forced {
         Vec::new()
@@ -661,7 +640,6 @@ fn label(a: Action) -> std::borrow::Cow<'static, str> {
         // the picker's leading mark (see this module's doc)
         Action::SetQuality(q) => q.label().into(),
         Action::SendDiagnostics => plx_platform::i18n::msg::widgets_menu_diagnostics().into(),
-        Action::NextEpisode => plx_platform::i18n::msg::widgets_menu_next_episode().into(),
         Action::None => "".into(),
     }
 }
@@ -693,7 +671,7 @@ fn is_on(a: Action) -> bool {
     match a {
         Action::ToggleStats => stats_on(),
         // a rung is not a switch — see `row_for`, which gives it the leading mark instead
-        Action::SetQuality(_) | Action::SendDiagnostics | Action::NextEpisode | Action::None => false,
+        Action::SetQuality(_) | Action::SendDiagnostics | Action::None => false,
     }
 }
 
@@ -733,7 +711,6 @@ fn quality_detail(q: plx_media::route::Quality, source_decodable: bool) -> &'sta
 fn row_for(ps: &plx_media::route::PlaybackSession, a: Action) -> Row {
     match a {
         Action::SetQuality(q) => Row::new(label(a)).detail(quality_detail(q, plx_media::route::source_decodable(ps))),
-        Action::NextEpisode => Row::new(label(a)),
         _ => Row::new(label(a)).toggle(is_on(a)),
     }
 }
@@ -838,27 +815,6 @@ mod tests {
         form.table.compact = true;
         form.set_or_open(root_form(&ps, &rows, forced, current), None);
         MoreMenuState { form, rows, forced, current, pages: PageStack::new(), motion: PanelMotion::new() }
-    }
-
-    /// **Next episode leads the root while one is queued, and is absent otherwise.** It is an
-    /// action, so it carries no On/Off word, and OK reports it rather than navigating.
-    #[test]
-    fn next_episode_leads_the_root_only_when_a_next_episode_is_queued() {
-        let ps = plx_media::route::PlaybackSession::default();
-        let current = plx_media::route::Quality::Original;
-        let mut rows = rows_for(false);
-        rows.insert(0, Action::NextEpisode);
-        let mut form = FormTable::new(plx_ui::table_screen::BAND_BASE);
-        form.table.compact = true;
-        form.set_or_open(root_form(&ps, &rows, false, current), None);
-        assert_eq!(form.id_at(0), Some(&MoreRow::Act(Action::NextEpisode)));
-        let mut st = MoreMenuState { form, rows, forced: false, current, pages: PageStack::new(), motion: PanelMotion::new() };
-        st.focus_key(Action::NextEpisode.key().0);
-        assert_eq!(st.on_ok(&ps), MoreOk::Action(Action::NextEpisode));
-
-        let without = menu(false, current);
-        assert!(!without.rows.contains(&Action::NextEpisode), "a default session queues nothing");
-        assert_eq!(rows_for_session(&ps, false), rows_for(false));
     }
 
     /// The same menu with the Quality page pushed (and its slide skipped).
