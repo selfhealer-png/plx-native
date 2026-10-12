@@ -2564,8 +2564,12 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                         // are unaffected by whether the digits are painted.
                         // A supersampled simulator render (`surface::render_scale`) exists to be
                         // captured, so it leaves the diagnostic digits out of the picture.
+                        //
+                        // Off unless `/tmp/plxnative-fpscounter` is armed: a debug build is also
+                        // what a Developer Mode owner watches films on, and the digits sat in the
+                        // corner of every screen. The heartbeat's `fps=` carries the same number.
                         #[cfg(feature = "devtools")]
-                        if plx_base::surface::render_scale() == 1 {
+                        if plx_base::surface::render_scale() == 1 && fps_counter_armed() {
                             let fps_col = if app.buffer_flip_count < 30 {
                                 plx_ui::theme::DIAG_FLIP_A
                             } else {
@@ -2800,6 +2804,12 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
             let _ = plx_base::diag::spans::take();
         }
 }
+
+plx_base::devtrig::latched_flag!(
+    /// `/tmp/plxnative-fpscounter` — paint the dev on-screen frame counter (top right).
+    #[cfg(feature = "devtools")]
+    fn fps_counter_armed = "fpscounter";
+);
 
 /// The once/sec heartbeat line and its counters.
 pub(crate) unsafe fn heartbeat(app: &mut App, fr: &mut Frame) {
