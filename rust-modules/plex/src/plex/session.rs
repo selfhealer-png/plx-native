@@ -1459,12 +1459,24 @@ pub enum UiResolution {
     Hd900,
     #[serde(rename = "720p")]
     Hd720,
+    #[serde(rename = "576p")]
+    Sd576,
+    /// 960 is a power-of-two multiple of 15, which the Home underlay field needs, so it is on here
+    /// again where 1280x720 switches it off.
+    #[serde(rename = "540p")]
+    Sd540,
 }
 
 impl UiResolution {
     /// Every option, the order the setting cycles through them in.
-    pub const LADDER: [UiResolution; 4] =
-        [UiResolution::Auto, UiResolution::Full1080, UiResolution::Hd900, UiResolution::Hd720];
+    pub const LADDER: [UiResolution; 6] = [
+        UiResolution::Auto,
+        UiResolution::Full1080,
+        UiResolution::Hd900,
+        UiResolution::Hd720,
+        UiResolution::Sd576,
+        UiResolution::Sd540,
+    ];
 
     /// The next option, wrapping — what one press of the setting's row selects.
     pub fn next(self) -> UiResolution {
@@ -1479,6 +1491,8 @@ impl UiResolution {
             UiResolution::Full1080 => Some((1920, 1080)),
             UiResolution::Hd900 => Some((1600, 900)),
             UiResolution::Hd720 => Some((1280, 720)),
+            UiResolution::Sd576 => Some((1024, 576)),
+            UiResolution::Sd540 => Some((960, 540)),
         }
     }
 }
@@ -6267,7 +6281,9 @@ mod ui_preference_tests {
     #[test]
     fn the_resolution_ladder_cycles_and_names_its_sizes() {
         assert_eq!(UiResolution::Auto.next(), UiResolution::Full1080);
-        assert_eq!(UiResolution::Hd720.next(), UiResolution::Auto, "wraps");
+        assert_eq!(UiResolution::Hd720.next(), UiResolution::Sd576);
+        assert_eq!(UiResolution::Sd540.next(), UiResolution::Auto, "wraps");
+        assert_eq!(UiResolution::Sd540.size(), Some((960, 540)));
         assert_eq!(UiResolution::Auto.size(), None);
         assert_eq!(UiResolution::Hd900.size(), Some((1600, 900)));
     }
