@@ -128,7 +128,8 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
         // Lab builds only. Nothing about playback changes: the snapshot is taken and the toast
         // reports, over whatever the player is doing.
         plx_appkit::more_menu::Action::SendDiagnostics => crate::lab::request_upload("menu", ps),
-        plx_appkit::more_menu::Action::None => {}
+        // Answered by the caller, which holds the page stack `play_up_next` needs.
+        plx_appkit::more_menu::Action::NextEpisode | plx_appkit::more_menu::Action::None => {}
     }
 }
 
@@ -599,6 +600,13 @@ pub(crate) fn player_requests(
             // …and its twin, which does NOT resume: the scrub bar is how a paused film is moved.
             // `repause_at` is an `App` field, which is exactly why this is a request.
             PlayerReq::CommitSeek(ns) => commit_seek(ns, repause_at),
+            // Next episode needs the page stack (`play_up_next` closes the overlays), which
+            // `apply_more_action` is not handed, so it is answered here.
+            PlayerReq::More(plx_appkit::more_menu::Action::NextEpisode) => {
+                if !play_up_next(ps, pa, HUD_LINGER_MS, pages, bridge) {
+                    log("more: next episode asked for, none queued");
+                }
+            }
             PlayerReq::More(action) => apply_more_action(ps, pa, bridge, action),
             PlayerReq::CommitTrack(commit) => commit_track(ps, commit),
             PlayerReq::ArmInfoPress => {
