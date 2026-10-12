@@ -71,8 +71,10 @@ fn drawable() -> (i32, i32) {
 
 /// **Uniform** logical -> physical scale: `min(dw/1920, dh/1080)`.
 ///
-/// 1.0 on every device this has ever run on, and the fast path stays exactly that — `scale() == 1.0`
-/// means every drawn coordinate is already a pixel and the crispness contract holds unchanged.
+/// 1.0 on webOS 4 and later, and the fast path stays exactly that — `scale() == 1.0` means every
+/// drawn coordinate is already a pixel and the crispness contract holds unchanged. **0.667 on
+/// webOS 1-3**, which asks for a 1280x720 window because its GPU is fill-rate bound at 1080p
+/// (`app::boot::requested_drawable` has the measurement); the compositor fills the panel.
 ///
 /// It is `min`, not `dw/1920`, because the alternative is a stretched interface. Stretching to fill
 /// only looks harmless while every drawable is 16:9 — which is true of televisions, and is exactly

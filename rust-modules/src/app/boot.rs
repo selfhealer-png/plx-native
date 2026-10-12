@@ -385,20 +385,34 @@ pub(crate) unsafe fn hide_cursor() {
         }
     }
 }
-/// `/tmp/plxnative-drawable=<W>x<H>` — EXPERIMENT: ask for a smaller window than the 1920x1080
-/// canvas, so GL fills fewer pixels and the compositor upscales. On a 3.4.3 set Home is fill-rate
-/// bound (frame prep about 1.5 ms, half of all frames over 16.7 ms, unchanged with the tab glass
-/// off), and 1280x720 is 2.25x fewer pixels. `surface::probe` reads back what was granted, and
-/// `scale`/`viewport` letterbox the canvas into it; that path had never run on a television, and
-/// text is softer below 1:1. Bounded to 640x360..=1920x1080 so a typo cannot ask for nonsense.
+/// The window to ask for: 1920x1080 (the canvas) on webOS 4 and later, **1280x720 on webOS 1-3**,
+/// and whatever `/tmp/plxnative-drawable=<W>x<H>` says when that trigger is armed (debug builds).
+///
+/// Why 3.x draws smaller. On a 2016 set (webOS 3.4.3, Mali-T760) Home is fill-rate bound: frame
+/// prep is about 1.5 ms, half of all frames ran over 16.7 ms, poster uploads barely moved it and
+/// turning the tab glass off did not move it at all. At 1280x720 (2.25x fewer pixels) webOS
+/// granted the surface, the compositor filled the panel, and Home went from 9% to 65% of seconds
+/// at 58-61 fps, frames over 33 ms from 7.1% to 0.5%. `surface::probe` reads back what was
+/// granted and `scale`/`viewport` fit the 1920x1080 canvas into it; text is softer below 1:1, which
+/// the owner of that set judged fine. The trigger is bounded to 640x360..=1920x1080.
 #[cfg(not(feature = "hostsim"))]
 fn requested_drawable() -> Option<(c_int, c_int)> {
-    let v = plx_base::devtrig::read("drawable")?;
-    let (w, h) = v.trim().split_once('x')?;
-    let (w, h): (c_int, c_int) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
-    let ok = (640..=SCR_W).contains(&w) && (360..=SCR_H).contains(&h);
-    log(&format!("surface: drawable experiment {w}x{h} requested={}", if ok { "yes" } else { "refused" }));
-    ok.then_some((w, h))
+    if let Some(v) = plx_base::devtrig::read("drawable") {
+        let parsed = v.trim().split_once('x').and_then(|(w, h)| {
+            Some((w.trim().parse::<c_int>().ok()?, h.trim().parse::<c_int>().ok()?))
+        });
+        let ok = parsed.filter(|&(w, h)| (640..=SCR_W).contains(&w) && (360..=SCR_H).contains(&h));
+        log(&format!("surface: drawable trigger {:?} -> {:?}", v.trim(), ok));
+        if ok.is_some() {
+            return ok;
+        }
+    }
+    let major = plx_platform::tv::device::info().major;
+    let small = (1..=3).contains(&major);
+    if small {
+        log(&format!("surface: webOS {major} draws 1280x720 (fill-rate bound below webOS 4)"));
+    }
+    small.then_some((1280, 720))
 }
 
 /// Every 30th heartbeat, one `mem:` line: this process's resident and peak memory and what the
