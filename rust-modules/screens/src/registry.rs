@@ -82,13 +82,9 @@ pub enum PreferenceCmd {
         update: plx_plex::plex::account::PreferenceUpdate,
         reply: std::sync::mpsc::Sender<AccountPreferenceReply>,
     },
-    Quality { quality: plx_plex::plex::session::PlaybackQuality, reply: std::sync::mpsc::Sender<bool> },
-    DirectPlay { mode: plx_plex::plex::session::DirectPlayMode, reply: std::sync::mpsc::Sender<bool> },
-    NextEpisode { mode: plx_plex::plex::session::NextEpisodeMode, reply: std::sync::mpsc::Sender<bool> },
-    SkipInterval { interval: plx_plex::plex::session::SkipInterval, reply: std::sync::mpsc::Sender<bool> },
-    DeckPress { mode: plx_plex::plex::session::DeckPress, reply: std::sync::mpsc::Sender<bool> },
-    SubtitleSize { size: plx_plex::plex::session::SubtitleSize, reply: std::sync::mpsc::Sender<bool> },
-    SubtitlePosition { position: plx_plex::plex::session::SubtitlePosition, reply: std::sync::mpsc::Sender<bool> },
+    /// One live player setting's pick (`plx_media::route::Choice`): the app writes it through the
+    /// media door, and `reply` learns whether the write was durable.
+    Choose(plx_media::route::Choice, std::sync::mpsc::Sender<bool>),
     Language { language: plx_platform::i18n::Preference, reply: std::sync::mpsc::Sender<bool> },
 }
 
@@ -96,6 +92,11 @@ pub enum PreferenceCmd {
 /// app declines a menu with and the card screens' hold hint is gated by. The screens reach it
 /// here, never by naming the sibling `item_menu`.
 pub use crate::item_menu::has_actions as item_has_menu;
+/// The panels a sibling screen's host test reads through the shared vocabulary (the `sibling` gate
+/// admits only `crate::registry`): the Detail page's tests drive the real About panel and compare
+/// the audio summary against the tracks panel's full list.
+#[cfg(test)]
+pub(crate) use crate::{about_panel::AboutPanelScreen, tracks_panel::audio_rows as tracks_panel_audio_rows};
 
 /// **What the item context menu asks of the loop**, once its own `step` has resolved the pressed
 /// row to an [`crate::item_menu::Action`].
@@ -263,7 +264,9 @@ pub enum LibraryReq {
     PublishShelves { target: plx_data::stores::browse::SectionAddress, hidden_page: bool, at_head: bool },
     Menu { kind: LibraryMenuKind, anchor: [u32; 4], target: plx_data::stores::browse::SectionAddress },
     Play { sid: plx_plex::plex::ServerId, rk: String, resume_ns: i64 },
-    Detail { sid: plx_plex::plex::ServerId, rk: String },
+    /// Open the item's page. `from_deck` is the SHELF's answer (this library's own Continue
+    /// Watching shelf): a deck episode opens its show, any other card its own page.
+    Detail { sid: plx_plex::plex::ServerId, rk: String, from_deck: bool },
     ItemMenu { sid: plx_plex::plex::ServerId, rk: String, from_deck: bool },
     Account,
     Tab(HomeTab),
@@ -536,6 +539,28 @@ pub struct CardIdentity {
     pub elem: u32,
 }
 
+/// The slot ranges to project, sorted and merged, clamped to `total`. Shared by the sliding-window
+/// key projections of the Library grid and the Collection page.
+pub(crate) fn merged_ranges(mut ranges: Vec<std::ops::Range<usize>>, total: usize) -> Vec<std::ops::Range<usize>> {
+    ranges.retain_mut(|r| { r.end = r.end.min(total); r.start < r.end });
+    ranges.sort_by_key(|r| r.start);
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for r in ranges {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// The slots of the grid row holding `index` and the row either side, for a grid `cols` wide: the
+/// neighbourhood a focus or a restore keeps keys for.
+pub(crate) fn row_neighbourhood(index: usize, cols: usize) -> std::ops::Range<usize> {
+    let row = index / cols.max(1);
+    row.saturating_sub(1) * cols..(row + 2) * cols
+}
+
 /// A card page's stable item-key interning: which engine element each `(sid, rk)` card owns, and
 /// the next element to hand out. It maps identities to elements and never stores which one is
 /// focused. The Person and Collection pages share it; each page picks its own first element.
@@ -605,11 +630,52 @@ impl CardKeys {
 
     pub fn len(&self) -> usize { self.keys.len() }
 
+    /// Bounds the table: above twice `window` (the cells the page keeps keys for) plus 256, the
+    /// oldest-interned keys go. A key `keep` names (a card projected now or a sync ago, the
+    /// focused member, the member a Back restores to, the group's remembered key) is never
+    /// dropped, so the table may stand over the bound only by those. `next` never moves back, so a
+    /// dropped element is not handed out again.
+    pub fn prune(&mut self, window: usize, keep: impl Fn(u32) -> bool) {
+        let excess = self.keys.len().saturating_sub(key_cap(window));
+        if excess == 0 { return; }
+        let drop = unlive_excess(self.keys.iter().map(|key| key.elem), keep, excess, EvictOrder::Table);
+        self.keys.retain(|key| !drop.contains(&key.elem));
+    }
+
     /// This registry's canonical bytes after the page's `next` — `len` then `(sid, rk, elem)` per
     /// key, the order every card page and both [`PageMemory`] arms have always written.
     fn write_keys(&self, c: &mut plx_machine::machine::Canon) {
         for key in &self.keys { c.u32(u32::from(key.sid.raw())).str(&key.rk).u32(key.elem); }
     }
+}
+
+/// The slack every key table keeps above twice its live cells before it evicts.
+const KEY_SLACK: usize = 256;
+
+/// The size a key table may reach before the oldest unlive keys go: twice `live` plus [`KEY_SLACK`].
+pub(crate) fn key_cap(live: usize) -> usize { 2 * live + KEY_SLACK }
+
+/// Which keys of a table go first when it stands over its bound.
+#[derive(Clone, Copy)]
+pub(crate) enum EvictOrder {
+    /// Lowest element number first (elements are minted in order, so the oldest-interned).
+    Elem,
+    /// Table order, as the keys were stored.
+    Table,
+}
+
+/// The `excess` keys to drop from a table that stands over its bound: those of `elems` that `live`
+/// does not hold, in `order`. Fewer come back when too few are unlive.
+pub(crate) fn unlive_excess(
+    elems: impl Iterator<Item = u32>,
+    live: impl Fn(u32) -> bool,
+    excess: usize,
+    order: EvictOrder,
+) -> std::collections::HashSet<u32> {
+    let mut unlive: Vec<u32> = elems.filter(|&elem| !live(elem)).collect();
+    if matches!(order, EvictOrder::Elem) { unlive.sort_unstable(); }
+    unlive.truncate(excess);
+    unlive.into_iter().collect()
 }
 
 /// What a card page (Person, Collection) leaves behind on a push: its [`CardKeys`] and whether an
@@ -618,6 +684,12 @@ impl CardKeys {
 pub struct CardPageMemory {
     pub cards: CardKeys,
     pub header_marked: bool,
+    /// A listing page's directory (Collection): its total, one kept-row count per page read, the
+    /// focused member's index and element. Empty for a page that has none.
+    pub total: usize,
+    pub counts: Vec<u8>,
+    pub focus_index: Option<usize>,
+    pub focus_elem: Option<u32>,
 }
 
 impl CardPageMemory {
@@ -625,6 +697,12 @@ impl CardPageMemory {
     fn write(&self, tag: u32, c: &mut plx_machine::machine::Canon) {
         c.u32(tag).u32(self.cards.next).bool(self.header_marked).seq(self.cards.len());
         self.cards.write_keys(c);
+        if tag == 7 {
+            c.u64(self.total as u64).seq(self.counts.len());
+            for &kept in &self.counts { c.u32(u32::from(kept)); }
+            c.bool(self.focus_index.is_some()).u64(self.focus_index.unwrap_or(0) as u64)
+                .bool(self.focus_elem.is_some()).u32(self.focus_elem.unwrap_or(0));
+        }
     }
 }
 
@@ -705,6 +783,20 @@ pub enum PageMemory {
     Home(HomeMemory),
     Library(LibraryMemory),
     Search(crate::search::Memory),
+}
+
+impl PageMemory {
+    /// What an entry far below the top keeps (`plx_ui::containers::stack::DEEP`): Detail's key
+    /// table shrinks to the focused card's identity, so the page that reloads on return seats the
+    /// same card by it; `next_elem` stays, so no key minted later reuses a released number. The
+    /// other pages bound their own memory (Home and Library prune theirs, the card pages keep one
+    /// key per card the store holds) and are left as they are.
+    pub fn shed_to_identity(&mut self, focus: Option<u32>) {
+        if let Self::Detail(memory) = self {
+            memory.keys.retain(|key| Some(key.elem) == focus);
+            memory.keys.shrink_to_fit();
+        }
+    }
 }
 
 impl plx_machine::machine::LogicalState for DetailIdentity {
@@ -1365,6 +1457,35 @@ mod repeat_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The card key table is bounded by twice the window plus 256: the oldest-interned keys go,
+    /// and a key the page names (focus, restore target, remembered key, a card in view) never does.
+    #[test]
+    fn card_keys_prune_to_twice_the_window_plus_256_and_never_drop_a_named_key() {
+        let mut keys = CardKeys::new(0x1000);
+        let sid = plx_plex::plex::ServerId::UNSET;
+        let elems: Vec<u32> = (0..2000).map(|i| keys.intern(sid, &format!("m{i}"), "test")).collect();
+        let (oldest, middle, newest) = (elems[0], elems[900], elems[1999]);
+        keys.prune(50, |elem| elem == oldest || elem == middle);
+        assert_eq!(keys.len(), 2 * 50 + 256, "pruned to the bound");
+        assert!(keys.get(oldest).is_some() && keys.get(middle).is_some(), "a named key stays even when it is the oldest");
+        assert!(keys.get(newest).is_some(), "the newest stay");
+        assert!(keys.get(elems[1]).is_none(), "the oldest unnamed go first");
+        let next = keys.next;
+        keys.prune(50, |_| false);
+        assert_eq!(keys.len(), 2 * 50 + 256, "already at the bound: nothing more goes");
+        assert_eq!(keys.next, next, "an element is not handed out again");
+        // under the bound nothing is dropped, named or not
+        let mut small = CardKeys::new(0x1000);
+        for i in 0..300 { small.intern(sid, &format!("s{i}"), "test"); }
+        small.prune(100, |_| false);
+        assert_eq!(small.len(), 300);
+        // named keys beyond the bound all stay (the bound is on the unnamed)
+        let mut named = CardKeys::new(0x1000);
+        let all: Vec<u32> = (0..400).map(|i| named.intern(sid, &format!("n{i}"), "test")).collect();
+        named.prune(0, |elem| all.contains(&elem));
+        assert_eq!(named.len(), 400);
+    }
 
     /// A row index stays itself under `band_elem`/`band_index` for the whole practical range of
     /// an action row (never more than two controls in this family today, but the round trip is
@@ -2087,7 +2208,12 @@ pub const SCREEN_SHAPES: &[&str] = &[
 // Person adopts `cards::Stack` (cards-stack PR 5): its logical state gains the stack's motion canon
 // (`stack:Stack{scroll,target,sections}`), the same as Collection's; the previous pin was
 // 0xbc1d_d51d_5b11_1273.
-const SCREEN_SHAPES_PIN: u64 = 0xdb39_f424_a0be_5fd2;
+// The Library grid projects keys for its wanted windows only (`LibraryGrid{total,windows,..}`
+// replaces a key per slot); the previous pin was 0xdb39_f424_a0be_5fd2.
+// About panel scroll: `AboutPanelScreen{}` gains the synopsis viewport's cursor and spring
+// (`page:usize,scroll:Spring{pos:f32,vel:f32}`, person_bio's shape); the previous pin was
+// 0x7435_d234_b769_60c2.
+const SCREEN_SHAPES_PIN: u64 = 0x6a55_c53a_d931_3acf;
 
 #[cfg(test)]
 mod arg_tests {

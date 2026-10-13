@@ -113,9 +113,10 @@ conservative choice) learn nothing. It lives in `Session::server_key_pins`, one 
 `ProfileCreds`, which are cloned per profile), soft-parsed and skipped while empty.
 **It is in the PUBLIC preferences, so sign-out forgets it by an explicit rule, not with the
 credentials:** `Mutation::ClearTenure` retains `public.preferences` whole except the keys in
-`storage::state::ACCOUNT_BOUND_PREFERENCES` (`server_key_pins`), so sign-out — and "Delete all
+`storage::state::ACCOUNT_BOUND_PREFERENCES` (`server_key_pins` and `plaintext_consent`, issue #385), so sign-out — and "Delete all
 local data", which runs it first — leaves the stored record with no learned key, and the next account to sign in opens with none
-(`migration_tests::helper_signout_forgets_the_learned_server_keys_and_the_next_account_inherits_none`).
+(`migration_tests::helper_signout_forgets_the_learned_server_keys_and_the_next_account_inherits_none`;
+for the answers, `helper_signout_forgets_the_plaintext_answers_and_signing_back_in_asks_again`).
 `session::learn_server_key` queues the write only when the pin changed.
 `Session::server_key_pin(machine_id)` is the accessor.
 
@@ -282,7 +283,7 @@ re-discovery, requested by `grant::UpgradeRetry::due`), on a refusal (which also
 a `PlaintextAsk` captured) and on a roster commit that does not install its (machine, origin) —
 a roster commit moves no generation — and a stored `SourceRef` naming a
 plaintext origin registers tokenless until discovery re-mints. Ending a grant re-grades the
-registry (`servers::regrade_credentials` blanks every client a grant was carrying, `ON_GRANT`);
+registry (`servers::regrade_credentials` blanks every client a grant was carrying, and `mark_on_grant` sets the per-slot `on_grant` flag);
 `grant::UpgradeRetry` re-discovers a granted server on the hub-retry backoff and the HTTPS
 registration retires the grant (`auth::retire_grant_on_https`).
 
@@ -324,8 +325,10 @@ Three design choices carry the weight, and each is a prevented bug rather than a
   re-point lands at frame N+1 with that worker mid-request. Re-pointing publishes a NEW leaked
   `Client` over the pointer, so the worst case for the old reference is **one request sent to where
   that server used to be** — never a dangling pointer, which is the failure that has no debugger on
-  this device. The leak is bounded: a handful of small structs, written on login / profile switch /
-  server switch, never per frame.
+  this device. The leak is one small struct per registration ever made, written on login / profile switch /
+  server switch, never per frame; ids are never reused and the table grows by segments, with no
+  server-count ceiling short of the `u16` id space. A sign-out removes the revoked slots' rows from
+  the keyed per-server tables (`serverinfo`).
 - **Token generations come from a process-global sequence, so no two clients ever share one.**
   `token_gen` was a single process-wide counter, which cannot express "server B's token changed".
   Its only reader is `app::adapters::poster::built_key`'s memo and that memo compares **one number** — so two
@@ -473,6 +476,17 @@ a dead source is **absent** from Home and states itself in its own library secti
   across the write's `sync_all`, so **nothing per-frame may take it directly** — but a per-frame
   reader may now call `session::peek()`, because `peek()` is backed by a live in-memory read
   cache, not a per-call file transaction.
+- **The nine install-wide player settings live in ONE struct, `session/prefs.rs`'s `Preferences`,
+  flattened (`#[serde(flatten)] prefs`) into BOTH on-disk forms** — the legacy file's `Session` and
+  the canonical preference record — declared before each form's own `extensions`, so the flatten
+  takes its keys first and the unknown-key map still sees only keys nobody models. A new setting of
+  that kind is a `Preferences` field (its serde attributes written out where rustfmt and a reviewer
+  see them, copied from a neighbour, never unified: each row keeps its own soft-parse policy), a
+  `Setting` marker (`setting!` for the plain shape; hand-written when `Stored` ≠ `Value`, as for
+  quality) and a line in `prefs::DESCRIPTORS`. Callers read `session.prefs.<field>` or the hand-written
+  getter, and change a value with `session.with_pref::<Marker>(v)`. `prefs_tests` holds the table to
+  the struct (T-fields), to platform's `ACCOUNT_BOUND_PREFERENCES` (T-account) and to each row's
+  parse policy (T-parse), both ways; a field with no row, or a row with no field, fails there.
 - **`session::peek()` is a write-through cache over the persisted session, not a fresh read.** A
   hit is one uncontended `Mutex` lock and an `Arc<Session>` clone — no `IO`, no helper round trip —
   which is what makes it safe to call every frame (`player::preview::enabled` does). The invariants

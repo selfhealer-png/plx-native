@@ -20,6 +20,7 @@
 //! through a `PlayerReq`.
 
 use super::*;
+use plx_media::player::report::AttemptOrigin;
 // The list is what the LOOP still spells, and phase 12 (PX-PLAYER) is why it is short: the scrub
 // gesture's constants and its two pure policies (`scrub_press`, `failed_key_action`) are read by
 // `screens::player` alone now, so re-exporting them here would be this module claiming a
@@ -120,7 +121,7 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
             let failed = matches!(plx_media::player::state(ps), plx_media::player::PlaybackState::Error);
             if failed {
                 plx_media::route::set_quality_for_retry(q);
-                retry_failed_playback(ps, pa, bridge.metadata_mut(), None);
+                retry_failed_playback(ps, pa, bridge.metadata_mut(), None, AttemptOrigin::QualityChange);
             } else {
                 plx_media::route::set_quality(ps, q);
             }
@@ -140,12 +141,15 @@ pub(crate) fn apply_more_action(ps: &mut plx_media::route::PlaybackSession, pa: 
 /// the current playhead and the Engine lifecycle.
 ///
 /// `direct_play` overrides the Direct Play mode the retry resolves under; `None` keeps the failed
-/// attempt's own (a retry is the SAME request).
+/// attempt's own (a retry is the SAME request). `origin` is why the viewer asked — a Retry press
+/// or a quality pick on the failure screen — and rides to the error report of the attempt this
+/// starts, which is the next open of the same session.
 pub(crate) fn retry_failed_playback(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     meta: &mut plx_data::stores::metadata::MetadataStore,
     direct_play: Option<plx_plex::plex::session::DirectPlayMode>,
+    origin: AttemptOrigin,
 ) -> bool {
     // URL/dev-trigger playback has no Plex descriptor.  Check BEFORE teardown: extinguishing its
     // Error Engine and only then discovering it cannot be rebuilt would replace an actionable
@@ -162,7 +166,7 @@ pub(crate) fn retry_failed_playback(
         .max(plx_media::route::unpresented_resume_ns(ps))
         .max(0);
     plx_media::player::stop_bufferfeed(ps, pa);
-    if plx_media::route::retry_current_play(ps, meta, resume_ns, direct_play) {
+    if plx_media::route::retry_current_play(ps, meta, resume_ns, direct_play, origin) {
         plx_machine::idle::invalidate();
         true
     } else {
@@ -175,24 +179,19 @@ pub(crate) fn retry_failed_playback(
 ///
 /// A PERSISTENT switch, deliberately, not a one-shot: Force is what made this play fail, and it
 /// would make the next unsupported file fail the same way. The preference moves to Auto now (the
-/// in-memory value every later resolve reads) and is saved on the storage worker exactly as the
-/// Settings row saves it (`app::preferences`' `DirectPlay` arm), since the frame may not block on
-/// storage. The retry resolves under Auto explicitly rather than inheriting the failed attempt's
-/// Force, which a plain retry keeps on purpose.
+/// in-memory value every later resolve reads) and is saved on the storage worker behind it, both
+/// by the one write door (`route::choose`, `How::Optimistic`): the frame may not block on storage,
+/// the cell is published ONCE, and a failed save is logged by the door while the pick stands for
+/// this session. The retry resolves under Auto explicitly rather than inheriting the failed
+/// attempt's Force, which a plain retry keeps on purpose.
 pub(crate) fn play_automatically(
     ps: &mut plx_media::route::PlaybackSession,
     pa: &mut plx_media::player::adapter::PlayerAdapter,
     meta: &mut plx_data::stores::metadata::MetadataStore,
 ) -> bool {
-    use plx_plex::plex::session::DirectPlayMode;
-    plx_media::route::restore_direct_play_mode(DirectPlayMode::Auto);
-    let _ = plx_base::storage_worker::submit_retained(|| {
-        if !plx_media::route::set_direct_play_mode(DirectPlayMode::Auto) {
-            log("play automatically: the Direct Play preference was not saved");
-        }
-        plx_machine::idle::invalidate();
-    });
-    retry_failed_playback(ps, pa, meta, Some(DirectPlayMode::Auto))
+    use plx_plex::plex::session::{DirectPlayMode, DirectPlayModePref};
+    plx_media::route::choose::<DirectPlayModePref>(DirectPlayMode::Auto, plx_media::route::How::Optimistic(None));
+    retry_failed_playback(ps, pa, meta, Some(DirectPlayMode::Auto), AttemptOrigin::UserRetry)
 }
 
 /// **Where a session that is STARTING returns to** — the whole of what `app::nav::Origin` was,
@@ -343,7 +342,9 @@ impl PlaybackResources for LivePlaybackResources {
         // `seek_to_ns < 0`, so that stray armed seek blocks feeding forever: no frames, no
         // ACB bind, timeline frozen at the resume point. (Exactly what broke
         // transcode_av1_no_dp_audio. Direct-play never noticed because arm_seek is what the
-        // correct branch does anyway.) Defer it to `pump_play`, after apply_plan.
+        // correct branch does anyway. That item is a transcode only where the codec table lists
+        // no AV1 decoder, which the dev set does not; on a set that does, it direct-streams video.)
+        // Defer it to `pump_play`, after apply_plan.
         let pending = plx_media::route::play_pending();
         // A transcode's rebuild at the saved position is a flight (`begin_resume`): the Load is
         // started by the run loop's drain when it lands, so a pending resume enters the player and
@@ -445,7 +446,7 @@ pub(crate) fn request_loaded_hero(ps: &mut plx_media::route::PlaybackSession, me
 
 pub(crate) fn request_loaded_episode(ps: &mut plx_media::route::PlaybackSession, meta: &mut plx_data::stores::metadata::MetadataStore, rk: &str) -> bool {
     let Some(d) = meta.view().current().cloned() else { return false };
-    let Some(ep) = d.episodes.iter().find(|e| e.rk == rk).cloned() else { return false };
+    let Some(ep) = d.episodes.position(rk).and_then(|i| d.episodes.get(i)).cloned() else { return false };
     request_episode(ps, meta, &d, &ep)
 }
 
@@ -560,7 +561,7 @@ pub(crate) fn player_requests(
     for req in reqs {
         match req {
             PlayerReq::RetryPlayback => {
-                retry_failed_playback(ps, pa, bridge.metadata_mut(), None);
+                retry_failed_playback(ps, pa, bridge.metadata_mut(), None, AttemptOrigin::UserRetry);
             }
             PlayerReq::PlayAutomatically => {
                 play_automatically(ps, pa, bridge.metadata_mut());

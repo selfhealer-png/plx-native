@@ -365,3 +365,27 @@ modes), so nothing could be compared. They were re-recorded with `tests/focusfp.
 1,6,12`, `tools/plxnative-rec check`, then `tools/plxnative-rec rerecord` (shape `(3,
 3109788404986066319)` to `(3, 14333139794472628045)`, anchors preserved) and replayed SAME in
 Targets and Resolve with zero difference counters.
+
+Recently Added paging adds the page cursor and pending request to the recorded Home state.
+The three previous anchors were refused in both replay modes after the shape changed from
+14333139794472628045 to 6411129155501563480. All three were recorded again against the synthetic
+server and installed with `tools/plxnative-rec rerecord`, with their anchor flags retained.
+This macOS display runs at 120 Hz. The recordings use shorter idle intervals and a 350 ms
+key interval to stay within the replay memory budget. A host test checks the committed
+recordings' initial hashes and request validation. Targets and Resolve replay checks also
+verify the recorded behavior.
+
+The review fixes add raw item positions and the page direction and hidden-library list to
+the recorded data state. The state shape changed from 6411129155501563480 to
+9159381185758612433. All three anchors were recorded again against the synthetic server
+and installed with `tools/plxnative-rec rerecord`. Their anchor flags remain set.
+Targets and Resolve both report SAME, with every difference counter at zero.
+
+The unbounded-lists work (windowed hub list, window identities on page requests, the Home row
+ring's `Hold` command, the About-panel prose scroll) moved the state shape from
+9159381185758612433 to 1703904437409982862 (`SCREEN_SHAPES_PIN` `0x6a55_c53a_d931_3acf`). All
+three anchors were refused on load, then recorded again against the synthetic server with
+`tests/focusfp.sh --rec --only 1,6,12` and installed with `tools/plxnative-rec rerecord`, anchors
+retained. The recorder now encodes `HubsCmd::Hold` (`hubs.hold: [lo, hi]`), and the closed alphabet
+admits the Related hub's page key `/library/metadata/<digits>/similar`. Targets and Resolve both
+report SAME with every difference counter at zero.

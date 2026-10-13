@@ -62,6 +62,12 @@ pub(super) fn test_store() -> &'static mut plx_data::stores::metadata::MetadataS
     TEST_METADATA.with(|cell| unsafe { &mut *cell.get() })
 }
 
+impl crate::registry::CollectionLike for TestHost {
+    fn collection<'a>(_cx: &Cx<'a, Self>) -> plx_data::collection::CollectionView<'a> {
+        plx_data::collection::CollectionView::default()
+    }
+}
+
 impl crate::registry::MetadataLike for TestHost {
     fn metadata<'a>(_cx: &Cx<'a, Self>) -> plx_data::metadata::MetadataView<'a> {
         test_store().view()
@@ -109,7 +115,7 @@ pub(super) fn bare_held(sid: ServerId, rk: &str) -> DetailScreen {
         sid,
         rk: rk.into(),
         keys: vec![], next_elem: FIRST_ITEM_ELEM, key_by_local: Default::default(),
-        local_by_key: Default::default(), gone: Default::default(), return_pending: false,
+        local_by_key: Default::default(), prev_by_key: Default::default(), gone: Default::default(), return_pending: false,
         pending_season: None,
         season_settle: 0.0,
         preview_dwell: 0.0,
@@ -134,8 +140,9 @@ pub(super) fn bare_held(sid: ServerId, rk: &str) -> DetailScreen {
         scroll_target: 0.0,
         episode_scroll: Spring::at(0.0),
         tab_scroll: Spring::at(0.0),
-        episode_scale: [Spring::at(1.0); EP_SCALE_MAX],
-        episode_text_lift: [plx_ui::text_lift::TextLift::new(); EP_SCALE_MAX],
+        episode_cells: episodes::Cells::new(),
+            ep_want: Default::default(),
+            strip_seat: Default::default(),
         about_card_lift: plx_ui::text_lift::TextLift::new(),
         about_lang_lift: plx_ui::text_lift::TextLift::new(),
         related: plx_ui::cards::Shelf::new(EntryId(7), &plx_ui::cards::RowStyle::HOME),
@@ -194,7 +201,7 @@ fn detail(sid: ServerId, rk: &str) -> Detail {
         is_show: true,
         kind: "show".into(),
         seasons: vec![season(1), season(2)],
-        episodes: vec![episode("e1", 1), episode("e2", 2)],
+        episodes: vec![episode("e1", 1), episode("e2", 2)].into(),
         ..Default::default()
     }
 }
@@ -752,7 +759,7 @@ fn apply_metadata_effects(effects: &[plx_machine::machine::Stamped<TestHost>]) {
 #[test]
 fn the_episode_text_highlight_fits_the_block_the_flow_already_reserves() {
     let d = detail(ServerId::UNSET, "show");
-    for (i, ep) in d.episodes.iter().enumerate() {
+    for (i, ep) in d.episodes.iter_loaded() {
         let r = episodes::meta_rect(ep, i, 0.0, 0.0, &plx_ui::fixture::FixtureMeasure);
         assert!(r.y + r.h <= episodes::block_h(&d, &plx_ui::fixture::FixtureMeasure) + theme::space::SM);
     }
@@ -930,6 +937,183 @@ fn a_vanished_credit_falls_to_the_same_place_in_the_shelf() {
     );
 }
 
+/// Every section's element block is its own, wide, and below the engine keys: no two overlap, and
+/// no section's list can run into its neighbour's ids. A block is 2^24 ids; episodes take two ids
+/// each out of their 2^30 block.
+#[test]
+fn the_element_blocks_are_wide_disjoint_and_below_the_engine_keys() {
+    const BLOCK: u32 = 1 << 24;
+    let blocks: [(&str, u32, u32); 8] = [
+        ("hero", 0, hero::HERO_ELEM_RANGE_END),
+        ("season", season::SEASON_ELEM_RANGE_START, season::SEASON_ELEM_RANGE_END),
+        ("episodes", episodes::EPISODES_ELEM_RANGE_START, episodes::EPISODES_ELEM_RANGE_END),
+        ("related", related::RELATED_ELEM_RANGE_START, related::RELATED_ELEM_RANGE_END),
+        ("cast", cast::CAST_ELEM_RANGE_START, cast::CAST_ELEM_RANGE_END),
+        ("about", about::ABOUT_ELEM_RANGE_START, about::ABOUT_ELEM_RANGE_END),
+        ("extras", extras::EXTRAS_ELEM_RANGE_START, extras::EXTRAS_ELEM_RANGE_END),
+        ("collection", collection::COLLECTION_ELEM_RANGE_START, collection::COLLECTION_ELEM_RANGE_END),
+    ];
+    for (name, start, end) in blocks {
+        assert!(start < end && end <= FIRST_ITEM_ELEM, "{name} sits below the engine keys");
+        if name == "episodes" {
+            assert_eq!(end - start, 1 << 30, "episodes own their 2^30 block");
+        } else {
+            assert_eq!(end - start, BLOCK, "{name} owns a 2^24 block");
+        }
+    }
+    for (i, a) in blocks.iter().enumerate() {
+        for b in &blocks[i + 1..] {
+            assert!(a.2 <= b.1 || b.2 <= a.1, "the {} and {} blocks overlap", a.0, b.0);
+        }
+    }
+    assert_eq!(FIRST_ITEM_ELEM, 1 << 31, "engine keys start above every local block");
+}
+
+/// The key a card answers to is its engine key, not its local id. A caller outside the crate (the
+/// app's menu-opener route) asks about focus keys it did not mint, so it must look in the interned
+/// range; a card's key sitting in the low range again, or a local id leaking out as a focus key,
+/// is what this pins.
+#[test]
+fn card_focus_keys_live_in_the_interned_range_and_locals_are_not_focus_keys() {
+    let sid = ServerId::UNSET;
+    let mut d = detail(sid, "show");
+    d.related = vec![Default::default(), Default::default()];
+    let _guard = install(d);
+    let screen = bare(&_guard, sid, "show");
+    let meta = test_store().view();
+    for i in 0..2 {
+        let local = related::elem(i).unwrap();
+        let key = screen.engine_key(local).expect("a related card key");
+        assert!(key >= FIRST_ITEM_ELEM, "card {i} is keyed from the interned range");
+        assert!(screen.locate(key, meta) == Some(Located::Related(i)));
+        assert!(screen.locate(local, meta).is_none(), "a local id is not a focus key");
+    }
+    clear();
+}
+
+/// A list that arrives whole is addressable whole. A 600-credit item has a card for every credit,
+/// and Right walks the shelf to its last one; the old block clamped the shelf at 512.
+#[test]
+fn a_six_hundred_credit_item_addresses_every_cast_card_and_right_reaches_the_last() {
+    let sid = ServerId::UNSET;
+    let mut d = detail(sid, "show");
+    d.cast = (0..600)
+        .map(|i| plx_data::metadata::Cast {
+            tag: format!("person {i}"),
+            role: String::new(),
+            thumb: String::new(),
+            id: i,
+            tag_key: format!("p{i}"),
+        })
+        .collect();
+    let _guard = install(d);
+    let mut screen = bare(&_guard, sid, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let context = cx(&measure, None);
+    let key_at = |screen: &DetailScreen, i: usize| {
+        screen.engine_key(cast::elem(i).expect("a local id per credit")).expect("a key per credit")
+    };
+    let mut at = key_at(&screen, 0);
+    for i in 1..600 {
+        let Step::Move(next) = Focusable::<TestHost>::neighbour(
+            &screen,
+            FocusKey { entry: EntryId(7), elem: at },
+            Dir::Right,
+            &context,
+        ) else {
+            panic!("Right stopped at credit {}", i - 1);
+        };
+        assert_eq!(next.elem, key_at(&screen, i), "Right reaches credit {i} in order");
+        at = next.elem;
+    }
+    clear();
+}
+
+/// The 600th credit is drawn when focus is on it, and the shelf registers stops only for the cards
+/// in reach, so the draw work follows the screen and not the credit count.
+#[test]
+fn a_six_hundred_credit_shelf_draws_its_last_card_with_stops_for_the_visible_range_only() {
+    let sid = ServerId::UNSET;
+    let mut d = detail(sid, "show");
+    d.cast = (0..600)
+        .map(|i| plx_data::metadata::Cast {
+            tag: format!("person {i}"), role: String::new(), thumb: String::new(), id: i, tag_key: format!("p{i}"),
+        })
+        .collect();
+    let _guard = install(d);
+    let mut screen = bare(&_guard, sid, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let last = screen.engine_key(cast::elem(599).unwrap()).unwrap();
+    let top = {
+        let d = screen.detail(test_store().view()).unwrap();
+        screen.section_top(4, d, &measure)
+    };
+    screen.scroll.jump(top);
+    screen.scroll_target = top;
+    let first = screen.engine_key(cast::elem(0).unwrap()).unwrap();
+    let to = FocusKey { entry: EntryId(7), elem: last };
+    step(&mut screen, &ScreenEvent::FocusMoved {
+        from: Some(FocusKey { entry: EntryId(7), elem: first }), to, by: By::Dir,
+    }, Some(last));
+    let context = cx(&measure, Some(last));
+    for n in 1..=240u32 {
+        step(&mut screen, &ScreenEvent::Tick(plx_machine::machine::Tick { ms: 17 * n, dt_us: 16_667 }), Some(last));
+        drawn_stops(&mut screen, &context);
+    }
+    let stops = drawn_stops(&mut screen, &context);
+    let cast_stops: Vec<_> = stops.iter().filter(|stop| screen.locate(stop.key.elem, test_store().view()).is_some_and(|l| matches!(l, Located::Cast(_)))).collect();
+    assert!(cast_stops.iter().any(|stop| stop.key.elem == last), "credit 600 is drawn");
+    assert!(cast_stops.len() < 60, "stops follow the visible range, got {}", cast_stops.len());
+    clear();
+}
+
+/// A 200-season show: Right walks the tab strip to its last tab, and the strip registers stops for
+/// the tabs on the axis only, so the stop count does not grow with the season count.
+#[test]
+fn a_two_hundred_season_show_focuses_its_last_tab_and_stops_only_on_the_axis() {
+    let sid = ServerId::UNSET;
+    let mut d = detail(sid, "show");
+    d.seasons = (1..=200).map(season).collect();
+    let _guard = install(d);
+    let mut screen = bare(&_guard, sid, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let context = cx(&measure, None);
+    let key_at = |screen: &DetailScreen, i: usize| {
+        screen.engine_key(season::elem(i).expect("a local id per tab")).expect("a key per tab")
+    };
+    let last = key_at(&screen, 199);
+    let mut at = key_at(&screen, 0);
+    for i in 1..200 {
+        let Step::Move(next) = Focusable::<TestHost>::neighbour(
+            &screen,
+            FocusKey { entry: EntryId(7), elem: at },
+            Dir::Right,
+            &context,
+        ) else {
+            panic!("Right stopped at tab {}", i - 1);
+        };
+        at = next.elem;
+    }
+    assert_eq!(at, last, "Right reaches the 200th tab");
+    let season_keys: std::collections::HashSet<u32> = (0..200).map(|i| key_at(&screen, i)).collect();
+    // the tab strip is drawn (and so registers stops) only while its section is on screen; its
+    // pills are measured on the Tick and the landing, which a live frame has already run
+    let top = {
+        let d = screen.detail(test_store().view()).unwrap();
+        screen.season_metrics.update(d, &measure);
+        screen.section_top(1, d, &measure)
+    };
+    screen.scroll.jump(top);
+    screen.scroll_target = top;
+    let stops = drawn_stops(&mut screen, &cx(&measure, Some(last)));
+    let on_strip = stops.iter().filter(|stop| season_keys.contains(&stop.key.elem)).count();
+    assert!(on_strip > 0 && on_strip < 40, "only the on-axis tabs register stops, not all 200 (got {on_strip})");
+    clear();
+}
+
 #[test]
 fn hero_focus_is_clamped_when_the_control_set_shrinks_under_it() {
     let sid = ServerId::UNSET;
@@ -1026,7 +1210,7 @@ fn a_watched_toggle_holds_the_filmstrips_place_and_a_stale_latch_never_steers_a_
     let sid = ServerId::UNSET;
     let mut d = detail(sid, "show");
     d.cur_season = 1;
-    d.episodes.push(episode("e3", 3));
+    d.episodes = vec![episode("e1", 1), episode("e2", 2), episode("e3", 3)].into();
     let _guard = install(d);
     let measure = plx_ui::fixture::FixtureMeasure;
     let want = FocusKey {
@@ -1055,6 +1239,7 @@ fn a_watched_toggle_holds_the_filmstrips_place_and_a_stale_latch_never_steers_a_
         },
         episode: Some("e3".into()),
         season_requested: true,
+        seek: Default::default(),
     });
     pump_restore(&mut screen);
     assert!(
@@ -1654,6 +1839,75 @@ fn episode_text_ok_activates_on_down_without_arming_a_holdable_press() {
     clear();
 }
 
+/// **An episode summary is never cut off for good.** The episode card clamps its summary to
+/// `episodes::SUMMARY_MAX_LINES`; this walks the route a viewer takes to the rest: the card's text
+/// block opens the episode's own page, that page's About card (OK, i.e. its MORE) asks for the About
+/// panel, and the panel pages down to the end of a 2,000-character summary.
+///
+/// Covered: each hop's effect against the real `DetailScreen` and the real `AboutPanelScreen`, both
+/// reading the one metadata store. NOT covered here: the container presenting
+/// `ContentPanel::About` as `AboutPanelScreen` (`registry.rs`, one `match` arm) and the drawn
+/// pixels, which need the app and the TV.
+#[test]
+fn a_long_episode_summary_is_readable_to_its_end_through_the_episode_route() {
+    use crate::registry::AboutPanelScreen;
+    let sid = ServerId::UNSET;
+    let summary = "word ".repeat(400);
+
+    // 1. the show page: the episode's text block opens the episode's page
+    let mut show = detail(sid, "show");
+    show.episodes = vec![episode("e1", 1), plx_data::metadata::Episode { summary: summary.clone(), ..episode("e2", 2) }].into();
+    let _guard = install(show);
+    let mut screen = bare(&_guard, sid, "show");
+    let ok = ScreenEvent::Input(InputEvent {
+        at: Default::default(),
+        source: plx_machine::machine::Source::Script,
+        kind: InputKind::Key { key: Key::Ok, sym: 0, wcode: 0, edge: Edge::Down, at_edge: false },
+    });
+    let (_, effects) = step(&mut screen, &ok, Some(episodes::elem(1, episodes::Row::Text).unwrap()));
+    assert!(effects.iter().any(|e| matches!(
+        &e.fx,
+        Fx::App(AppFx::Content(ContentReq::Push(ContentArg::Detail { rk, .. }))) if rk == "e2"
+    )));
+
+    // 2. the episode's page (landed with the same summary): the About card asks for the panel
+    plx_data::metadata::set_current_for_test(
+        test_store().state_mut(),
+        Some(Detail { sid, rk: "e2".into(), kind: "episode".into(), summary: summary.clone(), ..Default::default() }),
+    );
+    let mut page = bare(&_guard, sid, "e2");
+    let (_, effects) = step(&mut page, &ScreenEvent::Activate(about::CARD_ELEM), Some(about::CARD_ELEM));
+    assert!(
+        effects.iter().any(|e| matches!(&e.fx, Fx::App(AppFx::Content(ContentReq::Panel(ContentPanel::About))))),
+        "OK on the About card requests the About panel"
+    );
+
+    // 3. the panel over the same store pages to the last line
+    let mut panel = AboutPanelScreen::new(EntryId(8));
+    let measure = plx_ui::fixture::FixtureMeasure;
+    assert!(!panel.last_line_in_view(&cx(&measure, None)), "the panel opens at the top of a long summary");
+    let down = ScreenEvent::Input(InputEvent {
+        at: Default::default(),
+        source: plx_machine::machine::Source::Script,
+        kind: InputKind::Key { key: Key::Down, sym: plx_ui::consts::SDLK_DOWN, wcode: 0, edge: Edge::Down, at_edge: false },
+    });
+    let run = |panel: &mut AboutPanelScreen, ev: &ScreenEvent<TestHost>| {
+        let context = cx(&measure, None);
+        let (mut out, mut present) = (Vec::new(), plx_machine::present::Present::new());
+        let mut fx = Effects::new(&mut out, plx_machine::machine::MachineId::Nav, &mut present);
+        plx_machine::machine::Machine::step(panel, ev, &context, &mut fx);
+    };
+    for _ in 0..40 {
+        run(&mut panel, &down);
+    }
+    let tick = ScreenEvent::Tick(plx_machine::machine::Tick { ms: 0, dt_us: 16_667 });
+    for _ in 0..600 {
+        run(&mut panel, &tick);
+    }
+    assert!(panel.last_line_in_view(&cx(&measure, None)), "DOWN reaches the end of the episode summary");
+    clear();
+}
+
 /// Both BACK and DOWN collapse full-trailer mode through the SAME shared helper
 /// (`collapse_full_trailer`), and neither one does anything unusual when it was already off — the
 /// regression this guards is the naive first draft, which duplicated the same four-line body
@@ -1866,10 +2120,12 @@ fn left_right_scrub_hops_on_down_and_asks_for_no_transport_request() {
     clear();
 }
 
-/// A HELD scrub commits at once on its key-up, through `ContentReq::PreviewSeek` — never
-/// `route::request_seek`'s own `PlayerReq::SeekTo`/`CommitSeek`, which is the whole point of
-/// routing a preview's seek through `player::preview::seek` instead (see `ContentReq::PreviewSeek`
-/// and `player/preview.rs`'s own module doc for the watch-state promise this keeps).
+/// A HELD scrub commits once its key-up has survived the key-bounce window, through
+/// `ContentReq::PreviewSeek` — never `route::request_seek`'s own `PlayerReq::SeekTo`/`CommitSeek`,
+/// which is the whole point of routing a preview's seek through `player::preview::seek` instead
+/// (see `ContentReq::PreviewSeek` and `player/preview.rs`'s own module doc for the watch-state
+/// promise this keeps). The key-up itself commits nothing; the page's tick (`preview_tick`, not
+/// exercised by this direct `trailer_act` harness) does, so the window is stepped by hand here.
 #[test]
 fn a_held_left_right_scrub_commits_a_preview_seek_on_key_up() {
     let sid = ServerId::UNSET;
@@ -1883,8 +2139,14 @@ fn a_held_left_right_scrub_commits_a_preview_seek_on_key_up() {
     let target = screen.trailer_ctl.preview_ns_for_test();
     let effects = trailer_act_edge(&mut screen, trailer::TrailerKey::Scrub(true), Edge::Up, 0);
 
-    assert_eq!(seek_reqs(&effects), vec![target], "the hold's own preview position, verbatim");
+    assert!(seek_reqs(&effects).is_empty(), "the key-up waits out the bounce window first");
     assert!(transport_reqs(&effects).is_empty(), "a seek is not a pause/resume");
+    assert!(screen.trailer_ctl.scrubbing(), "the preview stays up while it waits");
+    let commit = screen.trailer_ctl.step_scrub_hold(
+        plx_appkit::player_hud::SCRUB_RELEASE_DEBOUNCE_MS,
+        DurationFixture::DUR,
+    );
+    assert_eq!(commit, Some(target), "the hold's own preview position, verbatim");
     assert!(!screen.trailer_ctl.scrubbing(), "committing ends the gesture");
     clear();
 }
@@ -3459,6 +3721,29 @@ fn ok_on_the_heading_opens_the_collection_and_ok_on_a_member_opens_its_detail() 
     clear();
 }
 
+/// A collection bigger than the shelf's preview is reached through its heading: the shelf holds the
+/// preview, the heading says the whole count, and OK on it opens the Collection page (which pages).
+#[test]
+fn a_collection_past_the_preview_is_reached_through_its_heading() {
+    let sid = ServerId::UNSET;
+    let mut d = collection_movie(sid);
+    let c = d.collection.as_mut().unwrap();
+    c.members = (1..=plx_data::metadata::COLLECTION_PREVIEW).map(|i| collection_member(sid, &format!("m{i}"))).collect();
+    c.count = 45;
+    let _guard = install(d);
+    let mut screen = bare(&_guard, sid, "m1");
+    assert_eq!(collection::len(screen.detail(test_store().view()).unwrap()), plx_data::metadata::COLLECTION_PREVIEW);
+    assert_eq!(screen.detail(test_store().view()).unwrap().collection.as_ref().unwrap().count, 45,
+        "the heading counts the whole collection");
+    let (_, effects) = step(&mut screen, &ScreenEvent::Activate(collection::HEADING_ELEM),
+        Some(collection::HEADING_ELEM));
+    assert!(effects.iter().any(|e| matches!(&e.fx,
+        Fx::App(AppFx::Content(ContentReq::Push(ContentArg::Collection(id))))
+            if id.sec == 1 && id.tag == 812)),
+        "the heading opens the Collection page, which holds all 45");
+    clear();
+}
+
 #[test]
 fn the_heading_is_a_hover_focus_stop_that_wins_over_the_member_cards() {
     use plx_ui::hit::{HitMap, PointerKind};
@@ -3677,7 +3962,7 @@ fn a_show_walk_derives_the_layout_identity_once_not_once_per_stop() {
     let bare_walk = stamped(&mut || {
         let mut f = DrawFrame::new(&context, plx_ui::Painter::root());
         screen.record_stops(&mut f);
-        assert!(f.stops().len() >= 2 * EPISODES, "the fixture must register a stop per episode row");
+        assert!(f.stops().len() >= 4, "the fixture must register a stop per visible episode row");
     });
     assert!(bare_walk <= EPISODES, "record_stops hashed {bare_walk} episodes for a {EPISODES}-episode season");
 
@@ -3713,7 +3998,7 @@ fn record_stops_places_nothing_outside_the_visible_walk() {
         (f.stops().len(), STAMPED_EPISODES.with(|n| n.get()))
     };
     let (visible, _) = walk(plx_ui::Painter::root());
-    assert!(visible >= 2 * EPISODES, "the visible walk registers every episode row ({visible})");
+    assert!(visible >= 4, "the visible walk registers the episode rows on the axis ({visible})");
     let sources = std::rc::Rc::new(std::cell::RefCell::new(backdrop::Sources::default()));
     {
         let _discovery = backdrop::discover(sources.clone());
@@ -3768,5 +4053,640 @@ fn the_hold_hint_stands_on_a_resting_related_card_once_per_run() {
     assert!(!screen.hold_hint.visible(), "a menu taking focus hides it");
     rest(&mut screen, on(card), 4.0);
     assert!(!screen.hold_hint.visible(), "and not a second time on a Detail page this run");
+    clear();
+}
+
+/// Every season switch lands a different set of episode identities. The key table keeps the
+/// current pass, the previous one, the focus and the remembered keys, and above twice one pass plus
+/// 256 drops the oldest rest, so a hundred switches stay bounded. The focused card's key never
+/// changes, and a season that left and came back inside the bound gets the same keys.
+#[test]
+fn the_key_table_stays_bounded_over_a_hundred_season_switches_and_focus_never_moves() {
+    let sid = ServerId::UNSET;
+    let season_eps = |n: usize| -> Vec<_> {
+        (0..40).map(|i| episode(&format!("s{n}e{i}"), i as i64 + 1)).collect()
+    };
+    let mut d = detail(sid, "show");
+    d.related = vec![Default::default(), Default::default(), Default::default()];
+    d.episodes = season_eps(0).into();
+    let _guard = install(d.clone());
+    let mut screen = bare(&_guard, sid, "show");
+    screen.sync_keys(test_store().view());
+    let focus = screen.engine_key(related::elem(1).unwrap()).unwrap();
+    let ep_key = |screen: &DetailScreen, n: usize| {
+        screen.keys.iter().find(|k| matches!(&k.identity,
+            DetailIdentity::Episode { rk, text: false, .. } if *rk == format!("s{n}e5"))).map(|k| k.elem)
+    };
+    let first = ep_key(&screen, 0).expect("season 0 interned");
+    let mut widest = 0;
+    for n in 1..=100 {
+        d.episodes = season_eps(n).into();
+        plx_data::metadata::set_current_for_test(test_store().state_mut(), Some(d.clone()));
+        screen.sync_keys(test_store().view());
+        screen.prune_keys(&[focus]);
+        let pass = screen.local_by_key.len();
+        assert!(screen.keys.len() <= 2 * pass + 256, "switch {n}: {} keys for a pass of {pass}", screen.keys.len());
+        assert_eq!(screen.engine_key(related::elem(1).unwrap()), Some(focus), "switch {n} moved the focused card's key");
+        assert!(screen.keys.iter().any(|k| k.elem == focus), "the focus key is never pruned");
+        widest = widest.max(screen.keys.len());
+    }
+    assert!(widest < 500, "the table grew with the switches: {widest}");
+    // Out past the bound, season 0's keys are gone; coming back mints new ones, never reusing a live one.
+    assert!(ep_key(&screen, 0).is_none());
+    assert_ne!(first, 0);
+
+    // Inside the bound the same season returns to the same key.
+    d.episodes = season_eps(101).into();
+    plx_data::metadata::set_current_for_test(test_store().state_mut(), Some(d.clone()));
+    screen.sync_keys(test_store().view());
+    screen.prune_keys(&[focus]);
+    let a = ep_key(&screen, 101).unwrap();
+    for n in [102, 101] {
+        d.episodes = season_eps(n).into();
+        plx_data::metadata::set_current_for_test(test_store().state_mut(), Some(d.clone()));
+        screen.sync_keys(test_store().view());
+        screen.prune_keys(&[focus]);
+    }
+    assert_eq!(ep_key(&screen, 101), Some(a), "a season that left and returned within the bound keeps its key");
+    clear();
+}
+
+/// An entry far below the top keeps one identity: the focused card's. The page that reloads on
+/// return interns the same card under the same key, so focus seats on it.
+#[test]
+fn a_shed_detail_memory_holds_one_identity_and_the_reloaded_page_seats_the_same_card() {
+    use crate::registry::{DetailMemory, PageMemory};
+    let sid = ServerId::UNSET;
+    let mut d = detail(sid, "show");
+    d.related = (0..5).map(|i| plx_data::metadata::Related { rk: format!("rel-{i}"), ..Default::default() }).collect();
+    let _guard = install(d);
+    for n in 0..40usize {
+        let mut screen = bare(&_guard, sid, "show");
+        screen.sync_keys(test_store().view());
+        let focus = screen.engine_key(related::elem(n % 5).unwrap()).unwrap();
+        let mut memory = PageMemory::Detail(DetailMemory {
+            spot: Default::default(), keys: screen.keys.clone(), next_elem: screen.next_elem,
+        });
+        assert!(matches!(&memory, PageMemory::Detail(m) if m.keys.len() > 1));
+        memory.shed_to_identity(Some(focus));
+        let PageMemory::Detail(shed) = &memory else { unreachable!() };
+        assert_eq!(shed.keys.len(), 1, "route and one identity only");
+        assert_eq!(shed.keys[0].elem, focus);
+        let mut returned = bare(&_guard, sid, "show");
+        returned.restore_memory(shed, test_store().view());
+        assert_eq!(returned.engine_key(related::elem(n % 5).unwrap()), Some(focus), "the same card, the same key");
+        assert!(returned.locate(focus, test_store().view()) == Some(Located::Related(n % 5)));
+    }
+    clear();
+}
+
+/// A season of `total` episodes of which only the listed 60-episode pages have landed.
+fn long_season(total: usize, pages: &[usize]) -> Detail {
+    let mut d = detail(ServerId::UNSET, "show");
+    d.episodes = plx_data::metadata::EpisodeList::with_total(total);
+    for &p in pages {
+        d.episodes.set_page(p, episode_rows(total, p));
+    }
+    d
+}
+
+fn episode_rows(total: usize, page: usize) -> Vec<plx_data::metadata::Episode> {
+    (page * 60..((page + 1) * 60).min(total)).map(|i| episode(&format!("e{i}"), i as i64 + 1)).collect()
+}
+
+fn land_page(total: usize, page: usize) {
+    plx_data::metadata::edit_current_for_test(test_store().state_mut(), |d| d.episodes.set_page(page, episode_rows(total, page)));
+}
+
+fn episode_key(screen: &DetailScreen, i: usize, row: episodes::Row) -> Option<u32> {
+    screen.engine_key(episodes::elem(i, row)?)
+}
+
+/// Episode 257 of a long season used to be unreachable (`MAX_ITEMS` 256). With the pages landing as
+/// the walk reaches them, Right from the first episode reaches the 1,000th, and the focused cell's
+/// identity changes only by the key.
+#[test]
+fn a_thousand_episode_season_is_walked_to_its_last_episode_with_right() {
+    let total = 1000;
+    let _guard = install(long_season(total, &[0]));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let mut at = episode_key(&screen, 0, episodes::Row::Still).expect("page 0 is keyed");
+    let mut reached = 0;
+    while reached + 1 < total {
+        let context = cx(&measure, Some(at));
+        match Focusable::<TestHost>::neighbour(&screen, FocusKey { entry: EntryId(7), elem: at }, Dir::Right, &context) {
+            Step::Move(next) => {
+                reached += 1;
+                assert!(screen.locate(next.elem, test_store().view()) == Some(Located::Episode(reached, episodes::Row::Still)));
+                at = next.elem;
+            }
+            Step::Edge => {
+                // a hole: the press stops, the page lands, the same press goes on
+                assert!(test_store().view().current().unwrap().episodes.get(reached + 1).is_none(), "Right stopped at {reached} with the next episode loaded");
+                land_page(total, (reached + 1) / 60);
+                screen.sync_keys(test_store().view());
+                assert_eq!(episode_key(&screen, reached, episodes::Row::Still), Some(at), "landing did not rekey the focused episode");
+            }
+        }
+    }
+    assert!(screen.locate(at, test_store().view()) == Some(Located::Episode(999, episodes::Row::Still)));
+    clear();
+}
+
+/// The strip keys, lays out and draws the cells on the axis only, however long the season.
+#[test]
+fn a_long_season_registers_stops_for_the_visible_cells_only() {
+    let all: Vec<usize> = (0..17).collect();
+    let _guard = install(long_season(1000, &all));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let top = {
+        let d = screen.detail(test_store().view()).unwrap();
+        screen.section_top(2, d, &measure)
+    };
+    screen.scroll.jump(top);
+    screen.scroll_target = top;
+    screen.episode_scroll.jump(episodes::strip_x(700) - plx_ui::consts::MARGIN_X);
+    let stops = drawn_stops(&mut screen, &cx(&measure, None));
+    let eps: Vec<usize> = stops
+        .iter()
+        .filter_map(|s| match screen.locate(s.key.elem, test_store().view()) {
+            Some(Located::Episode(i, _)) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert!(!eps.is_empty() && eps.iter().all(|i| (696..709).contains(i)), "only the cells on the axis: {eps:?}");
+    clear();
+}
+
+/// A hole in view draws the still's skeleton; the page landing fills it and the focused cell does
+/// not move.
+#[test]
+fn a_hole_in_view_draws_a_skeleton_and_fills_on_landing_without_moving_the_focus() {
+    let _guard = install(long_season(200, &[0]));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let focus = episode_key(&screen, 59, episodes::Row::Still).unwrap();
+    let top = {
+        let d = screen.detail(test_store().view()).unwrap();
+        screen.section_top(2, d, &measure)
+    };
+    screen.scroll.jump(top);
+    screen.scroll_target = top;
+    // Scrolled so every cell on the axis is past the landed page: drawing a loaded cell needs the
+    // GL text path the host does not have, a hole's skeleton does not.
+    screen.episode_scroll.jump(episodes::strip_x(75) - plx_ui::consts::MARGIN_X);
+    let context = cx(&measure, Some(focus));
+    let skeletons = |screen: &mut DetailScreen| {
+        let (_, frame) = plx_ui::placeholder::capture_declared(|| {
+            let meta = test_store().view();
+            let d = screen.detail(meta).unwrap();
+            episodes::draw(plx_ui::Painter::root(), d, 0.0, screen.episode_scroll.pos, None, |_| 1.0, |_| Default::default(), &measure, meta);
+        });
+        frame.of(plx_ui::placeholder::Reason::CardSkeleton)
+    };
+    let before_rect = Focusable::<TestHost>::place(&screen, &focus, &context, At::SpringTarget).unwrap().rect;
+    assert!(skeletons(&mut screen) >= 2, "the cells past the landed page are skeletons");
+    land_page(200, 1);
+    screen.sync_keys(test_store().view());
+    {
+        let d = screen.detail(test_store().view()).unwrap();
+        assert!(episodes::visible(screen.episode_scroll.pos, d.episodes.len(), 0).all(|i| d.episodes.get(i).is_some()), "the landing fills the holes in view");
+    }
+    assert_eq!(episode_key(&screen, 59, episodes::Row::Still), Some(focus), "the focused identity is unchanged");
+    let after_rect = Focusable::<TestHost>::place(&screen, &focus, &context, At::SpringTarget).unwrap().rect;
+    assert_eq!(before_rect, after_rect, "the focused cell did not move");
+    clear();
+}
+
+/// Right and Left stop at a hole rather than seat on a cell that is not there.
+#[test]
+fn left_and_right_stop_at_a_hole() {
+    let _guard = install(long_season(300, &[0, 2]));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let context = cx(&measure, None);
+    let step_from = |i: usize, dir: Dir| {
+        let at = episode_key(&screen, i, episodes::Row::Still).unwrap();
+        Focusable::<TestHost>::neighbour(&screen, FocusKey { entry: EntryId(7), elem: at }, dir, &context)
+    };
+    assert!(matches!(step_from(59, Dir::Right), Step::Edge), "page 1 is a hole");
+    assert!(matches!(step_from(120, Dir::Left), Step::Edge), "page 1 is a hole");
+    assert!(matches!(step_from(58, Dir::Right), Step::Move(_)));
+    clear();
+}
+
+/// A restore onto episode 700 seats it once its page is in, and waits for the page rather than
+/// seating on another episode.
+#[test]
+fn a_restore_onto_episode_700_waits_for_its_page_and_then_seats_it() {
+    let _guard = install(long_season(1000, &[0]));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.restore_intent = Some(RestoreIntent {
+        spot: Spot { section: 2, col: 700, ..Default::default() },
+        episode: Some("e700".into()),
+        season_requested: true,
+        seek: Default::default(),
+    });
+    screen.sync_keys(test_store().view());
+    assert_eq!(screen.restore_focus(test_store().view()), None, "episode 700's page has not landed");
+    land_page(1000, 11);
+    screen.sync_keys(test_store().view());
+    assert_eq!(screen.restore_focus(test_store().view()), episode_key(&screen, 700, episodes::Row::Still));
+    clear();
+}
+
+/// The strip tells the store which episodes it needs, and says it again only when that changes (or
+/// once a second while a page in it is still a hole), so a long season fetches as the strip moves.
+#[test]
+fn a_long_season_asks_for_the_pages_the_strip_reaches_only_when_the_range_changes() {
+    let _guard = install(long_season(1000, &[0]));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let context = cx(&measure, None);
+    let mut present = plx_machine::present::Present::new();
+    let mut effects = Vec::new();
+    let mut tick = |screen: &mut DetailScreen, ms: u32, effects: &mut Vec<plx_machine::machine::Stamped<TestHost>>| {
+        let before = effects.len();
+        let mut sink = Effects::new(
+            effects,
+            plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(1)),
+            &mut present,
+        );
+        Machine::<TestHost>::step(screen, &ScreenEvent::Tick(plx_machine::machine::Tick { ms, dt_us: 16_667 }), &context, &mut sink);
+        effects.len() - before
+    };
+    let wants = |effects: &[plx_machine::machine::Stamped<TestHost>]| {
+        effects
+            .iter()
+            .filter(|s| matches!(&s.fx, Fx::App(AppFx::Store(StoreId::Metadata, StoreCmd::Metadata(MetadataCmd::WantEpisodes { .. })))))
+            .count()
+    };
+    tick(&mut screen, 0, &mut effects);
+    assert_eq!(wants(&effects), 1, "the first tick says what the strip needs");
+    tick(&mut screen, 16, &mut effects);
+    assert_eq!(wants(&effects), 1, "the same range is not said again at once");
+    screen.episode_scroll.jump(episodes::strip_x(500) - plx_ui::consts::MARGIN_X);
+    tick(&mut screen, 32, &mut effects);
+    assert_eq!(wants(&effects), 2, "a strip somewhere else is a new range");
+    tick(&mut screen, 2_000, &mut effects);
+    assert_eq!(wants(&effects), 3, "a page still missing a second later is asked for again");
+    clear();
+}
+
+// ---- where the strips open: the season and the episode the viewer left off at ------------------
+
+/// A show with `season_count` seasons, season `cur` selected and `total` episodes of it listed
+/// (only the first page when `total` exceeds one), whose on-deck episode is the one named `deck`
+/// (its rating key) with the episode NUMBER `deck_index`, or no on-deck at all.
+fn deck_show(season_count: i64, cur: usize, total: usize, deck: Option<(&str, i64)>) -> Detail {
+    let mut d = detail(ServerId::UNSET, "show");
+    d.seasons = (1..=season_count).map(season).collect();
+    d.cur_season = cur;
+    d.episodes = plx_data::metadata::EpisodeList::with_total(total);
+    d.episodes.set_page(0, episode_rows(total, 0));
+    d.on_deck = deck.map(|(rk, index)| plx_data::metadata::Episode {
+        rk: rk.into(),
+        index,
+        season: cur as i64 + 1,
+        ..episode(rk, index)
+    });
+    d
+}
+
+/// One real `Tick` of `screen` with `focus` (a LOCAL element) held, and the effects it pushed.
+fn tick_page(screen: &mut DetailScreen, focus: Option<u32>, ms: u32) -> Vec<plx_machine::machine::Stamped<TestHost>> {
+    screen.sync_keys(test_store().view());
+    let measure = plx_ui::fixture::FixtureMeasure;
+    let context = cx(&measure, focus.and_then(|local| screen.engine_key(local)));
+    let mut present = plx_machine::present::Present::new();
+    let mut effects = Vec::new();
+    let mut sink = Effects::new(
+        &mut effects,
+        plx_machine::machine::MachineId::Instance(plx_machine::machine::InstanceId(1)),
+        &mut present,
+    );
+    Machine::<TestHost>::step(screen, &ScreenEvent::Tick(plx_machine::machine::Tick { ms, dt_us: 16_667 }), &context, &mut sink);
+    effects
+}
+
+fn wanted_episodes(effects: &[plx_machine::machine::Stamped<TestHost>]) -> Vec<(usize, usize)> {
+    effects
+        .iter()
+        .filter_map(|s| match &s.fx {
+            Fx::App(AppFx::Store(StoreId::Metadata, StoreCmd::Metadata(MetadataCmd::WantEpisodes { lo, hi, .. }))) => Some((*lo, *hi)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Opening a show the viewer is part way through leaves the page where it always opened, on the
+/// hero, and only the two strips sit where they left off: season 12 of 20 is on its tab strip and
+/// episode 14 of the season is in the filmstrip.
+#[test]
+fn a_started_show_opens_with_both_strips_scrolled_to_where_the_viewer_left_off() {
+    let _guard = install(deck_show(20, 11, 30, Some(("e13", 14))));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    for ms in [0, 16, 32] {
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), ms);
+    }
+    let len = 30;
+    assert!(
+        episodes::visible(screen.episode_scroll.pos, len, 0).contains(&13),
+        "episode 14 is in the filmstrip's window (scroll {})",
+        screen.episode_scroll.pos
+    );
+    assert!(screen.episode_scroll.pos > 0.0);
+    assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(13, len), "and it stands at the leading edge");
+    assert!(screen.tab_scroll.pos > 0.0, "twenty season tabs do not fit one screen");
+    assert!(
+        screen.season_metrics.visible(screen.tab_scroll.pos).contains(&11),
+        "season 12's tab is on screen (tab scroll {})",
+        screen.tab_scroll.pos
+    );
+    assert_eq!(screen.scroll_target, 0.0, "the page itself stays at the top, on the hero");
+    assert_eq!(screen.scroll.pos, 0.0);
+    assert!(screen.restore_intent.is_none() && !screen.return_pending, "nothing was queued to move focus");
+    clear();
+}
+
+/// A show nobody has started — or finished, or whose server sent no on-deck — opens as it did:
+/// season one, both strips at zero.
+#[test]
+fn a_show_without_an_on_deck_episode_opens_with_both_strips_at_zero() {
+    let _guard = install(deck_show(20, 0, 30, None));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    for ms in [0, 16, 32] {
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), ms);
+    }
+    assert_eq!((screen.episode_scroll.pos, screen.tab_scroll.pos), (0.0, 0.0));
+    assert_eq!(test_store().view().current().map(|d| d.cur_season), Some(0));
+    clear();
+}
+
+/// The on-deck episode of ANOTHER season is not this season's: a season the viewer is not on
+/// opens at its first episode.
+#[test]
+fn an_on_deck_episode_in_another_season_does_not_scroll_this_seasons_strip() {
+    let mut show = deck_show(4, 1, 30, Some(("e13", 14)));
+    show.on_deck.as_mut().unwrap().season = 4;
+    let _guard = install(show);
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.episode_scroll.jump(900.0);
+    tick_page(&mut screen, Some(hero::ELEM_PLAY), 0);
+    assert_eq!(screen.episode_scroll.pos, 0.0);
+    clear();
+}
+
+/// A user's tab switch lands a new season's list. Before the page seated its strips, the filmstrip
+/// kept the PREVIOUS season's scroll offset across the switch (nothing but focus ever moved it),
+/// so season 2 opened part way along. Now a season other than the on-deck one starts at 0, and the
+/// on-deck season starts at the on-deck episode.
+#[test]
+fn switching_season_seats_the_filmstrip_at_the_new_seasons_start() {
+    let mut show = deck_show(4, 0, 30, Some(("s3e14", 14)));
+    show.on_deck.as_mut().unwrap().season = 3;
+    let _guard = install(show);
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    tick_page(&mut screen, Some(hero::ELEM_PLAY), 0);
+    screen.episode_scroll.jump(3_000.0); // the viewer scrolled season 1's strip
+    let tab = season::elem(1).unwrap();
+    plx_data::metadata::edit_current_for_test(test_store().state_mut(), |d| {
+        d.cur_season = 1;
+        d.episodes.set_page(0, episode_rows(30, 0));
+    });
+    tick_page(&mut screen, Some(tab), 16);
+    assert_eq!(screen.episode_scroll.pos, 0.0, "season 2 starts at its first episode");
+
+    // …and the on-deck season, switched to, starts at the on-deck episode.
+    plx_data::metadata::edit_current_for_test(test_store().state_mut(), |d| {
+        d.cur_season = 2;
+        d.episodes = plx_data::metadata::EpisodeList::with_total(30);
+        d.episodes.set_page(0, (0..30).map(|i| episode(&format!("s3e{}", i + 1), i as i64 + 1)).collect());
+    });
+    tick_page(&mut screen, Some(season::elem(2).unwrap()), 32);
+    assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(13, 30));
+    clear();
+}
+
+/// Neither a return (BACK, the player) nor a restore onto the filmstrip is seated over: both put
+/// the strip where the viewer left it by their own rule.
+#[test]
+fn a_return_and_a_filmstrip_restore_are_not_seated_over() {
+    let _guard = install(deck_show(4, 1, 30, Some(("e13", 14))));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.return_pending = true;
+    screen.restore_intent = Some(RestoreIntent {
+        spot: Spot { section: 0, ..Spot::default() },
+        episode: None,
+        season_requested: false,
+        seek: Default::default(),
+    });
+    screen.episode_scroll.jump(123.0);
+    tick_page(&mut screen, None, 0);
+    assert_eq!(screen.episode_scroll.pos, 123.0, "a return in flight owns the strip");
+    // Once the return is over, a page that was never seated (a fresh body) opens on the on-deck episode.
+    screen.return_pending = false;
+    screen.restore_intent = None;
+    tick_page(&mut screen, Some(hero::ELEM_PLAY), 16);
+    assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(13, 30));
+
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.restore_intent = Some(RestoreIntent {
+        spot: Spot { section: 2, col: 3, season: Some(2), ..Spot::default() },
+        episode: Some("e3".into()),
+        season_requested: false,
+        seek: Default::default(),
+    });
+    screen.episode_scroll.jump(123.0);
+    tick_page(&mut screen, None, 0);
+    assert_eq!(screen.episode_scroll.pos, 123.0, "a restore onto the filmstrip seats its own episode");
+    clear();
+}
+
+/// A restore onto the HERO that names a season (`open_detail(.., Some(season), ..)`) is not a
+/// filmstrip restore: the on-deck seat still applies, and the season restore then moves the tab.
+#[test]
+fn a_hero_restore_that_names_a_season_still_seats_the_filmstrip() {
+    let _guard = install(deck_show(4, 1, 30, Some(("e13", 14))));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    screen.restore_intent = Some(RestoreIntent {
+        spot: Spot { section: 0, season: Some(2), ..Spot::default() },
+        episode: None,
+        season_requested: false,
+        seek: Default::default(),
+    });
+    tick_page(&mut screen, Some(hero::ELEM_PLAY), 0);
+    assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(13, 30));
+    clear();
+}
+
+/// Once the viewer has put focus on the tabs or the filmstrip the page never moves them again,
+/// however the data under them changes.
+#[test]
+fn a_viewer_who_took_the_filmstrip_is_not_seated_over() {
+    let _guard = install(deck_show(4, 1, 30, Some(("e13", 14))));
+    let mut screen = bare(&_guard, ServerId::UNSET, "show");
+    tick_page(&mut screen, Some(episodes::elem(0, episodes::Row::Still).unwrap()), 0);
+    assert_eq!(screen.episode_scroll.pos, 0.0, "focus was on the strip before the page seated it");
+    // a re-read lands a fresh list for the same season
+    plx_data::metadata::edit_current_for_test(test_store().state_mut(), |d| {
+        d.episodes = plx_data::metadata::EpisodeList::with_total(30);
+        d.episodes.set_page(0, episode_rows(30, 0));
+    });
+    tick_page(&mut screen, Some(hero::ELEM_PLAY), 16);
+    assert_eq!(screen.episode_scroll.pos, 0.0);
+    clear();
+}
+
+/// A long season lands as its first page: the on-deck episode on a later page is seated at the
+/// number the server gave it, the page holding it is asked for, and the seat is corrected to the
+/// episode's real place when the page lands. A viewer who took the strip meanwhile, or a page that
+/// never lands, ends the correction.
+#[test]
+fn a_long_seasons_on_deck_episode_is_seated_by_hint_then_corrected_when_its_page_lands() {
+    // Episode number 100, but it is the 91st listed (e90): a season with a gap in its numbering.
+    let total = 200;
+    {
+        let _guard = install(deck_show(2, 0, total, Some(("e90", 100))));
+        let mut screen = bare(&_guard, ServerId::UNSET, "show");
+        let first = tick_page(&mut screen, Some(hero::ELEM_PLAY), 0);
+        assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(99, total), "seated by the hint");
+        assert!(
+            wanted_episodes(&first).iter().any(|&(lo, hi)| lo <= 99 && 99 < hi),
+            "the page holding the hint is asked for: {:?}",
+            wanted_episodes(&first)
+        );
+        land_page(total, 1);
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), 100);
+        assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(90, total), "corrected to e90's place");
+        land_page(total, 2);
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), 200);
+        assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(90, total), "and final");
+        clear();
+    }
+
+    {
+        // The viewer takes the strip before the page lands: no correction under their hands.
+        let _guard = install(deck_show(2, 0, total, Some(("e90", 100))));
+        let mut screen = bare(&_guard, ServerId::UNSET, "show");
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), 0);
+        // (a hole has no cell to hold focus, so the viewer's stop is the first, loaded episode)
+        tick_page(&mut screen, Some(episodes::elem(0, episodes::Row::Still).unwrap()), 16);
+        let held = screen.episode_scroll.pos;
+        land_page(total, 1);
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), 32);
+        assert_eq!(screen.episode_scroll.pos, held);
+        clear();
+    }
+
+    {
+        // A page that never lands is given up on: the hint stands, and a late landing leaves it be.
+        let _guard = install(deck_show(2, 0, total, Some(("e90", 100))));
+        let mut screen = bare(&_guard, ServerId::UNSET, "show");
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), 0);
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), SEAT_GIVE_UP_MS + 1);
+        land_page(total, 1);
+        tick_page(&mut screen, Some(hero::ELEM_PLAY), SEAT_GIVE_UP_MS + 17);
+        assert_eq!(screen.episode_scroll.pos, episodes::seat_scroll(99, total));
+        clear();
+    }
+}
+
+// ---- A short Related head: the row that paints pending cells asks for them -------------------
+
+/// A member movie whose `/related` previews were mostly its own collection: the members go to the
+/// collection shelf (`plx_data::metadata::CollectionShelf`), so the Related head that is left is
+/// ONE card, and the similar hub still has more behind its preview (`related_tail.more`).
+fn short_related_head(sid: ServerId) -> Detail {
+    let mut d = collection_movie(sid);
+    d.related = vec![plx_data::pms::PmsMovie { thumb: "/t/r1".into(), ..collection_member(sid, "r1") }];
+    d.related_tail = plx_data::metadata::RelatedTail {
+        hubs: vec![plx_data::metadata::TailHub { key: "/library/metadata/1/similar".into(), preview: 8, len: None }],
+        exclude: ["m1", "m2", "m3", "m4"].iter().map(|rk| rk.to_string()).collect(),
+        head: 1,
+        more: true,
+        ..Default::default()
+    };
+    d
+}
+
+/// The cells the Related row paints past its last loaded card (`Shelf::paint_pending`): skeletons
+/// that stand in for no card (an empty key); the loaded card's own skeleton names its thumb.
+fn related_pending_cells(screen: &DetailScreen, measure: &plx_ui::fixture::FixtureMeasure) -> usize {
+    let context = cx(measure, None);
+    let meta = test_store().view();
+    let d = screen.detail(meta).unwrap();
+    let (_, frame) = plx_ui::placeholder::capture_declared(|| {
+        let mut f = DrawFrame::new(&context, plx_ui::Painter::root());
+        let p = f.painter;
+        let at = SectionFrame { y: 600.0, clip: Rect::FULL };
+        screen.related.draw(&mut f, p, &screen.cards(cards::Which::Related, d), at);
+    });
+    frame.entries.iter().filter(|e| e.reason == plx_ui::placeholder::Reason::CardSkeleton && e.key.is_empty()).count()
+}
+
+/// **Regression (the site-video frame dump's `card-skeleton:<empty>` on Tears of Steel).** A Related
+/// row whose head is shorter than the screen and whose tail goes on paints the skeletons of the
+/// cards past its edge whoever is looking (`CardSource::more_after`). The tail used to be asked for
+/// only with focus near the row's end, so a row on screen that nobody had focused showed a
+/// screenful of skeletons for as long as the page was up: a promise of cards that never came. The
+/// row that paints pending cells on screen asks for them, focused or not.
+#[test]
+fn an_unfocused_related_row_that_paints_pending_cells_asks_for_the_tail() {
+    let sid = ServerId::UNSET;
+    let _guard = install(short_related_head(sid));
+    let mut screen = bare(&_guard, sid, "m1");
+    let measure = plx_ui::fixture::FixtureMeasure;
+    assert!(related_pending_cells(&screen, &measure) > 0, "the row paints the cells past its one card");
+    let mut asks = Vec::new();
+    for n in 0..60 {
+        let tick = ScreenEvent::Tick(plx_machine::machine::Tick { ms: 17 * n, dt_us: 16_667 });
+        // focus stands on the hero's Play, not on the Related row
+        let (_, effects) = step(&mut screen, &tick, Some(hero::ELEM_PLAY));
+        asks.extend(effects.into_iter().filter_map(|e| match e.fx {
+            Fx::App(AppFx::Store(StoreId::Metadata, StoreCmd::Metadata(MetadataCmd::WantRelated { before, seen }))) => Some((before, seen)),
+            _ => None,
+        }));
+    }
+    assert_eq!(asks.first(), Some(&(false, (0, 0))),
+        "the unfocused row asks for the tail its skeletons stand in for: {asks:?}");
+    // The tail lands (24 cards from position 0, more behind them) and takes the cells over.
+    let mut window = short_related_head(sid);
+    window.related.extend((0..24).map(|n| plx_data::pms::PmsMovie { thumb: format!("/t/t{n}"), ..collection_member(sid, &format!("t{n}")) }));
+    window.related_tail = plx_data::metadata::RelatedTail { positions: (0..24).collect(), end: 24, total: 0, ..window.related_tail };
+    let (state, adapter) = test_store().split_for_test();
+    plx_data::metadata::land_related_for_test(adapter, (0, 0), &window);
+    assert!(plx_data::metadata::pump_related_pages(state, adapter), "the window installs");
+    screen.sync_keys(test_store().view());
+    assert_eq!(related_pending_cells(&screen, &measure), 0, "no skeleton is left in view");
+    clear();
+}
+
+/// The other half of the rule: a row whose loaded cards already reach past the screen paints no
+/// pending cell there, and an unfocused one asks for nothing (the tail is read as focus nears it).
+#[test]
+fn an_unfocused_related_row_that_fills_the_screen_does_not_ask() {
+    let sid = ServerId::UNSET;
+    let mut d = short_related_head(sid);
+    d.related = (0..12).map(|i| plx_data::pms::PmsMovie { thumb: format!("/t/r{i}"), ..collection_member(sid, &format!("r{i}")) }).collect();
+    d.related_tail.head = 12;
+    let _guard = install(d);
+    let mut screen = bare(&_guard, sid, "m1");
+    let measure = plx_ui::fixture::FixtureMeasure;
+    assert_eq!(related_pending_cells(&screen, &measure), 0, "no pending cell is on screen");
+    for n in 0..60 {
+        let tick = ScreenEvent::Tick(plx_machine::machine::Tick { ms: 17 * n, dt_us: 16_667 });
+        let (_, effects) = step(&mut screen, &tick, Some(hero::ELEM_PLAY));
+        assert!(!effects.iter().any(|e| matches!(&e.fx,
+            Fx::App(AppFx::Store(StoreId::Metadata, StoreCmd::Metadata(MetadataCmd::WantRelated { .. }))))),
+            "tick {n}: an unfocused row that fills the screen asks for nothing");
+    }
     clear();
 }

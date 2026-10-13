@@ -28,6 +28,8 @@ pub mod marquee; // the focused run's looping glide: a tile's title and caption 
 pub mod card_motion;
 #[cfg(feature = "devtriggers")]
 pub mod card_motion_metrics;
+#[cfg(feature = "devtriggers")]
+pub mod card_probe; // `plxnative-focusx`: the focused card's drawn rect/index/art of every Shelf and Grid
 pub mod value_chip; // shared label/value/owner capsule used by menu-opening controls
 pub mod containers; // RESTRUCTURE (spec §6.2): Navigation = TabContainer → NavStack → ModalStack, the transitions, the host fold
 pub mod collection_tile; // the neutral tile a thumb-less collection draws on every surface
@@ -40,6 +42,7 @@ pub mod adapters; // RESTRUCTURE (spec §2.2): the one door out of the machine w
 pub mod geom; // RESTRUCTURE (spec §7.1): `Focusable` for the widgets — geometry IS `place`
 pub mod tile; // RESTRUCTURE (spec §10): the library's item abstraction for a shelf tile
 pub mod document_reader;
+pub mod prose_scroll; // the paged prose viewport `person_bio` and `about_panel` share
 pub mod fit; // one declared-priority primitive for a line with two competing runs (`two_runs`)
 pub mod fixture; // RESTRUCTURE spike: `FixtureHost` — the bundle the generic library is tested against
 pub mod focus; // RESTRUCTURE (spec §7.3): the focus ENGINE — one owner of focus, the golden tables
@@ -432,7 +435,14 @@ impl Painter {
         use frame::backdrop::Value;
         let mut data=vec![tag];
         [self.a,self.rgb].record(&mut data);
-        let m = self.place(r);
+        let mut m = self.place(r);
+        if matches!(tag, 100..=102) && self.zoom.is_none() {
+            // Unzoomed text is drawn at a whole pixel (`text::Placed::origin` snaps it), so the
+            // pixel it lands on is what it can change under a glass, not the float it came from: a
+            // heading easing the last fraction of a pixel into place changes nothing on screen.
+            m.x = plx_gfx::gfx::snap(m.x);
+            m.y = plx_gfx::gfx::snap(m.y);
+        }
         [m.x,m.y,m.w,m.h].record(&mut data);
         values(&mut data);
         // The primitive AA/rim can paint just outside its nominal rectangle.
@@ -973,10 +983,11 @@ impl Painter {
         rim: plx_gfx::gfx::GlassRim,
         face: plx_gfx::gfx::GlassFace,
         deep: f32,
+        rises: bool,
     ) -> bool {
         if self.records() { return false; }
         if frame::backdrop::discovering() {
-            frame::backdrop::surface(self.place(r));
+            frame::backdrop::surface_with(self.place(r), rises);
             self.declare(r,frame::backdrop::GLASS_COMMAND,|data| {
                 use frame::backdrop::Value;
                 (rim as u32).record(data);
@@ -1000,6 +1011,7 @@ impl Painter {
             rim,
             face,
             deep,
+            rises,
         )
     }
     /// [`tex`](Self::tex) with the focus edge-sheen (the 1px inset perimeter rim) baked into the SAME

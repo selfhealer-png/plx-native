@@ -15,6 +15,7 @@ use super::{log, sink, threads, ACB_OK, PTYPE, SHARED, TX};
 use crate::aq::{AuNode, AuQueue};
 use plx_net::stream::HttpStream;
 use plx_base::task::MainThread;
+use plx_telemetry::telemetry::window::Stage as WindowStage;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -89,9 +90,18 @@ pub fn fed_totals() -> (i64, i64) {
     (VTOT.load(Ordering::Relaxed), ATOT.load(Ordering::Relaxed))
 }
 
-/// The AU queues' byte caps — the denominators the read-out shows `dg_aq_*` against, so a viewer
+/// The AU queues' BASE byte caps — the denominators the read-out shows `dg_aq_*` against, so a viewer
 /// can see backpressure (a video lane pinned at its cap is the demuxer outrunning the decoder;
 /// both lanes empty while Stage is Playing is the opposite).
+///
+/// **Base, not the cap in force.** For the first seconds of a file whose audio starts so late that
+/// the video lane fills to this cap before the first audio packet, the demuxer lifts the video
+/// lane's cap by `ff::PRE_AUDIO_VIDEO_HEADROOM` (24 MiB) and then walks it back down as the
+/// consumer drains, so the read-out can show a video lane ABOVE this number then. That is the
+/// headroom doing its job, not an accounting error. An ordinary file never sees it: the grant is
+/// taken only when a video push would park at this cap with no audio yet. The reachable-reserve
+/// model (`abr::plant::b_max_est_ms`) wants exactly this steady-state number: the headroom is a
+/// transient of the start of one kind of file, gone before the buffer-driven controller acts.
 pub const fn aq_caps() -> (i64, i64) {
     (AQ_VIDEO_BYTES as i64, AQ_AUDIO_BYTES as i64)
 }
@@ -187,6 +197,10 @@ pub struct Engine {
     pub presentation_rearm_pending: bool,
     pub max_fed_video_pts: i64, // high-water fed pts, VIDEO lane (g_max_fed_pts)
     pub max_fed_audio_pts: i64, // high-water fed pts, AUDIO lane (two-lane feed)
+    /// Fed pts of the AU that opened this timeline's audio — the one the demuxer marked as its
+    /// first since the open or seek (`SHARED.first_audio_pts`) — once Starfish accepted it.
+    /// `None` until then; reset with `max_fed_audio_pts`. See [`audio_lead_in`].
+    pub audio_start_fp: Option<i64>,
     /// The feed-ahead throttle's reference position, run on between the pipeline's 5 Hz
     /// position reports (see [`FeedPace`]).
     pub feed_pace: FeedPace,
@@ -374,6 +388,7 @@ fn release_native_object(mt: &MainThread, epoch: u32) {
     // object is preferable to letting D1 turn a late producer callback into a use-after-free.
     if unsafe { sink().ready(mt) } != 0 {
         unsafe { sink().unload(mt) };
+        window_step(WindowStage::NativeUnload);
         let callback_gate_proven = unsafe { sink().callback_gate_retire(mt) } != 0;
         let callback_intercepts = unsafe { sink().callback_intercepts(mt) };
         let unload_completed = SHARED.native_unload_completed(epoch);
@@ -395,15 +410,22 @@ fn release_native_object(mt: &MainThread, epoch: u32) {
         }
         if ACB_OK.load(Ordering::Relaxed) {
             unsafe { sink().plane_unload(mt) };
+            window_step(WindowStage::AcbPlaneUnload);
         }
         match native_object_disposition(unload_completed, callback_gate_proven, rust_epoch_retired)
         {
             NativeObjectDisposition::Destroy => {
                 if unsafe { sink().destroy(mt) } == 0 {
                     log("native lifecycle: C seam rejected D1 and quarantined the object");
+                    window_step(WindowStage::NativeQuarantined);
+                } else {
+                    window_step(WindowStage::NativeDestroyed);
                 }
             }
-            NativeObjectDisposition::Quarantine => unsafe { sink().quarantine(mt) },
+            NativeObjectDisposition::Quarantine => {
+                unsafe { sink().quarantine(mt) };
+                window_step(WindowStage::NativeQuarantined);
+            }
         }
     } else if !SHARED.retire_native_session(epoch) {
         log(&format!(
@@ -416,6 +438,21 @@ fn release_native_object(mt: &MainThread, epoch: u32) {
     // otherwise leak it, and the next Load would ask for another. Unguarded because the seam
     // already no-ops in the other modes (see starfish.h).
     unsafe { sink().destroy_window(mt) };
+    if sink().window_mode() == super::VP_EXPORTED {
+        window_step(WindowStage::ExportedWindowDestroy);
+    }
+}
+
+/// One closed teardown/exported-window breadcrumb on a native crash event, **only inside an app
+/// switch's background or foreground cycle** (`window::record_in_cycle`): this runs for every
+/// engine that comes and goes (a trailer, a seek or quality reload, an abandoned Load), and those
+/// would fill the shared 16-slot ring with steps of no cycle. Consent-gated inside
+/// `window::record` and a no-op while the crash backend is not running; carries no data beyond the
+/// label, so a crash in the next step shows which step had already returned.
+fn window_step(stage: WindowStage) {
+    plx_telemetry::telemetry::window::record_in_cycle(
+        plx_telemetry::telemetry::window::Observation::step(stage, None),
+    );
 }
 
 /// Bind the decoded video sink to the display plane, whichever way this television does it.
@@ -523,6 +560,67 @@ const ENVELOPE_FHD60: SinkEnvelope = SinkEnvelope {
     fps: 60,
 };
 
+/// The video codec one Load declares: what the payload's `codec.video` names, and what the
+/// `dg_load_v` diagnostic code says. Written once here so the three never disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoadVideo {
+    H264,
+    H265,
+    Av1,
+    Vp9,
+}
+
+impl LoadVideo {
+    /// The route's stream vcodec -> what the Load declares, case-insensitively (PMS emits lowercase;
+    /// the route's own comparisons elsewhere are case-insensitive too). **An unknown codec is `None`,
+    /// not H.264**: the old catch-all declared an H.264 Load for whatever the route held, so a codec
+    /// the pipeline cannot feed arrived as an H.264 declaration over a bitstream it could not parse,
+    /// i.e. a black screen with nothing in the log naming the cause. The empty string is the one
+    /// deliberate H.264: the route holds it until a decision installs a codec, which is the pipeline
+    /// tier's and the local-sample feeds' baseline.
+    pub(crate) fn of_stream(vcodec: &str) -> Option<Self> {
+        match vcodec.to_ascii_lowercase().as_str() {
+            "" | "h264" => Some(Self::H264),
+            "hevc" | "h265" => Some(Self::H265),
+            "av1" => Some(Self::Av1),
+            "vp9" => Some(Self::Vp9),
+            _ => None,
+        }
+    }
+    /// The payload's `codec.video` string. libpf selects its AV1 caps for `"AV1"`; the pipeline
+    /// has no av1parse, so an AV1 Load carries its configuration in-band (see `ff.rs`). `"VP9"`
+    /// is the name in libpf's codec table beside `"VP8"`; its `video/x-vp9` appsrc caps carry no
+    /// `codec_data`, and a VP9 frame carries its own headers, so nothing is added to the packets.
+    pub(crate) fn payload_name(self) -> &'static str {
+        match self {
+            Self::H264 => "H264",
+            Self::H265 => "H265",
+            Self::Av1 => "AV1",
+            Self::Vp9 => "VP9",
+        }
+    }
+    /// `SHARED.dg_load_v`'s code (video 1 = H264, 2 = H265, 3 = AV1, 4 = VP9).
+    pub(crate) fn diag_code(self) -> u8 {
+        match self {
+            Self::H264 => 1,
+            Self::H265 => 2,
+            Self::Av1 => 3,
+            Self::Vp9 => 4,
+        }
+    }
+}
+
+/// True when the Load must be refused: an AV1 or VP9 stream on a set whose table lists no such
+/// decoder. Only reachable when a server ignores the profile we sent, so the refusal is a refusal
+/// to declare a codec the set may not have, never a fallback to H.264 for another bitstream.
+pub(crate) fn load_video_refused(lv: LoadVideo, caps: &plx_platform::devcaps::Caps) -> bool {
+    match lv {
+        LoadVideo::Av1 => !caps.av1,
+        LoadVideo::Vp9 => !caps.vp9,
+        LoadVideo::H264 | LoadVideo::H265 => false,
+    }
+}
+
 /// **The sink envelope for this session, and the rule is deliberately narrow.** Until 2026-09-03
 /// the streamed A/V Load declared `ENVELOPE_UHD60` for every codec and every source, and on
 /// webOS 10.3.1 that refuses EVERY H.264 Load — i.e. every server transcode — with `type=18
@@ -550,8 +648,11 @@ const ENVELOPE_FHD60: SinkEnvelope = SinkEnvelope {
 /// value every Dolby Vision verification was taken under. `/tmp/plxnative-sinkmax=WxH@F`
 /// overrides the whole result so the remaining legs are an A/B with no rebuild. Pure; the
 /// wrappers feed it the route.
+///
+/// AV1 and VP9 copy HEVC's rule because only H.264 was measured to need the FHD declaration on
+/// webOS 10; both are unmeasured on that axis (issue #593).
 fn sink_envelope(
-    is_h265: bool,
+    video: LoadVideo,
     max_raster: (u16, u16),
     stream_fps: f64,
     caps: &plx_platform::devcaps::Caps,
@@ -559,7 +660,7 @@ fn sink_envelope(
 ) -> SinkEnvelope {
     let fits_fhd = |w: u32, h: u32| w > 0 && h > 0 && w <= 1920 && h <= 1088;
     let (mw, mh) = (u32::from(max_raster.0), u32::from(max_raster.1));
-    let mut env = if !is_h265 && fits_fhd(mw, mh) {
+    let mut env = if video == LoadVideo::H264 && fits_fhd(mw, mh) {
         ENVELOPE_FHD60
     } else {
         ENVELOPE_UHD60
@@ -575,11 +676,16 @@ fn sink_envelope(
     // what the eye saw: declared at 60 the 4K 24p stream was PRESENTED at 13.0 fps mean, worst
     // second 10; declared at 24, 24.1 fps.** The class, not the exact value: 23.976 → 24 keeps
     // the declaration a ceiling the stream fits under.
-    if !is_h265 && stream_fps > 0.0 && stream_fps.is_finite() {
+    if video == LoadVideo::H264 && stream_fps > 0.0 && stream_fps.is_finite() {
         env.fps = fps_class(stream_fps);
     }
     if measured {
-        let (rw, rh, rf) = if is_h265 { caps.hevc_row } else { caps.h264_row };
+        let (rw, rh, rf) = match video {
+            LoadVideo::H264 => caps.h264_row,
+            LoadVideo::H265 => caps.hevc_row,
+            LoadVideo::Av1 => caps.av1_row,
+            LoadVideo::Vp9 => caps.vp9_row,
+        };
         let clamp = |v: u32, bound: u32| if bound == 0 { v } else { v.min(bound) };
         env.w = clamp(env.w, rw);
         env.h = clamp(env.h, rh);
@@ -596,16 +702,22 @@ fn sink_envelope(
 /// every arm that sends one (the local-sample feeds and the streamed `/tmp/plxnative-noaudio`
 /// path), so the `load:` line's `max=` reports what was SENT rather than the streamed builder's
 /// initializer. The test below pins these to the strings themselves.
-fn static_envelope(hevc: bool) -> SinkEnvelope {
-    if hevc {
-        ENVELOPE_UHD60
-    } else {
-        SinkEnvelope {
+fn static_envelope(video: LoadVideo) -> SinkEnvelope {
+    match video {
+        LoadVideo::H264 => SinkEnvelope {
             w: 1920,
             h: 1080,
             fps: 30,
-        }
+        },
+        LoadVideo::H265 | LoadVideo::Av1 | LoadVideo::Vp9 => ENVELOPE_UHD60,
     }
+}
+
+/// The `PAYLOAD_H265` template with its codec renamed: the static Load for an AV1 or VP9 stream on
+/// the no-audio path, which keeps that template's envelope and transport.
+fn renamed_static_payload(video: LoadVideo) -> String {
+    let to = format!(r#""video":"{}""#, video.payload_name());
+    PAYLOAD_H265.replacen(r#""video":"H265""#, &to, 1)
 }
 
 /// The smallest of the broadcast/film rate classes the stream fits under: 24, 25, 30, 50, 60,
@@ -619,7 +731,7 @@ fn fps_class(fps: f64) -> u32 {
     fps.ceil() as u32
 }
 
-fn sink_envelope_now(ps: &crate::route::PlaybackSession, is_h265: bool) -> SinkEnvelope {
+fn sink_envelope_now(ps: &crate::route::PlaybackSession, video: LoadVideo) -> SinkEnvelope {
     if let Some(spec) = plx_base::devtrig::read("sinkmax") {
         if let Some(env) = parse_sinkmax(&spec) {
             #[cfg(feature = "devtriggers")]
@@ -632,7 +744,7 @@ fn sink_envelope_now(ps: &crate::route::PlaybackSession, is_h265: bool) -> SinkE
         log(&format!("sinkmax: unparseable spec {spec:?} — ignored"));
     }
     sink_envelope(
-        is_h265,
+        video,
         crate::route::sink_max_raster(ps),
         crate::route::stream_fps(ps),
         plx_platform::devcaps::caps(),
@@ -870,6 +982,7 @@ fn with_window_id(mt: &MainThread, p: &str) -> String {
         return p.to_string();
     }
     let id = unsafe { sink().create_window(mt) };
+    window_step(WindowStage::ExportedWindowCreate);
     if id.is_null() {
         log("windowId: no exported window — video will not bind");
         return p.to_string();
@@ -943,6 +1056,7 @@ pub fn start_bufferfeed_tracked(ps: &mut crate::route::PlaybackSession, pa: &mut
         return BufferfeedStartOutcome::Failed;
     }
     ps.jail_load_blocked = false;
+    ps.native_start_refused = false;
     if let Some(existing) = pa.engine().map(|engine| engine.route_start) {
         match crate::route::classify_live_engine_start(existing) {
             crate::route::LiveEngineStartRelation::CurrentAttempt => {
@@ -973,7 +1087,14 @@ pub fn start_bufferfeed_tracked(ps: &mut crate::route::PlaybackSession, pa: &mut
         ));
         return BufferfeedStartOutcome::Failed;
     };
-    start_bufferfeed_for(ps, pa, route_start)
+    let outcome = start_bufferfeed_for(ps, pa, route_start);
+    // The refusal for an outstanding abandoned Load builds no Engine, so no pump will ever publish
+    // why the player is empty. Record it where `player::state` derives the read-out from; the start
+    // itself stays refused.
+    if outcome == BufferfeedStartOutcome::Failed && pa.has_abandoned_load() {
+        ps.native_start_refused = true;
+    }
+    outcome
 }
 
 /// Builds the "stream: <origin> path=<path>" diagnostic line for the freshly opened
@@ -994,7 +1115,14 @@ fn start_bufferfeed_for(
     route_start: crate::route::RouteStartTransaction,
 ) -> BufferfeedStartOutcome {
     match start_bufferfeed_inner(ps, pa, route_start) {
-        Ok(attempt) => BufferfeedStartOutcome::Launched(attempt),
+        Ok(attempt) => {
+            // Every start funnels through here (fresh, reload and the rollback's reload alike), so
+            // the refusal's read-out ends at the first start that is NOT refused. Clearing it only
+            // in `start_bufferfeed_tracked` left a reload landing after a refused fresh start
+            // (the foreground restore's rollback) with an Error over the video it began.
+            ps.native_start_refused = false;
+            BufferfeedStartOutcome::Launched(attempt)
+        }
         Err(result) => {
             let _ = crate::route::abort_route_start(route_start, result);
             BufferfeedStartOutcome::Failed
@@ -1141,28 +1269,44 @@ fn start_bufferfeed_inner(
     // The LG-side audio name the payload ended up carrying, hoisted so the `load:` line below can
     // report it. "-" is the video-only case, where there is no audio ES to name.
     let mut audio_declared: &str = "-";
-    // ...and the video name beside it, for the same reason and to keep the hevc->"H265" mapping
-    // written ONCE: the `load:` line below would otherwise re-read the route and re-derive it.
+    // ...and the video name beside it, for the same reason and to keep the codec->name mapping
+    // written ONCE (`LoadVideo`): the `load:` line below would otherwise re-read the route and
+    // re-derive it.
     let mut video_declared: &str = "-";
     let payload_str: &str = if stream {
-        let hevc = crate::route::stream_vcodec(ps) == "hevc";
-        video_declared = if hevc { "H265" } else { "H264" };
+        let stream_vcodec = crate::route::stream_vcodec(ps);
+        let Some(lv) = LoadVideo::of_stream(&stream_vcodec) else {
+            log(&format!(
+                "start_bufferfeed: the pipeline cannot feed video codec {stream_vcodec:?}; refusing the Load instead of declaring it H.264"
+            ));
+            SHARED.demux_failed.store(true, Ordering::Release);
+            return Err(crate::route::RouteStartResult::StartFailed);
+        };
+        if load_video_refused(lv, plx_platform::devcaps::caps()) {
+            log(&format!(
+                "start_bufferfeed: {} stream but the device table lists no such decoder; refusing the Load",
+                lv.payload_name()
+            ));
+            SHARED.demux_failed.store(true, Ordering::Release);
+            return Err(crate::route::RouteStartResult::StartFailed);
+        }
+        video_declared = lv.payload_name();
         // Record what the payload ACTUALLY says, for the diagnostics read-out — including the
         // video-only case, where `dg_load_a == 0` is the whole explanation for silence.
-        SHARED
-            .dg_load_v
-            .store(if hevc { 2 } else { 1 }, Ordering::Relaxed);
+        SHARED.dg_load_v.store(lv.diag_code(), Ordering::Relaxed);
         if no_audio {
             SHARED.dg_load_a.store(0, Ordering::Relaxed);
             // A static payload declares its own envelope; say so on the `load:` line.
-            sink_env = static_envelope(hevc);
-            if hevc {
-                PAYLOAD_H265
-            } else {
-                PAYLOAD_V
+            sink_env = static_envelope(lv);
+            match lv {
+                LoadVideo::H264 => PAYLOAD_V,
+                LoadVideo::H265 => PAYLOAD_H265,
+                LoadVideo::Av1 | LoadVideo::Vp9 => {
+                    stream_payload = renamed_static_payload(lv);
+                    stream_payload.as_str()
+                }
             }
         } else {
-            let vc = video_declared;
             // LG's pipeline names E-AC3 "AC3 PLUS" (Dolby Digital Plus), NOT "EAC3" — the
             // wrong string leaves the audio ES unconfigured, and with audioSync the video
             // sink slaves to the dead audio clock and stalls (verified: video-only plays).
@@ -1181,18 +1325,18 @@ fn start_bufferfeed_inner(
             // the declaration and refuses every H.264 Load at 4K60 (`smp_cb type=18 num=601`) —
             // i.e. every server transcode. `sink_envelope` is the rule now, and it is deliberately
             // no wider than what was measured: `docs/webos10-resource-allocation.md`.
-            // `vc` is the STREAM's declared codec; `is_h265` above belongs to the local-sample
+            // `lv` is the STREAM's declared codec; `is_h265` above belongs to the local-sample
             // path and is false here for every streamed HEVC playback (device-measured 2026-09-03:
             // three HEVC cells declared FHD before this read the right flag).
-            sink_env = sink_envelope_now(ps, vc == "H265");
-            stream_payload = build_av_payload(ps, vc, ac, sink_env);
+            sink_env = sink_envelope_now(ps, lv);
+            stream_payload = build_av_payload(ps, lv.payload_name(), ac, sink_env);
             &stream_payload
         }
     } else if is_h265 {
-        sink_env = static_envelope(true);
+        sink_env = static_envelope(LoadVideo::H265);
         PAYLOAD_H265
     } else {
-        sink_env = static_envelope(false);
+        sink_env = static_envelope(LoadVideo::H264);
         PAYLOAD_V
     };
     // The windowId splice happens HERE, at the single point every payload variant passes through,
@@ -1393,6 +1537,7 @@ fn start_bufferfeed_inner(
         presentation_rearm_pending: false,
         max_fed_video_pts: 0,
         max_fed_audio_pts: 0,
+        audio_start_fp: None,
         feed_pace: FeedPace::default(),
         seek_base_pts: 0,
         prime_play: false,
@@ -1428,12 +1573,17 @@ fn start_bufferfeed_inner(
     // built out of Load/Play alone and assumes no layout at all. Re-enable per release only once
     // somebody has re-derived the offsets on that firmware.
     //
-    // NOR on webOS 3.x, for the same reason from the other side: 3.4.0's libplayerAPIs predates
-    // the C++11 string ABI (its Feed carries the old mangling), so StarfishMediaAPIs' layout is a
-    // different object, and the first fast-forward on a 3.4.0 set crashed through these offsets.
-    // An unknown release (`major == 0`, os_info unreadable) takes the reload path too: slower
-    // seeks are the cost, a dereference through an unverified layout is the alternative.
-    let layout_known = plx_platform::tv::device::info().major >= 4;
+    // NOR when the library is the pre-C++11 build (`inplace_layout_known`): its StarfishMediaAPIs
+    // is a different object from the 4.5 one, and the first fast-forward on a 3.4.0 set crashed
+    // through these offsets. The old-ABI Feed (`sf_feed_abi_is_cow`) is the direct evidence, and
+    // it covers 3.9.x too. A KNOWN release below 4 is refused as well; an UNKNOWN one
+    // (`major == 0`, os_info unreadable) with the C++11 Feed keeps in-place seek, as before
+    // #578, because that Feed says the library is 4.x or later and the VP_EXPORTED exclusion
+    // below already handles 5+.
+    let layout_known = inplace_layout_known(
+        plx_platform::tv::device::info().major,
+        sink().feed_abi_is_cow(),
+    );
     super::INPLACE_SEEK_OK.store(
         layout_known && sink().window_mode() != super::VP_EXPORTED,
         Ordering::Relaxed,
@@ -2043,7 +2193,7 @@ const PRIME_VIDEO_MAX_NS: i64 = 2_500_000_000;
 // ~1.6s (was ~10-20s: aq 6MB + the pipeline's own ~8MB) makes seeks flush far less, keeps the
 // clock from running ahead, and cuts latency. AUDIO gets a looser bound so it can ride slightly
 // ahead (audio buffer is cheap and it's the master clock) without unbounded race on odd muxes.
-const MAX_FEED_AHEAD_NS: i64 = 1_600_000_000;
+pub(crate) const MAX_FEED_AHEAD_NS: i64 = 1_600_000_000;
 const AUDIO_SLACK_NS: i64 = 2_000_000_000;
 // A fed pts this far below a lane's high-water is a stale pre-seek AU (past the B-frame reorder
 // distance) → drop it rather than feed a backward jump.
@@ -2062,6 +2212,29 @@ const MAX_REBASE_DROPS: i32 = 240;
 // ~MAX_FEED_AHEAD+AUDIO_SLACK (3.6s), so 5s has margin. It was 15s, and a stuck-retry seek fed
 // stale audio 14.9s ahead — 13s of user-audible silence after a rapid 10s-back tap burst.
 const AUDIO_STALE_AHEAD_NS: i64 = 5_000_000_000;
+/// How far past the start of its timeline the audio lane may feed whatever the clock says.
+///
+/// **A track whose audio starts late must still reach Starfish before the clock can move.** An
+/// MKV audio `Delay` (an 11.008 s E-AC-3 track on a WEB-DL, 2026-10) puts the first audio AU
+/// seconds past the first video one. Starfish's clock waits for audio, so `pres_fed` sits at 0
+/// and the video lane stops [`MAX_FEED_AHEAD_NS`] in — and the audio AU, far past both, was
+/// dropped as stale by [`AUDIO_STALE_AHEAD_NS`] and would have been held by the throttle anyway.
+/// Nothing moved again: the picture buffered forever, while a resume past the gap played. The
+/// AU the demuxer marked as its first since the open or seek is the real start, never stale
+/// pre-seek audio (that was pushed before the mark), so it and the next 2 s are fed regardless.
+/// 2 s is under the throttle's own audio lead ([`MAX_FEED_AHEAD_NS`] + [`AUDIO_SLACK_NS`]), so a
+/// track that starts on time is fed exactly as before.
+///
+/// **The demuxer has to be able to READ that much audio**, which for a late track means with the
+/// video lane already past its base cap and nobody draining it (no clock yet): `ff::demux` keeps
+/// the video lane's pre-audio headroom until the audio lane has been pushed this much plus a
+/// margin (`ff::LEAD_IN_MARGIN_NS`), and only then releases it as the consumer drains.
+pub(crate) const AUDIO_LEAD_IN_NS: i64 = 2_000_000_000;
+// The lead-in is only sound between these two: under the throttle's own audio lead (a track that
+// starts on time is fed exactly as before), and over the audio the clock is primed with (else
+// "ahead of the clock" would not be enough audio to start it).
+const _: () = assert!(AUDIO_LEAD_IN_NS < MAX_FEED_AHEAD_NS + AUDIO_SLACK_NS);
+const _: () = assert!(AUDIO_LEAD_IN_NS > PRIME_AUDIO_NS);
 // Sentinel for SHARED.pres_fed meaning "no post-seek frame has presented yet" — the feed-ahead
 // throttle treats it as feed-freely (don't compare the new fed pts against a stale pre-seek
 // presented position). Set on a seek; the first presented frame overwrites it with a real pts.
@@ -2721,6 +2894,14 @@ fn feed_stream(mt: &MainThread, eng: &mut Engine) {
     }
 }
 
+/// Whether an audio AU at fed pts `fp` is in its timeline's lead-in: it is the AU the demuxer
+/// marked as the first since its open or seek (`opens`), or lies within [`AUDIO_LEAD_IN_NS`] past
+/// the one that was accepted (`start`). Lead-in audio is fed ahead of the clock: neither the
+/// stale-ahead drop nor the feed-ahead throttle applies to it.
+fn audio_lead_in(fp: i64, opens: bool, start: Option<i64>) -> bool {
+    opens || start.is_some_and(|s| fp >= s && fp - s < AUDIO_LEAD_IN_NS)
+}
+
 /// AUDIO lane feeder (two-lane ff path only). Independent of the video lane: its own queue, its
 /// own fed-pts high-water, its own BufferFull retry — so a video BufferFull never starves audio.
 /// HOLDS while a seek rebase is pending (the VIDEO lane sets pts_shift on its first post-seek
@@ -2754,9 +2935,15 @@ fn feed_audio_lane(mt: &MainThread, eng: &mut Engine) {
         let n = eng.pending_audio.as_ref().unwrap().0;
         let (es, _key, pts, len, data) = unsafe { crate::aq::au_fields(n) };
         let mut fp = pts + shift;
+        let first_pts = SHARED.first_audio_pts.load(Ordering::Acquire);
+        let opens = first_pts != i64::MIN && pts == first_pts;
+        let lead_in = audio_lead_in(fp, opens, eng.audio_start_fp);
         // Stale drifted audio from before a seek's reopen: far AHEAD of the freshly-anchored video.
         // Drop it (else it poisons max_fed_audio_pts and stalls the audio clock → playback sticks).
-        if eng.max_fed_video_pts > 0 && fp > eng.max_fed_video_pts + AUDIO_STALE_AHEAD_NS {
+        // A late-starting track is far ahead too, legitimately, so it is measured from its own
+        // start as well as from the video (see AUDIO_LEAD_IN_NS).
+        let stale_ref = eng.max_fed_video_pts.max(eng.audio_start_fp.unwrap_or(i64::MIN));
+        if !lead_in && eng.max_fed_video_pts > 0 && fp > stale_ref + AUDIO_STALE_AHEAD_NS {
             eng.pending_audio = None;
             continue;
         }
@@ -2767,7 +2954,11 @@ fn feed_audio_lane(mt: &MainThread, eng: &mut Engine) {
         if fp < 0 {
             fp = 0;
         }
-        if !eng.prime_play && pres != PRES_NONE && fp - pres > MAX_FEED_AHEAD_NS + AUDIO_SLACK_NS {
+        if !eng.prime_play
+            && !lead_in
+            && pres != PRES_NONE
+            && fp - pres > MAX_FEED_AHEAD_NS + AUDIO_SLACK_NS
+        {
             break;
         }
         let starved = lane_starved(eng.prime_play, eng.max_fed_audio_pts, eng.seek_base_pts, PRIME_AUDIO_NS, pres);
@@ -2778,6 +2969,15 @@ fn feed_audio_lane(mt: &MainThread, eng: &mut Engine) {
         // Accepted only — see the video lane's note.
         if (r as u8) == b'O' && fp > eng.max_fed_audio_pts {
             eng.max_fed_audio_pts = fp;
+        }
+        if (r as u8) == b'O' && opens {
+            if eng.audio_start_fp.is_none() && fp - eng.max_fed_video_pts > MAX_FEED_AHEAD_NS {
+                log(&format!(
+                    "feed: audio starts {}ms after the video fed so far; fed ahead of the clock",
+                    (fp - eng.max_fed_video_pts) / 1_000_000
+                ));
+            }
+            eng.audio_start_fp = Some(fp);
         }
         let a = AATT.fetch_add(1, Ordering::Relaxed) + 1;
         if a <= 4 || a % 200 == 0 {
@@ -2825,6 +3025,14 @@ pub fn feed_sample(mt: &MainThread, eng: &mut Engine) {
         s.next += 1;
         fed += 1;
     }
+}
+
+/// Whether the decompiled StarfishMediaAPIs offsets (see the NOR comment in `start_bufferfeed_inner`)
+/// may be trusted for in-place seek. The old-ABI `Feed` is the primary gate: it proves
+/// libplayerAPIs is the pre-C++11 build, so 3.9.x is excluded without listing releases. A known
+/// release below 4 is refused too; `major == 0` (release unknown) defers to the Feed evidence.
+fn inplace_layout_known(major: u32, feed_abi_is_cow: bool) -> bool {
+    !feed_abi_is_cow && (major == 0 || major >= 4)
 }
 
 #[cfg(test)]
@@ -2970,6 +3178,243 @@ mod native_lifecycle_host_seam_tests {
             "quarantine must remain a process-long refusal",
         );
         assert!(SHARED.retire_native_session(refused));
+    }
+
+    /// S12a: the window breadcrumbs `release_native_object` leaves, as a host can see them. The
+    /// capture sits behind the consent check, so the test grants the crash-report answer first and
+    /// puts the previous one back.
+    struct Consented(Option<plx_telemetry::telemetry::consent::Consent>);
+
+    impl Consented {
+        fn grant() -> Self {
+            use plx_telemetry::telemetry::consent::{self, Consent};
+            let previous = consent::current();
+            let mut granted = Consent::default();
+            granted.errors = true;
+            granted.asked_version = consent::POLICY_VERSION;
+            consent::install(granted);
+            // Another test's lifecycle edges may have left a cycle open on this process-wide flag.
+            plx_telemetry::telemetry::window::close_cycle_for_test();
+            plx_telemetry::telemetry::window::take_recorded_for_test();
+            Self(previous)
+        }
+
+        /// Consent granted with a background cycle open, as the teardown and create steps are
+        /// recorded only inside one (`window::record_in_cycle`). The lifecycle edge's own crumb is
+        /// drained, so a test sees only the steps it runs.
+        fn grant_in_cycle() -> Self {
+            let granted = Self::grant();
+            plx_telemetry::telemetry::window::lifecycle(0x103, true);
+            plx_telemetry::telemetry::window::take_recorded_for_test();
+            granted
+        }
+    }
+
+    impl Drop for Consented {
+        fn drop(&mut self) {
+            plx_telemetry::telemetry::consent::install(self.0.take().unwrap_or_default());
+            plx_telemetry::telemetry::window::close_cycle_for_test();
+            plx_telemetry::telemetry::window::take_recorded_for_test();
+        }
+    }
+
+    fn loaded_epoch(mt: &MainThread) -> u32 {
+        let epoch = SHARED.begin_native_session().expect("native epoch");
+        assert_eq!(unsafe { crate::player::sink().load(c"{}".as_ptr(), epoch) }, 1);
+        assert_eq!(unsafe { crate::player::sink().ready(mt) }, 1);
+        epoch
+    }
+
+    #[test]
+    fn a_proven_release_leaves_unload_destroyed_and_window_destroy_in_order() {
+        let _serial = plx_base::testlock::serial();
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        SHARED.reset_session();
+        let _fresh_process = FreshProcess;
+        let consent = Consented::grant_in_cycle();
+        let mt = unsafe { MainThread::assume() };
+        let epoch = loaded_epoch(&mt);
+        release_native_object(&mt, epoch);
+        assert_eq!(
+            plx_telemetry::telemetry::window::take_recorded_for_test(),
+            ["native_unload", "native_destroyed", "exported_window_destroy"],
+        );
+        drop(consent);
+    }
+
+    #[test]
+    fn an_unproven_release_records_quarantine_not_destroyed() {
+        let _serial = plx_base::testlock::serial();
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        SHARED.reset_session();
+        let _fresh_process = FreshProcess;
+        let consent = Consented::grant_in_cycle();
+        let mt = unsafe { MainThread::assume() };
+        let epoch = loaded_epoch(&mt);
+        // No callback ever crossed the gate: the evidence is incomplete and the object is kept.
+        crate::player::ffi_host::force_callback_intercepts_for_test(0);
+        release_native_object(&mt, epoch);
+        assert_eq!(
+            plx_telemetry::telemetry::window::take_recorded_for_test(),
+            ["native_unload", "native_quarantined", "exported_window_destroy"],
+        );
+        drop(consent);
+    }
+
+    #[test]
+    fn a_seam_rejected_destroy_is_recorded_as_quarantine() {
+        let _serial = plx_base::testlock::serial();
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        SHARED.reset_session();
+        let _fresh_process = FreshProcess;
+        let consent = Consented::grant_in_cycle();
+        let mt = unsafe { MainThread::assume() };
+        let epoch = loaded_epoch(&mt);
+        // Rust's three proofs hold, but the C seam's own evidence does not: `destroy` answers 0,
+        // and the crumb must say so rather than "destroyed".
+        crate::player::ffi_host::force_destroy_refusal_for_test(true);
+        release_native_object(&mt, epoch);
+        let recorded = plx_telemetry::telemetry::window::take_recorded_for_test();
+        assert!(recorded.contains(&"native_quarantined"), "{recorded:?}");
+        assert!(!recorded.contains(&"native_destroyed"), "{recorded:?}");
+        drop(consent);
+    }
+
+    #[test]
+    fn the_acb_plane_unload_is_a_step_only_when_acb_is_the_plane() {
+        let _serial = plx_base::testlock::serial();
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        SHARED.reset_session();
+        let _fresh_process = FreshProcess;
+        let consent = Consented::grant_in_cycle();
+        let mt = unsafe { MainThread::assume() };
+        let epoch = loaded_epoch(&mt);
+        ACB_OK.store(true, Ordering::Relaxed);
+        release_native_object(&mt, epoch);
+        ACB_OK.store(false, Ordering::Relaxed);
+        let recorded = plx_telemetry::telemetry::window::take_recorded_for_test();
+        let at = |label| recorded.iter().position(|l| *l == label);
+        assert!(
+            at("native_unload") < at("acb_plane_unload") && at("acb_plane_unload") < at("native_destroyed"),
+            "{recorded:?}",
+        );
+        drop(consent);
+    }
+
+    #[test]
+    fn without_a_dispatchable_object_or_an_exported_window_nothing_is_recorded() {
+        let _serial = plx_base::testlock::serial();
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(false);
+        SHARED.reset_session();
+        let _fresh_process = FreshProcess;
+        let consent = Consented::grant_in_cycle();
+        let mt = unsafe { MainThread::assume() };
+        let epoch = SHARED.begin_native_session().expect("native epoch");
+        release_native_object(&mt, epoch);
+        assert!(
+            plx_telemetry::telemetry::window::take_recorded_for_test().is_empty(),
+            "the seam's destroy_window is a no-op outside VP_EXPORTED, so it is not a step",
+        );
+        drop(consent);
+    }
+
+    #[test]
+    fn creating_the_exported_window_is_a_step_only_in_that_mode() {
+        let _serial = plx_base::testlock::serial();
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        SHARED.reset_session();
+        let _fresh_process = FreshProcess;
+        let consent = Consented::grant_in_cycle();
+        let mt = unsafe { MainThread::assume() };
+        crate::player::ffi_host::force_clocksink_for_test(false);
+        let _ = with_window_id(&mt, "{}");
+        assert!(plx_telemetry::telemetry::window::take_recorded_for_test().is_empty());
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        let _ = with_window_id(&mt, "{}");
+        assert_eq!(
+            plx_telemetry::telemetry::window::take_recorded_for_test(),
+            ["exported_window_create"],
+        );
+        drop(consent);
+    }
+
+    /// One engine's native life through the real create and release paths: what a trailer's start
+    /// and stop, a seek or quality reload's teardown and an abandoned Load's release all run.
+    fn engine_comes_and_goes(mt: &MainThread) {
+        let _ = with_window_id(mt, "{}");
+        let epoch = loaded_epoch(mt);
+        release_native_object(mt, epoch);
+    }
+
+    /// S12a: **the 16-slot ring belongs to the lifecycle cycle.** The webOS 5 exported-window path
+    /// costs a trailer four steps, so browsing four trailers used to push `will_foreground`,
+    /// `wm_*` and `first_frame` out of the ring before the next background cycle. Teardown and
+    /// window steps are crumbs of a lifecycle cycle only: this drives the REAL create and release
+    /// paths through the longest cycle (webOS 5, playing, foreground reload) with trailer churn
+    /// before, between and after, and checks the cycle's own steps are all the ring ever holds.
+    #[test]
+    fn trailer_starts_and_reloads_add_no_window_crumbs_and_a_whole_cycle_fits_the_ring() {
+        use plx_telemetry::telemetry::window::{self, Observation, Stage};
+        let _serial = plx_base::testlock::serial();
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        SHARED.reset_session();
+        let _fresh_process = FreshProcess;
+        let consent = Consented::grant();
+        let mt = unsafe { MainThread::assume() };
+        let step = |stage| window::record(Observation::step(stage, Some(true)));
+        let mut ring = Vec::new();
+
+        for _ in 0..6 {
+            engine_comes_and_goes(&mt);
+        }
+        assert_eq!(
+            window::take_recorded_for_test(),
+            Vec::<&str>::new(),
+            "browsing trailers and reloading engines is not a lifecycle cycle",
+        );
+
+        // Background, with playback: the engine is released inside the cycle.
+        window::lifecycle(0x103, true);
+        step(Stage::WaylandReleased);
+        window::lifecycle(0x104, true);
+        let epoch = loaded_epoch(&mt);
+        release_native_object(&mt, epoch);
+        step(Stage::BackgroundDone);
+        ring.extend(window::take_recorded_for_test());
+
+        // Foreground: the window is grabbed, then the restoring Load creates its exported window.
+        window::lifecycle(0x105, true);
+        window::lifecycle(0x106, true);
+        step(Stage::WmQuery);
+        step(Stage::WmReady);
+        let _ = with_window_id(&mt, "{}");
+        step(Stage::ForegroundDone);
+        ring.extend(window::take_recorded_for_test());
+
+        // The app is up again: trailers come and go before and after the first resumed frame.
+        engine_comes_and_goes(&mt);
+        step(Stage::FirstFrame);
+        step(Stage::FirstSwapComplete);
+        engine_comes_and_goes(&mt);
+        ring.extend(window::take_recorded_for_test());
+
+        assert_eq!(
+            ring,
+            [
+                "will_background", "wayland_released", "did_background", "native_unload",
+                "native_destroyed", "exported_window_destroy", "background_done",
+                "will_foreground", "did_foreground", "wm_query", "wm_ready",
+                "exported_window_create", "foreground_done", "first_frame", "first_swap_complete",
+            ],
+        );
+        assert!(ring.len() <= window::LIMIT, "{} steps would evict the start of the cycle", ring.len());
+        drop(consent);
     }
 }
 
@@ -3426,6 +3871,7 @@ mod prime_livelock_tests {
             presentation_rearm_pending: false,
             max_fed_video_pts: 0,
             max_fed_audio_pts: 0,
+            audio_start_fp: None,
             feed_pace: FeedPace::default(),
             seek_base_pts: 0,
             prime_play: true,
@@ -4923,6 +5369,195 @@ mod load_in_flight_tests {
         let next = SHARED.begin_native_session().expect("native sessions resume after the release");
         assert!(SHARED.retire_native_session(next));
     }
+
+    /// Releases the held host `sf_load` when a test unwinds, so a failed assertion cannot leave
+    /// the next test's Load hanging.
+    struct ReleaseLoadOnDrop;
+    impl Drop for ReleaseLoadOnDrop {
+        fn drop(&mut self) {
+            crate::player::ffi_host::release_load_for_test();
+        }
+    }
+
+    /// An Engine whose `sf_load` is held past the budget: the pump's budget arm has fired
+    /// (`load_failed` + `load_timed_out`), the Load thread is still inside `sf_load`, and the
+    /// Engine is installed in `pa`. The state the Auto Original's recovery starts from.
+    fn install_engine_with_timed_out_load(
+        ps: &mut crate::route::PlaybackSession,
+        pa: &mut crate::player::adapter::PlayerAdapter,
+    ) {
+        let epoch = SHARED.begin_native_session().expect("native session");
+        let mut eng = engine_loading(epoch);
+        crate::player::ffi_host::hold_load_for_test();
+        let payload_ptr = threads::SendPtr(eng.payload.as_ptr() as *mut c_char);
+        eng.load_th = Some(
+            std::thread::Builder::new()
+                .name("test-load-thread-hung".into())
+                .spawn(move || threads::load_thread(payload_ptr, epoch, None))
+                .expect("spawn load_thread"),
+        );
+        pa.install(eng);
+        wait_for_load_in_flight();
+        assert!(
+            SHARED.test_backdate_native_load_issued(epoch, crate::player::pump::NATIVE_LOAD_BUDGET),
+            "PRECONDITION FAILED: the epoch must still own Active to backdate it"
+        );
+        crate::player::pump::pump(ps, pa, 1_000);
+        assert!(
+            SHARED.load_timed_out.load(Ordering::Acquire),
+            "PRECONDITION FAILED: the budget must have fired, or this test is not about a timed-out Load"
+        );
+    }
+
+    /// PLX-NATIVE-15: the Auto Original's Load passes its budget, the HLS recovery reloads while
+    /// the Load is still inside `sf_load`, the reload's teardown parks that Load (clearing
+    /// `load_timed_out` with the rest of the session) and the start is refused. The failure was
+    /// published with no cause, so the report said `unspecified`; the cause is the timeout.
+    #[test]
+    fn a_recovery_reload_refused_for_an_abandoned_load_still_reports_the_timeout() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        SHARED.reset_session();
+        crate::route::reset_player_control_for_test(&ps);
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        let _cleanup = Cleanup;
+        let _release = ReleaseLoadOnDrop;
+        let mut pa = crate::player::adapter::PlayerAdapter::new(unsafe {
+            plx_base::task::MainThread::assume()
+        });
+        crate::route::set_url(&mut ps, "http://127.0.0.1:1/hls/start.m3u8");
+        install_engine_with_timed_out_load(&mut ps, &mut pa);
+
+        // `land_recovery_flight`'s own two calls: the reload (whose teardown parks the
+        // still-running Load) and the settle that publishes the outcome.
+        let started = crate::player::pump::settle_reload(
+            reload_transcode(&mut ps, &mut pa, 0),
+            "test HLS recovery",
+        );
+        assert!(!started, "the recovery start must be refused while the Load is outstanding");
+        assert!(pa.has_abandoned_load(), "PRECONDITION FAILED: the Load must still be parked");
+        assert_eq!(crate::player::state(&ps), crate::player::PlaybackState::Error);
+        assert_eq!(
+            crate::player::error_now(&ps).kind,
+            crate::player::FailureKind::LoadTimeout,
+            "the refusal must keep the timeout as its cause, not report `unspecified`"
+        );
+    }
+
+    /// The fresh-start half of the same hole: a Retry or Back+Play while the parked Load is still
+    /// inside `sf_load` is refused with no Engine to publish anything, so the player sat in Idle
+    /// and drew nothing: no read-out, no report, no Try Again. The refusal stays (a second native
+    /// object must not be started), but the viewer is told why.
+    #[test]
+    fn a_fresh_start_refused_for_an_abandoned_load_shows_an_error_with_try_again() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        SHARED.reset_session();
+        crate::route::reset_player_control_for_test(&ps);
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        let _cleanup = Cleanup;
+        let _release = ReleaseLoadOnDrop;
+        let mut pa = crate::player::adapter::PlayerAdapter::new(unsafe {
+            plx_base::task::MainThread::assume()
+        });
+        install_engine_with_timed_out_load(&mut ps, &mut pa);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_abandoned_load(), "PRECONDITION FAILED: the Load must be parked");
+
+        // `finish_landed_play`'s entry. A refused start answers false and creates no Engine.
+        assert!(!crate::player::start_bufferfeed(&mut ps, &mut pa));
+        assert!(!pa.is_live(), "the start stays refused: no second native object");
+        assert!(pa.has_abandoned_load());
+
+        assert_eq!(
+            crate::player::state(&ps),
+            crate::player::PlaybackState::Error,
+            "a refused fresh start left the player Idle: a black screen with no read-out"
+        );
+        let shape = crate::player::error_now(&ps);
+        assert_eq!(shape.kind, crate::player::FailureKind::LoadTimeout);
+        let actions = crate::player::failure_actions(
+            shape.kind,
+            crate::player::FailureContext { forced: false, can_retry: true, repair_idle: true },
+        );
+        assert!(
+            actions.contains(&crate::player::FailureAction::TryAgain),
+            "the read-out must offer Try Again: {actions:?}"
+        );
+
+        // The Load returns and is reaped: the next start is no longer refused for it, and the
+        // refusal's read-out does not outlive the refusal.
+        crate::player::ffi_host::release_load_for_test();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !reap_abandoned_load(&mut pa) {
+            assert!(std::time::Instant::now() < deadline, "the returned Load was never released");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = crate::player::start_bufferfeed(&mut ps, &mut pa);
+        assert_ne!(
+            crate::player::state(&ps),
+            crate::player::PlaybackState::Error,
+            "a start that is no longer refused must not keep the refusal's read-out"
+        );
+    }
+
+    /// The latch's other edge: a start refused for the parked Load sets `native_start_refused`,
+    /// and a RELOAD that then starts (the foreground restore's rollback landing after the Load was
+    /// reaped: `land_engineless_rollback` -> `reload_transcode_tracked`) goes through
+    /// `start_bufferfeed_for`, not `start_bufferfeed_tracked`, which is where the flag used to be
+    /// cleared. The flag outlived the refusal and, once the flight ended, `state()` answered Error
+    /// over playing video and `report::tick` sent a bogus `load_timeout`.
+    #[test]
+    fn a_reload_that_starts_after_a_refused_fresh_start_does_not_keep_the_refusals_error() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        SHARED.reset_session();
+        crate::route::reset_player_control_for_test(&ps);
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        let _cleanup = Cleanup;
+        let _release = ReleaseLoadOnDrop;
+        let mut pa = crate::player::adapter::PlayerAdapter::new(unsafe {
+            plx_base::task::MainThread::assume()
+        });
+        install_engine_with_timed_out_load(&mut ps, &mut pa);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_abandoned_load(), "PRECONDITION FAILED: the Load must be parked");
+        crate::route::set_url(&mut ps, "http://127.0.0.1:1/hls/start.m3u8");
+        crate::route::set_stream_acodec(&mut ps, "aac");
+
+        // The resumed foreground's `PlayerForegroundActuator::start_load`.
+        assert_eq!(
+            start_bufferfeed_tracked(&mut ps, &mut pa),
+            BufferfeedStartOutcome::Failed,
+            "PRECONDITION FAILED: the fresh start must be refused for the parked Load"
+        );
+        assert!(ps.native_start_refused, "PRECONDITION FAILED: the refusal must be recorded");
+
+        // The parked Load returns and is reaped; the rollback's reload then starts.
+        crate::player::ffi_host::release_load_for_test();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !reap_abandoned_load(&mut pa) {
+            assert!(std::time::Instant::now() < deadline, "the returned Load was never released");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let reload = reload_transcode_tracked(&mut ps, &mut pa, 0);
+        assert!(
+            matches!(reload, BufferfeedStartOutcome::Launched(_)),
+            "PRECONDITION FAILED: the reload must start once the Load is reaped ({reload:?})"
+        );
+        assert!(pa.is_live(), "the reload must have built an Engine");
+
+        assert_ne!(
+            crate::player::state(&ps),
+            crate::player::PlaybackState::Error,
+            "a reload that started kept the refused fresh start's Error over live video \
+             (and report::tick would send a bogus load_timeout)"
+        );
+        stop_bufferfeed(&mut ps, &mut pa);
+    }
 }
 
 /// **The webOS 10.3.1 refusal, replayed.** `docs/webos10-lab-report.md` §3.2 records the exact
@@ -4976,9 +5611,9 @@ mod sink_envelope_tests {
             ((0, 0), ENVELOPE_UHD60),  // nobody said: today's value
             ((1920, 0), ENVELOPE_UHD60),
         ] {
-            assert_eq!(sink_envelope(false, raster, 0.0, &c, true), want, "h264 {raster:?}");
+            assert_eq!(sink_envelope(LoadVideo::H264, raster, 0.0, &c, true), want, "h264 {raster:?}");
             assert_eq!(
-                sink_envelope(false, raster, 0.0, &c, false),
+                sink_envelope(LoadVideo::H264, raster, 0.0, &c, false),
                 want,
                 "h264 {raster:?} unmeasured"
             );
@@ -4989,24 +5624,24 @@ mod sink_envelope_tests {
     fn hevc_keeps_the_verified_4k60_on_a_4k_set_whatever_the_source() {
         let c = caps(DEV_SET.0, DEV_SET.1);
         for raster in [(720, 480), (1920, 1080), (3840, 2160), (0, 0)] {
-            assert_eq!(sink_envelope(true, raster, 0.0, &c, true), ENVELOPE_UHD60, "{raster:?}");
-            assert_eq!(sink_envelope(true, raster, 0.0, &c, false), ENVELOPE_UHD60, "{raster:?}");
+            assert_eq!(sink_envelope(LoadVideo::H265, raster, 0.0, &c, true), ENVELOPE_UHD60, "{raster:?}");
+            assert_eq!(sink_envelope(LoadVideo::H265, raster, 0.0, &c, false), ENVELOPE_UHD60, "{raster:?}");
         }
     }
 
     #[test]
     fn a_measured_full_hd_table_clamps_both_codecs_and_the_assumed_table_clamps_nothing() {
         let c = caps(FHD_SET.0, FHD_SET.1);
-        assert_eq!(sink_envelope(true, (3840, 2160), 0.0, &c, true), ENVELOPE_FHD60);
-        assert_eq!(sink_envelope(false, (3840, 2160), 0.0, &c, true), ENVELOPE_FHD60);
-        assert_eq!(sink_envelope(true, (0, 0), 0.0, &c, true), ENVELOPE_FHD60);
+        assert_eq!(sink_envelope(LoadVideo::H265, (3840, 2160), 0.0, &c, true), ENVELOPE_FHD60);
+        assert_eq!(sink_envelope(LoadVideo::H264, (3840, 2160), 0.0, &c, true), ENVELOPE_FHD60);
+        assert_eq!(sink_envelope(LoadVideo::H265, (0, 0), 0.0, &c, true), ENVELOPE_FHD60);
         // the same rows, not measured: never a clamp
-        assert_eq!(sink_envelope(true, (3840, 2160), 0.0, &c, false), ENVELOPE_UHD60);
-        assert_eq!(sink_envelope(true, (0, 0), 0.0, &plx_platform::devcaps::Caps::assumed(), true), ENVELOPE_UHD60);
+        assert_eq!(sink_envelope(LoadVideo::H265, (3840, 2160), 0.0, &c, false), ENVELOPE_UHD60);
+        assert_eq!(sink_envelope(LoadVideo::H265, (0, 0), 0.0, &plx_platform::devcaps::Caps::assumed(), true), ENVELOPE_UHD60);
         // a table stating a lower frame rate clamps it; a higher one never raises it
         let slow = caps((3840, 2160, 30), (3840, 2160, 120));
-        assert_eq!(sink_envelope(false, (3840, 2160), 0.0, &slow, true).fps, 30);
-        assert_eq!(sink_envelope(true, (3840, 2160), 0.0, &slow, true).fps, 60);
+        assert_eq!(sink_envelope(LoadVideo::H264, (3840, 2160), 0.0, &slow, true).fps, 30);
+        assert_eq!(sink_envelope(LoadVideo::H265, (3840, 2160), 0.0, &slow, true).fps, 60);
     }
 
     /// The device measurement behind the rate rule: 4K H.264 declared at 60 is re-announced at
@@ -5015,13 +5650,13 @@ mod sink_envelope_tests {
     fn h264_declares_the_streams_rate_class_and_hevc_keeps_60() {
         let c = caps(DEV_SET.0, DEV_SET.1);
         for (fps, want) in [(24.0, 24), (23.976, 24), (25.0, 25), (29.97, 30), (30.0, 30), (50.0, 50), (59.94, 60), (60.0, 60), (120.0, 60), (0.0, 60)] {
-            assert_eq!(sink_envelope(false, (3840, 2160), fps, &c, true).fps, want, "h264 {fps}");
-            assert_eq!(sink_envelope(false, (1920, 1080), fps, &c, true).fps, want, "h264 fhd {fps}");
-            assert_eq!(sink_envelope(true, (3840, 2160), fps, &c, true).fps, 60, "hevc {fps}");
+            assert_eq!(sink_envelope(LoadVideo::H264, (3840, 2160), fps, &c, true).fps, want, "h264 {fps}");
+            assert_eq!(sink_envelope(LoadVideo::H264, (1920, 1080), fps, &c, true).fps, want, "h264 fhd {fps}");
+            assert_eq!(sink_envelope(LoadVideo::H265, (3840, 2160), fps, &c, true).fps, 60, "hevc {fps}");
         }
         // the table still clamps a class from above
         let slow = caps((3840, 2160, 25), (3840, 2160, 60));
-        assert_eq!(sink_envelope(false, (3840, 2160), 30.0, &slow, true).fps, 25);
+        assert_eq!(sink_envelope(LoadVideo::H264, (3840, 2160), 30.0, &slow, true).fps, 25);
     }
 
     #[test]
@@ -5039,11 +5674,11 @@ mod sink_envelope_tests {
     /// The static payloads' declared envelopes, read out of the strings that are actually sent.
     #[test]
     fn the_static_envelopes_are_the_static_payloads_own_numbers() {
-        for (hevc, payload) in [(false, PAYLOAD_V), (true, PAYLOAD_H265)] {
-            let e = static_envelope(hevc);
-            assert!(payload.contains(&format!(r#""maxWidth":{}"#, e.w)), "{hevc}");
-            assert!(payload.contains(&format!(r#""maxHeight":{}"#, e.h)), "{hevc}");
-            assert!(payload.contains(&format!(r#""maxFrameRate":{}"#, e.fps)), "{hevc}");
+        for (video, payload) in [(LoadVideo::H264, PAYLOAD_V), (LoadVideo::H265, PAYLOAD_H265)] {
+            let e = static_envelope(video);
+            assert!(payload.contains(&format!(r#""maxWidth":{}"#, e.w)), "{video:?}");
+            assert!(payload.contains(&format!(r#""maxHeight":{}"#, e.h)), "{video:?}");
+            assert!(payload.contains(&format!(r#""maxFrameRate":{}"#, e.fps)), "{video:?}");
         }
     }
 
@@ -5056,6 +5691,109 @@ mod sink_envelope_tests {
         assert_eq!(parse_sinkmax("1920x1080"), None);
         assert_eq!(parse_sinkmax("0x1080@60"), None);
         assert_eq!(parse_sinkmax("abc"), None);
+    }
+
+    #[test]
+    fn load_video_maps_exactly_today_plus_av1_and_vp9() {
+        for (vcodec, want) in [
+            ("hevc", LoadVideo::H265),
+            ("h264", LoadVideo::H264),
+            ("av1", LoadVideo::Av1),
+            ("vp9", LoadVideo::Vp9),
+            ("", LoadVideo::H264),
+            ("HEVC", LoadVideo::H265),
+            ("H264", LoadVideo::H264),
+            ("h265", LoadVideo::H265),
+        ] {
+            assert_eq!(LoadVideo::of_stream(vcodec), Some(want), "{vcodec:?}");
+        }
+        // an unknown codec is refused, never declared as H.264
+        for vcodec in ["mpeg2video", "vc1", "vp8", "theora", "mpeg4", "avc", "x"] {
+            assert_eq!(LoadVideo::of_stream(vcodec), None, "{vcodec:?}");
+        }
+        let all = [LoadVideo::H264, LoadVideo::H265, LoadVideo::Av1, LoadVideo::Vp9];
+        assert_eq!(all.map(LoadVideo::payload_name), ["H264", "H265", "AV1", "VP9"]);
+        assert_eq!(all.map(LoadVideo::diag_code), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn vp9_envelope_follows_hevc_and_its_own_row() {
+        let mut c = caps(DEV_SET.0, DEV_SET.1);
+        c.vp9 = true;
+        c.vp9_row = (3840, 2160, 30);
+        assert_eq!(sink_envelope(LoadVideo::Vp9, (1920, 1080), 23.976, &c, false), ENVELOPE_UHD60);
+        assert_eq!(
+            sink_envelope(LoadVideo::Vp9, (1920, 1080), 23.976, &c, true),
+            SinkEnvelope { w: 3840, h: 2160, fps: 30 }
+        );
+        c.vp9_row = (0, 0, 0);
+        assert_eq!(sink_envelope(LoadVideo::Vp9, (1920, 1080), 23.976, &c, true), ENVELOPE_UHD60);
+    }
+
+    #[test]
+    fn av1_envelope_follows_hevc_and_its_own_row() {
+        let mut c = caps(DEV_SET.0, DEV_SET.1);
+        c.av1 = true;
+        c.av1_row = (3840, 2160, 30);
+        assert_eq!(sink_envelope(LoadVideo::Av1, (1920, 1080), 23.976, &c, false), ENVELOPE_UHD60);
+        assert_eq!(
+            sink_envelope(LoadVideo::Av1, (1920, 1080), 23.976, &c, true),
+            SinkEnvelope { w: 3840, h: 2160, fps: 30 }
+        );
+        c.av1_row = (0, 0, 0);
+        assert_eq!(sink_envelope(LoadVideo::Av1, (1920, 1080), 23.976, &c, true), ENVELOPE_UHD60);
+    }
+
+    #[test]
+    fn static_envelope_av1_and_vp9_are_uhd60() {
+        assert_eq!(static_envelope(LoadVideo::Av1), ENVELOPE_UHD60);
+        assert_eq!(static_envelope(LoadVideo::Vp9), ENVELOPE_UHD60);
+        assert_eq!(static_envelope(LoadVideo::H265), ENVELOPE_UHD60);
+        assert_eq!(static_envelope(LoadVideo::H264), SinkEnvelope { w: 1920, h: 1080, fps: 30 });
+    }
+
+    #[test]
+    fn the_renamed_static_payloads_declare_their_codec() {
+        assert_eq!(PAYLOAD_H265.matches(r#""video":"H265""#).count(), 1);
+        for (video, name) in [(LoadVideo::Av1, "AV1"), (LoadVideo::Vp9, "VP9")] {
+            let p = renamed_static_payload(video);
+            assert!(p.contains(&format!(r#""video":"{name}""#)), "{p}");
+            assert!(!p.contains("H265"), "{p}");
+            assert!(p.contains(r#""maxWidth":3840"#) && p.contains(r#""maxHeight":2160"#), "{p}");
+        }
+    }
+
+    #[test]
+    fn load_video_refused_only_for_av1_and_vp9_without_their_rows() {
+        let assumed = plx_platform::devcaps::Caps::assumed();
+        assert!(load_video_refused(LoadVideo::Av1, &assumed));
+        assert!(load_video_refused(LoadVideo::Vp9, &assumed));
+        assert!(!load_video_refused(LoadVideo::H264, &assumed));
+        assert!(!load_video_refused(LoadVideo::H265, &assumed));
+        let with_row = plx_platform::devcaps::Caps {
+            av1: true,
+            vp9: true,
+            ..plx_platform::devcaps::Caps::assumed()
+        };
+        for video in [LoadVideo::H264, LoadVideo::H265, LoadVideo::Av1, LoadVideo::Vp9] {
+            assert!(!load_video_refused(video, &with_row), "{video:?}");
+        }
+        // one row never admits the other codec
+        let av1_only = plx_platform::devcaps::Caps { av1: true, ..plx_platform::devcaps::Caps::assumed() };
+        assert!(load_video_refused(LoadVideo::Vp9, &av1_only));
+    }
+
+    #[test]
+    fn load_v_name_is_the_name_the_payload_declares() {
+        use crate::player::load_v_name;
+        assert_eq!(load_v_name(1), "H264");
+        assert_eq!(load_v_name(2), "H265");
+        assert_eq!(load_v_name(3), "AV1");
+        assert_eq!(load_v_name(4), "VP9");
+        assert_eq!(load_v_name(0), "—");
+        for video in [LoadVideo::H264, LoadVideo::H265, LoadVideo::Av1, LoadVideo::Vp9] {
+            assert_eq!(load_v_name(video.diag_code()), video.payload_name());
+        }
     }
 }
 
@@ -5122,5 +5860,133 @@ mod load_refusal_tests {
             super::super::FailureKind::TvPipeline,
             "and the verdict must name the television's pipeline, not a generic stop"
         );
+    }
+}
+
+#[cfg(test)]
+mod inplace_layout_tests {
+    use super::inplace_layout_known;
+
+    #[test]
+    fn in_place_seek_needs_the_cxx11_feed_and_a_release_that_is_unknown_or_4_plus() {
+        assert!(inplace_layout_known(4, false));
+        assert!(inplace_layout_known(0, false));
+        assert!(inplace_layout_known(11, false));
+        assert!(!inplace_layout_known(3, false));
+        assert!(!inplace_layout_known(3, true));
+        assert!(!inplace_layout_known(4, true));
+        assert!(!inplace_layout_known(0, true));
+    }
+}
+
+#[cfg(test)]
+mod audio_lead_in_tests {
+    use super::{audio_lead_in, AUDIO_LEAD_IN_NS};
+
+    #[test]
+    fn the_opening_au_and_the_window_after_it_are_lead_in_and_nothing_else_is() {
+        let start = 11_008_000_000;
+        assert!(audio_lead_in(start, true, None), "the marked first AU opens the timeline");
+        assert!(!audio_lead_in(start, false, None), "an unmarked AU with no start is not");
+        assert!(audio_lead_in(start + AUDIO_LEAD_IN_NS - 1, false, Some(start)));
+        assert!(!audio_lead_in(start + AUDIO_LEAD_IN_NS, false, Some(start)), "the window ends");
+        assert!(!audio_lead_in(start - 1, false, Some(start)), "nothing before the start");
+    }
+}
+
+/// **A film whose audio starts 11 s after its video must still start.** The device log of the
+/// failing WEB-DL (E-AC-3 with an MKV `Delay` of 11.008 s): `SMP Play`, `feed v#1..v#4`, the
+/// demuxer's `first audio at 11008ms`, then no `feed a#` line at all and `timeline playing t=0s`
+/// for good. Starfish's clock waits for audio, so `pres_fed` stays 0 and the video lane stops
+/// [`MAX_FEED_AHEAD_NS`] in; the audio lane dropped every AU as stale because each was more than
+/// [`AUDIO_STALE_AHEAD_NS`] past that video. These tests drive the real lanes through
+/// [`feed_both_lanes`] against the host feed seam, in the state a progressive start leaves:
+/// Play already issued, nothing presented (`pres_fed` 0, not [`PRES_NONE`]).
+#[cfg(all(test, feature = "hostsim"))]
+mod late_audio_start_tests {
+    use super::*;
+
+    const V_STEP_NS: i64 = 41_708_333; // 23.976 fps
+    const A_STEP_NS: i64 = 32_000_000; // E-AC-3: 1536 samples at 48 kHz
+    const AUDIO_DELAY_NS: i64 = 11_008_000_000;
+
+    /// Process-wide state these tests set, restored on the way out, panic or not.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::player::ffi_host::force_clocksink_for_test(false);
+            SHARED.first_audio_pts.store(i64::MIN, Ordering::Relaxed);
+            SHARED.pres_fed.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// An engine past `SMP Play` at offset 0 holding the film's first 12 s: video from 0, audio
+    /// from [`AUDIO_DELAY_NS`]. `first_audio` is what the demuxer published as its first audio.
+    fn started_with_late_audio(first_audio: i64) -> Engine {
+        let mut eng = super::prime_livelock_tests::engine_after_reload();
+        eng.prime_play = false;
+        let au = [0u8; 64];
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut crate::aq::AuQueue;
+        for i in 0..(12_000_000_000 / V_STEP_NS) {
+            crate::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, i * V_STEP_NS, c_int::from(i == 0), 1);
+        }
+        let qa = &mut **eng.aq_audio.as_mut().unwrap() as *mut crate::aq::AuQueue;
+        for i in 0..200 {
+            crate::aq::aq_push(qa, au.as_ptr(), au.len() as c_int, AUDIO_DELAY_NS + i * A_STEP_NS, 1, 2);
+        }
+        SHARED.first_audio_pts.store(first_audio, Ordering::Relaxed);
+        eng
+    }
+
+    fn run_ticks(eng: &mut Engine) {
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        for _ in 0..8 {
+            feed_both_lanes(&mt, eng);
+        }
+    }
+
+    fn arm() -> Restore {
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        SHARED.pres_fed.store(0, Ordering::Relaxed);
+        SHARED.seek_to_ns.store(-1, Ordering::Relaxed);
+        Restore
+    }
+
+    #[test]
+    fn a_track_whose_audio_starts_late_reaches_the_sink() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        let mut eng = started_with_late_audio(AUDIO_DELAY_NS);
+        run_ticks(&mut eng);
+
+        // Precondition: the video lane fed and then stopped at the throttle, as on the device.
+        assert!(
+            eng.max_fed_video_pts > 0 && eng.max_fed_video_pts < AUDIO_DELAY_NS - AUDIO_STALE_AHEAD_NS,
+            "PRECONDITION FAILED, not the defect: video fed to {}ns — the host sink is not armed \
+             or the throttle did not hold the video lane short of the audio",
+            eng.max_fed_video_pts
+        );
+        assert_eq!(eng.audio_start_fp, Some(AUDIO_DELAY_NS), "the first audio AU was fed");
+        assert!(
+            eng.max_fed_audio_pts >= AUDIO_DELAY_NS + AUDIO_LEAD_IN_NS - A_STEP_NS,
+            "the lead-in was fed ahead of the clock (audio to {}ns)",
+            eng.max_fed_audio_pts
+        );
+        // Past the lead-in the throttle holds the audio — held, not dropped as stale.
+        let next = eng.pending_audio.as_ref().map(|n| unsafe { crate::aq::au_fields(n.0) }.2);
+        assert_eq!(next, Some(eng.max_fed_audio_pts + A_STEP_NS), "the next AU waits for the clock");
+    }
+
+    #[test]
+    fn audio_far_ahead_that_does_not_open_the_timeline_is_still_dropped_as_stale() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        // The demuxer has not marked these AUs: stale pre-seek audio looks exactly like this.
+        let mut eng = started_with_late_audio(i64::MIN);
+        run_ticks(&mut eng);
+
+        assert!(eng.max_fed_video_pts > 0, "PRECONDITION FAILED: the host sink fed no video");
+        assert_eq!(eng.max_fed_audio_pts, 0, "stale audio must not reach the sink");
+        assert_eq!(eng.audio_start_fp, None);
     }
 }

@@ -281,6 +281,8 @@ pub(super) struct HubSrc<'a> {
     /// `None` while the page still names a shelf the store has not published (a frame between a
     /// store change and the next `sync`): its cards draw nothing.
     pub(super) shelf: Option<&'a plx_data::browse::section_hubs::Shelf>,
+    /// Focus is near the row's trailing edge on a visible row: only then does the row ask for more.
+    pub(super) paging: bool,
 }
 
 impl HubSrc<'_> {
@@ -307,10 +309,20 @@ fn more_facts(total: usize) -> plx_ui::tile::TileFacts<'static> {
 
 impl<H: Host<Elem = u32>> CardSource<H> for HubSrc<'_> {
     fn len(&self) -> usize { self.elems.len() }
+    /// The card's place in the hub's listing (`positions` can skip what the window drops).
+    fn global(&self, i: usize) -> usize {
+        self.shelf.map_or(i, |shelf| shelf.positions.get(i).copied().unwrap_or(shelf.offset + i))
+    }
     fn elem(&self, i: usize) -> u32 { self.elems.get(i).copied().unwrap_or(0) }
     fn index_of(&self, e: &u32) -> Option<usize> { self.elems.iter().position(|elem| elem == e) }
     /// A card whose item the hub has not published draws nothing (its stop still registers).
     fn loaded(&self, i: usize) -> bool { self.is_more(i) || self.item(i).is_some() }
+    // A collection shelf ends in its MORE card, which stands for the rest of the collection: the
+    // row asks for no further page and paints no skeletons past it.
+    fn more(&self) -> bool { self.paging && self.shelf.is_some_and(|shelf| shelf.more && shelf.link.is_none()) }
+    fn page_epoch(&self) -> u32 { self.shelf.map_or(0, |shelf| shelf.epoch) }
+    fn more_after(&self) -> bool { self.shelf.is_some_and(|shelf| shelf.more && shelf.link.is_none()) }
+    fn more_before(&self) -> bool { self.shelf.is_some_and(|shelf| shelf.offset > 0) }
     fn art(&self, i: usize) -> Art<'_> {
         if self.is_more(i) {
             return Art::Poster(Some(more_facts(self.shelf.map_or(0, |shelf| shelf.total))));

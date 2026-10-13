@@ -64,8 +64,9 @@ pub(crate) fn desktop_window_size() -> (c_int, c_int) {
 /// generated. `crashtrace.c` says so itself. Two deliberate SIGSEGVs produced the signal status and
 /// an empty `/var/log/reports/librdx/`.
 ///
-/// The line this hook writes is also the crash channel's PANIC input: `telemetry::crashreport`
-/// reads the log on the next launch, hashes the message and sends the location only.
+/// The record this hook writes (the panic line and its `time:` line) is also the crash channel's
+/// PANIC input: `telemetry::crashreport` reads the log on the next launch, hashes the message and
+/// sends the location and the bounded crash time, never the message.
 pub(crate) fn install_panic_logger() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -86,6 +87,7 @@ pub(crate) fn install_panic_logger() {
         let _ = record_panic_in_crash_log(
             &plx_base::paths::in_runtime_dir(plx_base::paths::runtime_file::CRASH),
             &line,
+            plx_telemetry::telemetry::crashreport::now_secs(),
         );
         default(info); // preserve default behaviour (stderr -> plxnative-stderr.log)
     }));
@@ -102,8 +104,19 @@ pub(crate) fn install_panic_logger() {
 /// link, 0640, never truncated) rather than a bare `OpenOptions` at the umask's mode, so a name
 /// planted in the shared `/tmp` is refused instead of written through. `Err` is for the hook to
 /// ignore: a panic hook has nowhere to report a failure to.
-fn record_panic_in_crash_log(path: &std::path::Path, line: &str) -> std::io::Result<()> {
-    plx_base::eventlog::append_record(path, &plx_base::eventlog::scrub::scrub_local(line))
+///
+/// **The record is two lines in ONE write:** the panic line and the `time: <unix seconds>` line the
+/// C tracer also writes under a signal record ([`plx_telemetry::telemetry::crashreport::crash_time_record`]
+/// is the one spelling). The crash importer sends it as the event's `timestamp`, so the report says
+/// when the panic happened rather than when the next launch found it. `0` (a clock that reads
+/// nothing) writes no time line.
+fn record_panic_in_crash_log(path: &std::path::Path, line: &str, unix_secs: u64) -> std::io::Result<()> {
+    let mut record = plx_base::eventlog::scrub::scrub_local(line);
+    if unix_secs > 0 {
+        record.push('\n');
+        record.push_str(&plx_telemetry::telemetry::crashreport::crash_time_record(unix_secs));
+    }
+    plx_base::eventlog::append_record(path, &record)
 }
 
 #[cfg(test)]
@@ -127,15 +140,22 @@ mod panic_log_tests {
     fn the_panic_text_is_scrubbed_like_every_event_log_line() {
         let dir = scratch("scrub");
         let path = dir.join("crash.log");
-        record_panic_in_crash_log(&path, LINE).unwrap();
+        record_panic_in_crash_log(&path, LINE, 1_750_000_000).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("SECRETTOKEN"), "{written}");
         assert!(!written.contains("192-168-1-50") && !written.contains("plex.direct"), "{written}");
         assert!(written.starts_with("*** RUST PANIC [demux] at src/ff.rs:1204: "), "the record's shape survives: {written}");
-        assert!(written.ends_with('\n') && written.matches('\n').count() == 1, "one newline-terminated record");
-        // And the crash report parser still reads the scrubbed record.
+        assert!(
+            written.ends_with("\ntime: 1750000000\n") && written.matches('\n').count() == 2,
+            "the panic line, then its time line, newline-terminated: {written}"
+        );
+        // And the crash report parser still reads the scrubbed record, with the time it was given.
         let reports = plx_telemetry::telemetry::crashreport::parse(&written);
         assert_eq!(reports.len(), 1, "{written}");
+        assert!(
+            matches!(&reports[0], plx_telemetry::telemetry::crashreport::Report::Panic(p) if p.crash_time == Some(1_750_000_000)),
+            "{reports:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -147,14 +167,14 @@ mod panic_log_tests {
         let path = dir.join("crash.log");
         std::fs::write(&path, b"*** SIGNAL 11 earlier\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        record_panic_in_crash_log(&path, "*** RUST PANIC [t] at src/a.rs:1: boom").unwrap();
+        record_panic_in_crash_log(&path, "*** RUST PANIC [t] at src/a.rs:1: boom", 1_750_000_000).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "*** SIGNAL 11 earlier\n*** RUST PANIC [t] at src/a.rs:1: boom\n"
+            "*** SIGNAL 11 earlier\n*** RUST PANIC [t] at src/a.rs:1: boom\ntime: 1750000000\n"
         );
         let fresh = dir.join("fresh.log");
-        record_panic_in_crash_log(&fresh, "*** RUST PANIC [t] at src/a.rs:1: boom").unwrap();
+        record_panic_in_crash_log(&fresh, "*** RUST PANIC [t] at src/a.rs:1: boom", 1_750_000_000).unwrap();
         assert_eq!(std::fs::metadata(&fresh).unwrap().mode() & 0o7777, 0o640);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -170,11 +190,11 @@ mod panic_log_tests {
 
         let linked = dir.join("symlinked.log");
         symlink(&victim, &linked).unwrap();
-        assert!(record_panic_in_crash_log(&linked, LINE).is_err());
+        assert!(record_panic_in_crash_log(&linked, LINE, 1_750_000_000).is_err());
 
         let hard = dir.join("hardlinked.log");
         std::fs::hard_link(&victim, &hard).unwrap();
-        assert!(record_panic_in_crash_log(&hard, LINE).is_err());
+        assert!(record_panic_in_crash_log(&hard, LINE, 1_750_000_000).is_err());
 
         let meta = std::fs::metadata(&victim).unwrap();
         assert_eq!(meta.mode() & 0o7777, 0o600, "never widened");
@@ -367,7 +387,7 @@ mod seam_order_tests {
 /// One door rather than a branch at each of the five call sites, so the platform question is
 /// asked once and the call sites read the same on both.
 ///
-/// Resolved at runtime rather than linked: webOS 3.4.0 ships SDL 2.0.1, which has none of LG's
+/// Resolved at runtime rather than linked: webOS 3.4 ships SDL 2.0.3, which has none of LG's
 /// `SDL_webOS*` extensions, and a strong reference there is a lazily-bound PLT slot that kills
 /// the process on the first D-pad press (`tools/fwcompat.py --release 3.4.0`).
 #[inline]
@@ -677,6 +697,11 @@ pub(crate) unsafe fn boot(
     // The Up Next still prefetch `route::pump_play` asks for is `ui`'s, which `route` may not name,
     // so it is handed over here, before any playback can land. Replay boots take it too.
     plx_media::route::install_up_next_still_warm(super::playback::warm_up_next_still);
+    // The dev frame probe's clock is `platform`'s, which `gfx` does not depend on.
+    plx_gfx::gfx::install_clear_probe(
+        plx_platform::tv::window::frame_probe_waiting,
+        plx_platform::tv::window::frame_probe_acquired,
+    );
     let initial = match &preflight {
         super::bootstrap::Preflight::Live => None,
         super::bootstrap::Preflight::Record => {
@@ -702,6 +727,21 @@ pub(super) fn apply_deferred_capture(rec: &mut super::recorder::Recplay,
         return Err(reason);
     }
     Ok(())
+}
+
+/// **Boot's restore**: the nine live player cells from the record, through the one
+/// `route::restore_all` the credentials handoff (`bridge::follow_auth_landing`) calls too. Split
+/// out of [`construct`] so the cells it sets can be graded without an SDL window (`run.rs`'
+/// `lifecycle_regression_tests`).
+///
+/// Restored before any route can resolve a stream. A legacy file with no quality resolves to
+/// Original; a new file can choose Auto only through route's explicit readiness gate
+/// (session::load records that decision once). The dev quality override is honoured unless the
+/// harness is `controlled`.
+pub(super) fn restore_player_preferences(session: &plx_plex::plex::session::Session, controlled: bool) {
+    plx_media::route::restore_all(session, plx_media::route::Overrides {
+        quality: if controlled { None } else { crate::dev::playback_quality_override() },
+    });
 }
 
 pub(crate) unsafe fn construct(
@@ -1064,22 +1104,7 @@ pub(crate) unsafe fn construct(
     let mut pages = plx_ui::dispatch::Dispatcher::with_transition(Box::new(
         plx_ui::containers::transition::PageDip::new(),
     ));
-    // Install-wide playback preference, restored before any route can resolve a stream.
-    // A legacy file with no value resolves to Original; a new file can choose Auto only
-    // through route's explicit readiness gate (session::load records that decision once).
-    plx_media::route::restore_quality(
-        if controlled { session.playback_quality() }
-        else { crate::dev::playback_quality_override().unwrap_or_else(|| session.playback_quality()) },
-    );
-    plx_media::route::restore_direct_play_mode(session.direct_play_mode());
-    plx_media::route::restore_subtitle_size(session.subtitle_size());
-    plx_media::route::restore_subtitle_position(session.subtitle_position());
-    plx_media::route::restore_next_episode_mode(session.next_episode_mode());
-    plx_media::route::restore_skip_interval(session.skip_interval());
-    plx_media::route::restore_deck_press(session.deck_press());
-    // The subtitle tone rides the same file and the same moment: a preference, restored once.
-    plx_media::player::restore_subtitle_tone(session.subtitle_tone());
-    plx_media::player::restore_audio_enhancements(session.audio_enhancements());
+    restore_player_preferences(&session, controlled);
     // dev: /tmp/plxnative-audioenh=off|boost|loudness — force the PERSISTED enhancement
     // preference right after it was restored from whatever the install actually has saved, so a
     // harness case's starting preference never depends on what an earlier run's pick left behind.
@@ -1638,6 +1663,7 @@ pub(crate) unsafe fn construct(
         menu_play_await: None,
         prev,
         refresh_hubs_at,
+        refresh_detail: None,
         plaintext_upgrade: Default::default(),
         ev,
         remote,

@@ -70,10 +70,11 @@ harness refuses to grade it.
 
 ### What the synthetic cases actually cover
 
-The player can feed `{h264, hevc}` × `{aac, ac3, eac3, dts}` in `mkv`/`mp4`/`m4v`.
+The player can feed `{h264, hevc}` (plus `av1` / `vp9` on a set whose codec table lists that decoder) × `{aac, ac3, eac3, dts}` in `mkv`/`mp4`/`m4v`.
 Automatic direct play intersects those formats with the TV's codec table and channel limits;
 DTS requires an explicit capability row with a channel ceiling. The implemented Load strings
-are `H264`/`H265` and `AAC`/`AC3`/`AC3 PLUS`/`DTS`. DTS-HD packets feed only their core;
+are `H264`/`H265` (and `AV1` / `VP9` only on a set whose codec table lists that decoder) and
+`AAC`/`AC3`/`AC3 PLUS`/`DTS`. DTS-HD packets feed only their core;
 TrueHD and other unsupported feed formats still require server conversion. This is the
 implemented format set, not the complete vocabulary accepted by LG's firmware.
 
@@ -94,7 +95,9 @@ Still uncovered, and worth knowing before quoting a green run: **HLG, HDR10+, DV
 (the `atmos` declaration field exists and no case sets it), the **4096-wide edge** and any file
 that must be *refused* for exceeding it, a **user-driven** replay (as opposed to the trigger-driven
 one below — a Play control on a detail page is server-tier by construction), and the whole
-**transcode input space** — three server cases on one AV1 item stand in for 17 video codecs. One of
+**transcode input space** — three server cases on one AV1 item stand in for 17 video codecs (the AV1
+item transcodes because the dev set's codec table lists no AV1 decoder; see `transcode_av1_no_dp_audio`
+below for what a set that lists one would do with it). One of
 those is an app gap rather than a test gap: `devcaps` now reads `maxFrameRate` into per-codec rows,
 but only the Starfish Load's `adaptiveStreaming` ceiling clamps against it (`engine::sink_envelope`,
 since 2026-09-03) — the profile sent to PMS still carries no frame-rate limitation at all.
@@ -495,6 +498,37 @@ The landed count is the data layer's, so a library walk with `min_landed` also r
 that capped its rows again (store 170, page 12) would still walk into the grid and pass.
 The linked-shelf count is derived from the mock's own arguments, not read from the app.
 
+`library-burst` is an **instrument, not a gate**: how many loading (placeholder) poster tiles a
+viewer sees scrolling the Library grid in short bursts with rests between them (`library-scroll`
+never rests, so it cannot show a strategy that warms upcoming rows while the grid is at rest).
+`--mock` serves a 1000-movie library; the walk (`walk.burst`, the same `KeyWalk`) presses Down once
+per landed shelf plus `extra_rows` into the grid, rests, then `bursts` (8) bursts of `burst` (4)
+Downs `key_ms` (125) apart, each followed by `rest_ms` (1500), then the same bursts of Up. The
+count is the `phcount: frames=F ph_frames=P draws=D ph=N` line the app writes once a second while
+`plxnative-phcount` is armed (scene-armed; `ui::card_motion_metrics`, counted at the card primitive:
+`ph` is card draws that showed a skeleton, `ph_frames` the presented card frames that showed at
+least one, `frames`/`draws` the totals). Printed, not graded: `ph` in total, in the prelude, in the
+bursts and per burst (a sample belongs to the burst of the last key before it), the share of card
+frames that showed one, median `fps=`, the usual frame drops and the `pupf=`/`pupf_ge22=`/`pup=`
+tally; `n/a` when no `phcount:` line is in the window (never a zero). Graded: the synthetic identity,
+keys sent == the plan, and a `focus route=library … region=grid` fingerprint in the window. Dev
+triggers pass through like any scene's. The app ships with 3 rows of at-rest poster lookahead and
+no moving-card decline, so a plain run measures the shipping behaviour; the two triggers rebuild
+the baselines it was measured against (`plxnative-lookahead=0` is no lookahead, `=1`..`=4` another
+depth; `plxnative-cardspeed=120` is the old decline of poster work for a card moving over 120 px/s):
+
+```bash
+tools/tv-lock.sh with --why "fps burst" -- ./tests/run.py --fps --mock --filter library-burst
+tools/tv-lock.sh with --why "fps burst" -- ./tests/run.py --fps --mock --filter library-burst \
+    --extra-trigger plxnative-cardspeed=120 --extra-trigger plxnative-lookahead=0
+```
+
+`library-hold` is `library-burst`'s sibling for a long held scroll: the same mock, triggers, printing
+and grading (it is `--mock`-only too), but 3 bursts of 16 Downs `key_ms` (125) apart, each followed by
+2 s of rest, then 3 bursts of 16 Ups (13 + 96 keys on a 7-shelf landing, about 25 s from first press
+to last; 48 of the 166 grid rows). It shows how many placeholder tiles a held Down key outruns the
+posters by, and what each rest recovers. Run it the same way, `--filter library-hold`.
+
 `home-hint` is the instrument for Home's "Hold OK for options" glass hint (`ui::hold_hint`): Home
 rests on a shelf tile for 14 s so the window contains the hint's 1.5 s dwell, fade-in, standing and
 fade-out. It sends no key. `frame_gt33`, `frame_max` and p99 are printed from the heartbeats (read
@@ -603,6 +637,90 @@ marks pacing invalid if a render-profiler trigger is armed.
   `manifest.json → fps_scenes` and point their `item` keys at your own library from
   `manifest.local.json`; the harness stays library-agnostic.
 
+### Paging under a conditioned link (`tests/paging_link.py`, host; `home-recent-paging-held-*`, TV)
+
+Every list pages through a sliding 24-card window, and the bugs live where a page landing and a
+key repeat coincide, which a loopback mock (a page lands before the next key) never produces. Two
+pieces make that reproducible:
+
+- **`tests/link_conditioner.py`**, wired into `tests/mock_pms.py`: a macOS-Network-Link-Conditioner
+  style link. A profile is latency, jitter, downlink kbit/s (the response BODY is written at that
+  rate, so a 24-item listing and a poster JPEG take realistically different times) and an error
+  rate (`reset` = connection reset, or `503`). Classes are `listing` and `image`
+  (`/photo/:/transcode`, `.../thumb`); the control surface and media bytes are never touched.
+  `--link 3g` (profiles `dsl 3g edge lossy very-bad remote-wan none`), `--link image=edge:error=0.1`,
+  or `--link-latency-ms/--link-jitter-ms/--link-kbit/--link-error-rate/--link-error-kind`.
+  A targeted fault is the deterministic counterpart of the error rate: `--link-fault 'REGEX[@attempts=N,kind=503,min_start=1]'`
+  fails the first N reads of each page (same path and `X-Plex-Container-Start`, the head page spared) of every
+  endpoint whose path matches, and `POST /_mock/link {"faults": [{"path": REGEX, "kind": "503"}]}` re-arms it
+  live (an empty list disarms it). Jitter and failures are hashes of (`--seed`, class, request, nth time seen), so one seed fails
+  the same requests whatever the thread order. At run time: `POST /_mock/link`
+  `{"spec": "listing=3g"}` or `{"class": "image", "profile": "none"}` (loopback only), so one run
+  goes fast, slow, fast; `GET /_mock/wire` is the per-request arrival/finish log.
+  `--shows/--seasons/--episodes` size the TV library (a season over 60 episodes pages; rows page
+  over `--movies`, up to 1000). `python3 tests/test_link_conditioner.py` (in `make check`) and
+  `python3 tests/mock_pms.py --selftest` prove the rate, determinism, per-class overrides, run-time
+  change and the `X-Plex-Container-Start/Size` contract (query and header form, `totalSize`, `size`,
+  `offset`) on every endpoint `ci/plex-requests.ini` classes `paged`.
+- **`tests/paging_link.py`** drives the real macOS simulator with real keys against that mock:
+  `python3 tests/paging_link.py [--build] [--surface library-grid] [--profile remote-wan] [--dump F] [--json F]`
+  (1 to 3 minutes a run; a window opens; not in `make check`; `--list` names the surfaces). Each
+  surface boots straight onto its screen with the dev triggers, presses a seat key until the walked
+  list holds focus, then holds the direction key to the end of the list and back to the start:
+
+  | surface | what is walked | boot |
+  |---|---|---|
+  | `home-row` | Home > Recently Added Movies (Shelf, 24-card window) | `plxnative-grid` |
+  | `library-section-hub-row` | Library > a pageable section shelf (`--section-hubs 3`) | `plxnative-library=0` |
+  | `library-grid` | Library > the 1000-movie poster grid (6 columns, row-band window) | `plxnative-library=0` |
+  | `search-row` | Search > the Movies result row of a 2-letter query | `plxnative-search=sf` |
+  | `detail-related-row` | Detail > the related row (head of 8, tail from `/similar`) | `plxnative-detail=1001 plxnative-detailsec=2` |
+  | `collection` | a ~130-member collection (Grid over a paged listing) | `plxnative-collection=50002` |
+  | `long-season` | Detail > the episode strip of a 150-episode season (pages of 60) | `plxnative-detail=2001` |
+
+  The read-out is one shared hook, `plx_ui::card_probe` (cargo feature `devtriggers`, so a release
+  build has none of it), called from the two functions every card section draws through
+  (`Shelf::draw_card`, `Grid::draw_card`) and the episode strip. With `plxnative-focus` and
+  `plxnative-focusx` armed the focus fingerprint gains, per frame, the focused card's drawn rect
+  (`cdx cdy cdw`), its slot in the run of cards the section holds and that run's length (`cdi cdn`),
+  its index in the source (`cdg`), the ratingKey in its artwork path (`cdk`, the stable item key),
+  whether its texture was resident (`cda`), the caption's left edge and width (`cdc cdcw`) and two
+  running counts over every card drawn: `cdr`, posters that drew with their texture on one frame
+  and with none on the next (a blink in place, counted once per occurrence: the defect, and any is
+  a failure), and `cdb`, cards that left the screen and came back without a picture they once had
+  (reported as `art_returned_bare`, not graded: the poster store holds 64 pictures).
+  `--trigger imgtrace` arms one more dev trigger and puts its lines in `--dump`: each
+  `HIDDEN ... gap=1f cause=...` is one `cdr`, with the store's reason.
+  Without `plxnative-focusx` the fingerprint is byte-for-byte what it was (the replay recordings
+  do not change). Asserted on every surface: the last item and then the first are focused; one
+  key moves one card (one grid row), and keys held while the list could not move may land together
+  but never move more than they were pressed for; no focus change without a key; no slot jump (the
+  same card moving more than 400 px between two frames); the window bound; no poster goes back to
+  a placeholder; placeholders are gone a profile-derived time after the last key; and under an error
+  profile a failed listing page is asked for again and answered within 45 s when the focus still
+  stands at it five seconds after it failed (a held-key walk is past a page in about a second, so a
+  page it left behind is only counted). The random error rate is joined by a TARGETED fault: the
+  first read of every page of the walked list's endpoint fails, armed for the walk forward and again
+  for the walk back, so a run that failed no page in a direction fails the run, except a back walk
+  that reads no page at all (a short list is still fully held; reported as `back_walk_read_no_page`). Reported: host
+  frames, late frames inside and outside a window around each page landing, keys that moved
+  nothing, per page ask -> landed and landed -> the last poster of THAT page (matched by ratingKey
+  in the transcode request), and whether the focused card or its caption was ever drawn outside the
+  canvas (1920 wide; `min_x` / `max_right` give the extremes). **Host frame times are this Mac's
+  debug build, not the television's; they place late frames, they prove no smoothness.**
+  Profiles: `none remote-wan slow-latency low-bandwidth lossy` by default, plus `lossy-503` (10 %
+  of reads answer 503) and any `link_conditioner` profile by name.
+- **On the TV**: `home-recent-paging-held-3g` and `-remote-wan` (Home), and a `-3g` / `-remote-wan`
+  pair for each other surface (`library-grid-paging-held-*`, `library-shelf-paging-held-*`,
+  `search-row-paging-held-*`, `related-row-paging-held-*`, `collection-paging-held-*`,
+  `long-season-paging-held-*`) are `--fps --mock` scenes (the mock block's `"link": [...]` becomes
+  `--link ...`). They are the Home scene's row walk with `walk.key` / `walk.back` (Down and Up for a
+  grid) and, where the app logs no `hubs: landed` line per page, `walk.reach`: the deepest source
+  index (`cdg`) the focused card had must reach `min_global`, so a walk that never got past the first
+  window fails instead of printing a clean number. The detail also counts frames the focused card
+  was drawn partly off the canvas. Build `make ARM_PROFILE=release deploy` first and follow the
+  `profile-tv` skill; never run them without the TV lock. They have not been run on a television.
+
 ### What each case does (per case, automatically)
 
 1. `make kill` — close the app (luna-send `closeByAppId` + `fuser -k`) **first**.
@@ -647,7 +765,7 @@ Base playback (decision + codec + not-stuck), one case each:
 | `dp_mp4_container` | `movie_hevc_aac_mp4` | HEVC + AAC, **mp4 container** direct-play (mov demuxer over HTTP, AAC→ADTS), sidecar subs |
 | `dp_h264_aac_episode` | `episode_h264_aac` | H264 + AAC direct-play, TV episode, no subs |
 | `dp_h264_ac3_many_audio` | `movie_h264_ac3_many_audio` | H264 + AC3 direct-play, 8 audio tracks (TrueHD/vorbis present) |
-| `transcode_av1_no_dp_audio` | `movie_av1_no_dp_audio` | **must-transcode** (AV1 + no DP audio) → **HEVC 4K HDR10**/AC3 on this Plex-Pass server (the target chain ends in h264 since issue #22, so a server that cannot encode HEVC re-encodes to h264 instead of dropping video) |
+| `transcode_av1_no_dp_audio` | `movie_av1_no_dp_audio` | **must-transcode** on the dev set, whose codec table lists no AV1 decoder (AV1 + no DP audio) → **HEVC 4K HDR10**/AC3 on this Plex-Pass server (the target chain ends in h264 since issue #22, so a server that cannot encode HEVC re-encodes to h264 instead of dropping video). On a set whose table lists an AV1 decoder the same file would direct-stream video with converted audio. |
 
 Operation cases (each also re-checks not-stuck / no-error afterward):
 
@@ -918,6 +1036,18 @@ the one already device-verified, and an SDR twin would differ only in `trc=`/`pr
 here grades); the 4096-wide edge the device table claims, and any refusal above it; and every
 non-24p rung — the frame-rate axis is `pipe_h264_1080p5994` and `pipe_hevc_4k_60fps`, at 1080p and
 4K only.
+
+### Audio that starts late (`pipe_late_audio_eac3`)
+
+`pipe_h264_eac3_late_audio.mkv` carries an E-AC-3 track whose first packet is 11.008 s into the
+file, behind ~16 MB of 12 Mbit/s video — more than the 10 MiB video lane. A player that parks the
+demuxer on the full video lane, or drops/throttles the late audio, never starts its clock and sits
+at 0:00. `make_fixtures.py` reads the first audio packet's time and the video bytes ahead of it back
+out of the finished file (`verify_late_audio`), so a clip that lost either fails the build. The case
+grades the whole-path symptom (`min_pos_climb_s`) and the second stall on its own
+(`require_audio_feed_ready`). The demux half also has a host test over a generated file,
+`ff::late_audio_tests` in `rust-modules/media` (needs the host FFmpeg and the `ffmpeg` CLI; run with
+`--ignored`, see its module doc).
 
 ### Playing to the END, and then again (LG #46)
 

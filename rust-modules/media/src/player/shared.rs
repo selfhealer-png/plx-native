@@ -379,9 +379,11 @@ pub struct SubRect {
 }
 
 impl SubRect {
-    /// the bytes this rect holds in the store (what the byte budget counts)
+    /// the bytes this rect holds in the store (what the byte budget counts): its index buffer as
+    /// ALLOCATED (a `Vec` that grew by doubling holds its spare capacity) plus its palette. The
+    /// store holds only this indexed form; the RGBA expansion exists for the one set on screen.
     pub fn bytes(&self) -> usize {
-        self.index.len() + std::mem::size_of::<[[u8; 4]; 256]>()
+        self.index.capacity() + std::mem::size_of::<[[u8; 4]; 256]>()
     }
 
     /// The straight-alpha RGBA bitmap of `w`×`h` the renderer uploads.
@@ -529,6 +531,13 @@ pub struct Shared {
     /// see `appkit::player_hud::busy_surface`. Monotone within a session (false→true only), which is
     /// what lets two readers in one frame sample it independently without disagreeing.
     pub seen_frame: AtomicBool,
+    /// **The raw pts of the first audio AU the demuxer pushed since its last open or seek**.
+    /// Written by `ff::demux` BEFORE that push, so the feed thread that pops the AU
+    /// sees it. The audio lane uses it to tell the real start of a late audio track (an MKV
+    /// audio `Delay` of several seconds) from stale pre-seek audio, which looks the same — far
+    /// ahead of the video — but never carries this pts (see `engine::feed_audio_lane`). `i64::MIN`
+    /// before one, since a real pts may be negative.
+    pub first_audio_pts: AtomicI64,
     /// **Why the NEXT rebuild is happening, when the viewer's audio-track pick is the cause**: the
     /// read-out beside the load spinner says "Switching audio…" instead of "Buffering…". A
     /// [`AudioSwitch`] value. `Picked` (set by `route::commit_audio_selection` once its rebuild is
@@ -543,6 +552,9 @@ pub struct Shared {
     pub load_completed: AtomicBool,          // bf_loaded signal
     pub media_id: Mutex<Option<CString>>,    // bf_mediaId (captured once)
     pub source_info: Mutex<Option<Vec<u8>>>, // sourceInfoRaw, VERBATIM incl NUL
+    /// What the demuxer read of a VP9 stream's colour (PQ tag, mastering display, light level). Set
+    /// only for VP9, cleared per session; `pump` writes it into `source_info` before ACB is sent it.
+    pub container_hdr: Mutex<Option<super::vp9_hdr::ContainerHdr>>,
 
     // main/pump (M) -> library callback thread (K)
     pub pts_shift: AtomicI64, // g_pts_shift
@@ -764,6 +776,15 @@ pub struct Shared {
     /// session, and the index says whether it was immediate or after a long healthy run.
     pub dg_cb_err: AtomicI32,
     pub dg_cb_err_at: AtomicU32,
+    /// The firmware's own error NUMBER (`num`) of that same first `ty == 18` callback — the
+    /// `601` of `type=18 num=601 Resource Allocation Error`. Latched together with `dg_cb_err`
+    /// (first one wins, so a later callback cannot overwrite the explanation) and cleared where
+    /// that clears. Already clamped to the `i32` range: it is the one number a handled `tv_pipeline`
+    /// report carries about the refusal, never the callback's string. A SYNCHRONOUS Load refusal
+    /// (`sf_load` returning 0) has no number to latch — Starfish's `Load` hands back a bare
+    /// success flag, and the other refusals inside `sf_load` are the seam's own lifecycle gates —
+    /// so a session that failed that way leaves this at 0 ("none recorded").
+    pub dg_cb_err_num: AtomicI32,
     /// The media GET's HTTP status and the bytes actually delivered to the demuxer. Written by the
     /// DEMUX thread — the third writer of this block. 0/0 = no connection was ever made, which is
     /// a different failure from a connection that answered 401.
@@ -814,7 +835,7 @@ pub struct Shared {
     pub dg_fed_v_pts: AtomicI64,
     pub dg_fed_a_pts: AtomicI64,
     /// The codec strings this session actually put in the Starfish Load payload, as small codes
-    /// (0 = none/not built; video 1 = H264, 2 = H265; audio 1 = AC3, 2 = AC3 PLUS, 3 = AAC).
+    /// (0 = none/not built; video 1 = H264, 2 = H265, 3 = AV1, 4 = VP9; audio 1 = AC3, 2 = AC3 PLUS, 3 = AAC).
     ///
     /// Codes rather than strings so they need no lock on the render path — and the PAYLOAD's view
     /// rather than a re-derivation, because the whole class of bug here is the payload disagreeing
@@ -904,6 +925,7 @@ impl Shared {
             dg_feed_state: AtomicU8::new(0),
             dg_cb_err: AtomicI32::new(0),
             dg_cb_err_at: AtomicU32::new(0),
+            dg_cb_err_num: AtomicI32::new(0),
             dg_http_status: AtomicI32::new(0),
             dg_transport_rc: AtomicI32::new(0),
             dg_transport_age_ms: AtomicI64::new(-1),
@@ -951,11 +973,13 @@ impl Shared {
             pres_fed: AtomicI64::new(0),
             frames: AtomicI32::new(0),
             seen_frame: AtomicBool::new(false),
+            first_audio_pts: AtomicI64::new(i64::MIN),
             audio_switch: AtomicU8::new(AudioSwitch::None as u8),
             audio_pick_ms: AtomicI64::new(0),
             load_completed: AtomicBool::new(false),
             media_id: Mutex::new(None),
             source_info: Mutex::new(None),
+            container_hdr: Mutex::new(None),
             pts_shift: AtomicI64::new(0),
             disp_base: AtomicI64::new(0),
             seek_to_ns: AtomicI64::new(-1),
@@ -1217,6 +1241,18 @@ impl Shared {
         }
         state.phase = NativeSessionPhase::Abandoned { epoch };
         true
+    }
+
+    /// Whether a timed-out Load is parked ([`NativeSessionPhase::Abandoned`]): the native object
+    /// is still owned by a `Load` that has not returned, so every native start is refused.
+    pub fn native_load_abandoned(&self) -> bool {
+        matches!(
+            self.native_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phase,
+            NativeSessionPhase::Abandoned { .. }
+        )
     }
 
     /// Test-only: drop an abandoned phase that a failing test left behind, which
@@ -1497,6 +1533,7 @@ impl Shared {
         // playback red for the life of the process.
         self.dg_cb_err.store(0, Ordering::Relaxed);
         self.dg_cb_err_at.store(0, Ordering::Relaxed);
+        self.dg_cb_err_num.store(0, Ordering::Relaxed);
         self.dg_http_status.store(0, Ordering::Relaxed);
         self.dg_transport_rc.store(0, Ordering::Relaxed);
         self.dg_transport_age_ms.store(-1, Ordering::Relaxed);
@@ -1542,6 +1579,7 @@ impl Shared {
         // places (declaration, `new`, here): a reload that forgot the bit would silently suppress
         // the centred read-out for the rest of the app's life.
         self.seen_frame.store(false, Ordering::Relaxed);
+        self.first_audio_pts.store(i64::MIN, Ordering::Relaxed);
         // an audio pick's rebuild has begun (a reload keeps the pick's meaning for this session);
         // any other reset ends it
         let next = match AudioSwitch::from_u8(self.audio_switch.load(Ordering::Relaxed)) {
@@ -1561,6 +1599,7 @@ impl Shared {
         self.native_load_elapsed_ms.store(0, Ordering::Relaxed);
         *self.media_id.lock().unwrap() = None;
         *self.source_info.lock().unwrap() = None;
+        *self.container_hdr.lock().unwrap() = None;
         self.pts_shift.store(0, Ordering::Relaxed);
         self.disp_base.store(0, Ordering::Relaxed);
         self.seek_to_ns.store(-1, Ordering::Relaxed);

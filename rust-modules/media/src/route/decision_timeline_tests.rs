@@ -13,8 +13,8 @@ use super::test_support::apply_plan;
 fn the_machine_id_cache_is_scoped_to_the_server_that_taught_it() {
     let mut ps = crate::route::PlaybackSession::IDLE;
     let _g = fresh_registry(&mut ps);
-    let a = ServerId::from_raw((plx_plex::plex::MAX_SERVERS - 2) as u16);
-    let b = ServerId::from_raw((plx_plex::plex::MAX_SERVERS - 1) as u16);
+    let a = ServerId::from_raw(40);
+    let b = ServerId::from_raw(41);
     assert!(plx_plex::plex::client_for(a).is_none() && plx_plex::plex::client_for(b).is_none());
 
     apply_plan(&mut ps, 
@@ -388,6 +388,30 @@ fn a_session_resolved_for_a_preview_never_reports_a_timeline() {
         begin_timeline_reporting(&ps).is_none(),
         "a session resolved for a preview must never report a timeline"
     );
+    reset_player_control_for_test(&ps);
+    reset_session(&mut ps);
+}
+
+/// **A film pressed after a trailer is a film from the press on.** `resolved_as_preview` is fixed
+/// at a landing, so a film whose resolve never lands (a refused worker spawn, a superseded
+/// request) left the PREVIOUS trailer's flag standing: the failure read-out of the film was then
+/// reported as a preview, with the preview's origin, fingerprint and flags. The request itself
+/// retires the flag.
+#[test]
+fn a_film_request_retires_the_previous_trailers_preview_mark() {
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    let _g = fresh_registry(&mut ps);
+    let mut meta = plx_data::stores::metadata::MetadataStore::default();
+    resolve_as_preview_for_test(&mut ps);
+    assert!(preview_request(&ps), "the trailer's session is marked");
+
+    assert!(request_play(
+        &mut ps, &mut meta, ServerId::from_raw(0), "film", "/library/parts/2/file.mkv", "h264", "aac", "Film", "",
+    ));
+    assert!(!preview_request(&ps), "a film request is not a preview, whatever the last landing was");
+
+    cancel_play(&mut ps);
+    let _ = wait_resolve_workers_for_test(std::time::Duration::from_secs(10));
     reset_player_control_for_test(&ps);
     reset_session(&mut ps);
 }

@@ -57,6 +57,10 @@ impl Glass {
 
     /// Draw the captured backdrop only. The caller owns the material layered over it, which is
     /// what lets the same policy serve a frosted panel and the sheened tab-track capsule.
+    ///
+    /// For a glass that STAYS at its rest rect (`rest_dy` is 0 on every frame): its blurred region is
+    /// the panel plus the blur reach and nothing more. A glass that slides in from its rest rect
+    /// calls [`backdrop_rising`](Self::backdrop_rising).
     #[must_use]
     pub fn backdrop(
         self,
@@ -69,10 +73,62 @@ impl Glass {
         face: plx_gfx::gfx::GlassFace,
         mat: theme::Material,
     ) -> bool {
+        debug_assert!(rest_dy == 0.0, "a glass that slides must use `backdrop_rising`");
+        self.backdrop_with(p, r, rest_dy, radius, tint, rim, face, mat, false)
+    }
+
+    /// [`backdrop`](Self::backdrop) for a glass that slides in from its rest rect (`rest_dy` != 0
+    /// while it does): its region keeps the extra margin that holds the whole slide
+    /// ([`plx_gfx::gfx::BLUR_MARGIN`]).
+    #[must_use]
+    pub fn backdrop_rising(
+        self,
+        p: Painter,
+        r: Rect,
+        rest_dy: f32,
+        radius: f32,
+        tint: [f32; 4],
+        rim: plx_gfx::gfx::GlassRim,
+        face: plx_gfx::gfx::GlassFace,
+        mat: theme::Material,
+    ) -> bool {
+        self.backdrop_with(p, r, rest_dy, radius, tint, rim, face, mat, true)
+    }
+
+    fn backdrop_with(
+        self,
+        p: Painter,
+        r: Rect,
+        rest_dy: f32,
+        radius: f32,
+        tint: [f32; 4],
+        rim: plx_gfx::gfx::GlassRim,
+        face: plx_gfx::gfx::GlassFace,
+        mat: theme::Material,
+        rises: bool,
+    ) -> bool {
         // A bare painter outside a frame cannot name an underlay. Never silently fall through
         // to the synthetic load dial's independent scratch-cache policy.
         if !crate::frame::backdrop::active() || !plx_gfx::gfx::live_blur_available() { return false; }
-        p.backdrop_blur(r, rest_dy, radius, tint, rim, face, mat.deep())
+        p.backdrop_blur(r, rest_dy, radius, tint, rim, face, mat.deep(), rises)
+    }
+}
+
+/// Declare the chrome band's glass surfaces (`rects`, the profile chip's capsule and the tab track)
+/// the way the band does, for a screen test that grades what invalidates their shared blur source.
+#[cfg(any(test, feature = "test-support"))]
+pub fn declare_chrome_glass_for_test(p: Painter, rects: &[Rect]) {
+    for &r in rects {
+        assert!(Glass::DYNAMIC_BACKDROP.backdrop(
+            p,
+            r,
+            0.0,
+            r.h * 0.5,
+            [1.0, 1.0, 1.0, 1.0],
+            plx_gfx::gfx::GlassRim::Standing,
+            plx_gfx::gfx::GlassFace::NONE,
+            theme::Material::UltraThin,
+        ));
     }
 }
 
@@ -600,14 +656,26 @@ pub fn resolve_card_art(p: Painter, rect: Rect, art: &Art<'_>) -> (u32, f32, f32
     if p.is_recording() { return (0, 0.0, 0.0); }
     let _admission = art.motion_identity()
         .map(|id| crate::card_motion::Scope::card(id, p.to_screen(rect).0));
-    let image = match art {
-        Art::Poster(m) => m.map(|m| resolve_tex_wh_on(m.src, m.thumb, POSTER_RES.0, POSTER_RES.1, 0)).unwrap_or((0, 0.0, 0.0)),
-        Art::Still(m) => m.map(|m| resolve_tex_wh_on(m.src, still_key(&m), STILL_RES.0, STILL_RES.1, 0)).unwrap_or((0, 0.0, 0.0)),
-        Art::Thumb { sid, key, res } | Art::Person { sid, key, res } => resolve_tex_wh_on(*sid, key, res.0, res.1, 0),
-    };
+    let image = card_art_request(art).map_or((0, 0.0, 0.0), |(srv, path, w, h)| resolve_tex_wh_on(srv, path, w, h, 0));
     #[cfg(feature = "devtriggers")]
-    crate::card_motion_metrics::draw(image.0 != 0);
+    {
+        crate::card_motion_metrics::draw(image.0 != 0);
+        if let Some((srv, path, w, h)) = card_art_request(art) {
+            crate::card_probe::art(srv, path, w, h, image.0 != 0);
+        }
+    }
     image
+}
+
+/// The `(server, path, width, height)` [`resolve_card_art`] asks the source for, for a screen that
+/// must WARM exactly that key (the Library's at-rest lookahead). [`resolve_card_art`] resolves
+/// through this, so the two cannot name different keys; `screens/src/library/lookahead_tests.rs::the_lookahead_asks_for_the_key_the_card_draw_resolves` pins it. `None` for an empty slot.
+pub fn card_art_request<'a>(art: &Art<'a>) -> Option<(u16, &'a str, c_int, c_int)> {
+    Some(match art {
+        Art::Poster(m) => { let m = (*m)?; (m.src, m.thumb, POSTER_RES.0, POSTER_RES.1) }
+        Art::Still(m) => { let m = (*m)?; (m.src, still_key(&m), STILL_RES.0, STILL_RES.1) }
+        Art::Thumb { sid, key, res } | Art::Person { sid, key, res } => (*sid, *key, res.0, res.1),
+    })
 }
 
 /// The name a poster card draws on the neutral collection tile, when it draws one: a collection
@@ -3218,6 +3286,15 @@ fn ground_capped(c: [f32; 3]) -> [f32; 4] {
     )
 }
 
+/// A corner channel as the 8-bit code the GPU is sent. A critically damped spring never reaches its
+/// target: its tail keeps changing the float's low bits for seconds after the eye has stopped being
+/// able to see it, and those bits are what the draw RECORDS, so a settled wash never compared equal
+/// from frame to frame and every blur snapshot taken over it was rebuilt. Recording and drawing the
+/// code instead makes a settled wash bit-stable (the springs themselves keep their full precision).
+fn code(v: f32) -> f32 {
+    (v.clamp(0.0, 1.0) * 255.0).round() / 255.0
+}
+
 impl AmbientWash {
     /// The dissolve rate every page wash shares — deliberately slower than any focus spring (the
     /// person mock's `.5s ease`): the wash is atmosphere, and snapping it with the focus pop reads
@@ -3329,6 +3406,11 @@ impl AmbientWash {
             top + (bot - top) * v
         })
     }
+    /// The four corner colours as DRAWN and RECORDED: each channel at the 8-bit code the GPU is
+    /// sent, so a settled wash is bit-stable (see [`code`]). [`sample`](Self::sample) stays exact.
+    pub fn drawn_corners(&self) -> [[f32; 3]; 4] {
+        self.corners.map(|c| [code(c[0].pos), code(c[1].pos), code(c[2].pos)])
+    }
     /// Paint it over `r`. Opaque — this REPLACES what is under it (see the type docs), so it belongs
     /// at the bottom of a screen's draw, standing in for the flat clear.
     ///
@@ -3336,7 +3418,7 @@ impl AmbientWash {
     /// Detail's scrolling still (`gfx::draw_ambient` records the three gates that were tried and
     /// why each came back out).
     pub fn draw(&self, p: Painter, r: Rect) {
-        p.ambient(r, 1.0, self.corners.map(|c| [c[0].pos, c[1].pos, c[2].pos]));
+        p.ambient(r, 1.0, self.drawn_corners());
     }
     /// **Paint the whole GROUND over `r`: this wash, the photograph dissolving over it, and the
     /// screen's atmospheric ramp of scrim ink over both** — the same picture as
@@ -3374,7 +3456,7 @@ impl AmbientWash {
         };
         let corners = |b: Rect| {
             [(b.x, b.y), (b.x + b.w, b.y), (b.x + b.w, b.y + b.h), (b.x, b.y + b.h)]
-                .map(|(x, y)| self.sample(r, x, y))
+                .map(|(x, y)| self.sample(r, x, y).map(code))
         };
         let knees = ramp.map_or([None, None], |q| [Some(q.stops[0].0), Some(q.stops[1].0)]);
         let ink = |b: Rect| {
@@ -6245,7 +6327,12 @@ const GLASS_TRACK_MAX: f32 = if GLASS_TRACK_TOUCH_MAX < GLASS_TRACK_BUDGET_MAX {
 /// The widest track that still leaves [`BAND_AIR`] between the unfurled chip and the centred strip.
 const GLASS_TRACK_TOUCH_MAX: f32 = crate::consts::SCR_W - 2.0 * (CHIP_CAP_MAX_R + BAND_AIR);
 
-/// The track's blurred region HEIGHT, in authored px.
+/// The track's blurred region HEIGHT, in authored px — priced at [`plx_gfx::gfx::BLUR_MARGIN`], the
+/// margin of a glass that RISES. The band's glass never rises, so its real region is grown
+/// [`plx_gfx::gfx::blur_region_for`]'s `BLUR_REACH` (68) only: 20 px less each side. This constant,
+/// [`GLASS_TRACK_BUDGET_MAX`] and the budget tests stay on the wider figure on purpose — an upper
+/// bound, so a width that fits it fits the real region with room to spare, and the track the owner
+/// sees is unchanged.
 ///
 /// The top clamps to 0 — the track's own top edge (`TOP_BAR_Y - TAB_TRACK_PAD` = 54) is inside
 /// [`plx_gfx::gfx::BLUR_MARGIN`] 88 of the panel edge — so the whole region is

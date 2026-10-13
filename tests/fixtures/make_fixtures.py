@@ -738,6 +738,12 @@ def venc_args(v):
         return a
     if c == "av1":
         return ["-c:v", "libsvtav1", "-preset", "12", "-crf", str(v["crf"]), "-g", "48"]
+    if c == "vp9":
+        # Constant-quality (-b:v 0 + -crf), Profile 0 (8-bit 4:2:0): the shape every set's profile
+        # advertises (the webOS 4 family also advertises Profile 2, which this recipe does not make).
+        # One-pass libvpx emits no hidden alt-ref frames, so no superframes here.
+        return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(v["crf"]), "-deadline", "good",
+                "-cpu-used", "5", "-row-mt", "1", "-g", "48", "-pix_fmt", "yuv420p"]
     raise Fail("no encoder recipe for video codec %r" % c)
 
 
@@ -1005,7 +1011,10 @@ QUICK_SECS = 20
 #   * PGS and SRT subtitles. The demuxer would carry them, but the `sub cue` / `image cue`
 #     log lines a case would grade sit behind `desired_sub_idx`, which only the Plex path
 #     ever writes — so a subtitle case down here would assert nothing at all.
-#   * AV1. There is no Load payload video codec for it.
+#   * AV1. The dev set's codec table lists no AV1 decoder, so this tier's TV declares no AV1
+#     video codec, and the AV1 fixtures (`movie_av1_no_dp_audio`) expect a TRANSCODE there. On a
+#     set whose table lists an AV1 decoder the same file would direct-stream video with converted
+#     audio.
 #
 # `declare` IS THE TRIGGER'S PLAYBACK HALF, recorded verbatim into fixtures.json so the
 # harness writes `/tmp/plxnative-playurl` FROM the pack instead of restating it, and read
@@ -1020,6 +1029,12 @@ QUICK_SECS = 20
 # lands in the first seconds, so nothing here wants length for its own sake, and 60 s is
 # what keeps the whole pack to minutes of encoding.
 PIPE_SECS = 60
+
+# The player's video-lane byte cap, BY VALUE: `player::engine::AQ_VIDEO_BYTES` (`aq_caps().0`),
+# 10 MiB. Only `late_audio` shapes read it -- "more video than this precedes the first audio
+# packet" is what makes the demuxer park -- so if the cap is ever raised, raise this with it or the
+# late-audio clip stops reproducing the stall it exists for.
+AQ_VIDEO_BYTES = 10 * 1024 * 1024
 
 PIPE_SHAPES = {
     "pipe_h264_ac3_1080p": {
@@ -1109,6 +1124,18 @@ PIPE_SHAPES = {
         "video": {"codec": "h264", "size": "1920x1080", "crf": 21},
         # Stereo, no track title: mp4 carries neither through this path (see pipe_hevc_aac_mp4).
         "audio": [{"codec": "aac", "ch": 2, "lang": "eng", "br": "192k", "pitch": 233,
+                   "default": True}],
+        "subs": [],
+    },
+    "pipe_vp9_aac_1080p": {
+        # VP9 Profile 0 in MKV. The dev set's codec table lists a VP9 row, so this direct-plays
+        # there; on a set whose table does not, the Load is refused (`load_video_refused`).
+        # The first fixture to reach the `video/x-vp9` caps and the pass-through arm in ff.rs.
+        "kind": "clip", "ext": "mkv",
+        "duration": PIPE_SECS, "rate": 0.06,
+        "declare": {"vcodec": "vp9", "acodec": "aac", "fps": float(FPS), "atmos": False},
+        "video": {"codec": "vp9", "size": "1920x1080", "crf": 33},
+        "audio": [{"codec": "aac", "ch": 2, "lang": "eng", "br": "192k", "pitch": 261,
                    "default": True}],
         "subs": [],
     },
@@ -1407,6 +1434,35 @@ PIPE_SHAPES = {
                    "default": True, "title": "AC-3 5.1 English"}],
         "subs": [],
     },
+    "pipe_h264_eac3_late_audio": {
+        # **An E-AC-3 track that starts 11.008 s after the video** -- the container `Delay` of the
+        # film that buffered forever at 0:00 (PR #603). There is no audio packet for the first
+        # 11 s, so the demuxer reads more than `AQ_VIDEO_BYTES` of video before it reaches the
+        # first one: the video lane fills, the demux thread parks on the push, the pipeline will
+        # not start its clock without audio, and nothing moves. The pipeline tier is the only place
+        # that reaches it end to end (real socket, real lanes, the pump's stale-audio drop and
+        # feed-ahead throttle, Starfish's own clock); the host test `ff::late_audio_tests` covers
+        # the demux half.
+        #
+        # **Rate-targeted at 12 Mbit/s, and the number is load-bearing.** crf 20 testsrc2 measures
+        # 7.24 Mbit/s at 1080p (`pipe_h264_ac3_1080p`), i.e. 9.96 MB by 11 s -- UNDER the 10 MiB
+        # cap, which would build a clip that never parks the demuxer and passes on a broken
+        # player. 12 Mbit/s * 11.008 s = 16.5 MB: over the cap, and under the cap plus the fix's
+        # 24 MiB of headroom. verify() reads both facts back out of the finished file (the first
+        # audio packet's time and the video bytes ahead of it), so a clip that lost either fails
+        # the build instead of quietly grading nothing.
+        #
+        # 60 s like every clip here: 11 s without audio, then 49 s with -- enough for the case to
+        # watch the clock climb well past the start without reaching EOS.
+        "kind": "clip", "ext": "mkv",
+        "duration": PIPE_SECS, "rate": 0.12,
+        "declare": {"vcodec": "h264", "acodec": "eac3", "fps": float(FPS), "atmos": False},
+        "video": {"codec": "h264", "size": "1920x1080", "vbr": 12000, "vbr_bufsize_ratio": 1},
+        "audio": [{"codec": "eac3", "ch": 6, "lang": "eng", "br": "384k", "pitch": 330,
+                   "default": True, "title": "E-AC-3 5.1 English", "delay": 11.008}],
+        "subs": [],
+        "late_audio": {"min_video_bytes_before_audio": AQ_VIDEO_BYTES},
+    },
     "pipe_multiaudio_1080p": {
         # Audio-LANE selection by declared codec. `ff.rs::audio_stream_matching` walks the
         # streams and feeds the FIRST whose `avcodec_get_name` matches the declaration, so
@@ -1531,9 +1587,11 @@ PIPE_MBIT = {
     "pipe_hevc_eac3_4k_dovi_p8": 9.80,  # = movie_hevc_4k_dovi_p8
     "pipe_hevc_aac_mp4": 5.00,          # = movie_hevc_aac_mp4         (hevc 1080p crf 26)
     "pipe_h264_aac_mp4": 6.40,          # measured, from a full 60 s build
+    "pipe_vp9_aac_1080p": 6.10,         # measured, from a full 60 s build (vp9 1080p crf 33)
     "pipe_h264_1080p5994": 9.48,        # measured; NB 2.5x the frames cost only 1.3x the bits
     "pipe_hevc_4k_60fps": 9.40,         # measured, at crf 32 (crf 30 would be well over 15)
     "pipe_multiaudio_1080p": 8.10,      # = movie_h264_ac3_many_audio, minus five tracks
+    "pipe_h264_eac3_late_audio": 12.4,  # rate-targeted: 12 Mbit/s video + 384 kbps E-AC-3
     # The resolution matrix. Video measured 2026-08-23 over a 5 s encode at each rung's own
     # settings, plus its audio track's nominal rate — so these run HIGH for the reason the note
     # above gives (a short clip is I-frame-heavy), which is the safe direction for a warning.
@@ -1674,6 +1732,12 @@ def build_generic(ctx, key, spec, dur, ep, dest, work, video_only=False):
     a_idx, s_idx = [], []
     if not video_only:
         for a in spec.get("audio", []):
+            # `delay` (seconds) is a Matroska-style track Delay: `-itsoffset` shifts the NEXT
+            # input's timestamps, so the muxer writes this track's first block that far into the
+            # file and there is no audio packet before it. It is the only way to make a file whose
+            # audio starts late; see `pipe_h264_eac3_late_audio`.
+            if a.get("delay"):
+                argv += ["-itsoffset", _g(a["delay"])]
             argv += ["-t", str(dur), "-f", "lavfi",
                      "-i", audio_graph(a["ch"], a["pitch"], dur, segs)]
             a_idx.append(idx)
@@ -2026,7 +2090,7 @@ def _xml_escape(s):
 # PLAYER regressed and the evidence all points at the app. Everything a shape CLAIMS is
 # read back out of the finished file; a mismatch names both sides and is fatal.
 # ---------------------------------------------------------------------------------------
-VCODEC_NAME = {"h264": "h264", "hevc": "hevc", "av1": "av1"}
+VCODEC_NAME = {"h264": "h264", "hevc": "hevc", "av1": "av1", "vp9": "vp9"}
 ACODEC_NAME = {"ac3": "ac3", "eac3": "eac3", "aac": "aac", "truehd": "truehd",
                "dts": "dts", "vorbis": "vorbis", "opus": "opus", "flac": "flac"}
 
@@ -2182,6 +2246,74 @@ def physical_av_interleave(packets, video_index, audio_index):
         if wanted <= latest.keys():
             max_skew = max(max_skew, abs(latest[video_index] - latest[audio_index]))
     return max_skew, counts
+
+
+def late_audio_lead(packets, video_index, audio_index):
+    """`(first audio packet's time in s, video bytes in packets that precede it)`, from ffprobe
+    packets. Both are properties of the FILE as the demuxer meets it: it reads in file order and
+    pushes video until the video lane is full, so what matters is how much video sits ahead of the
+    first audio packet, not what the container's metadata says the delay is.
+
+    "Precede" is by presentation time, which for the muxers here equals file order to within one
+    interleave step; an audio packet with no timestamp cannot be placed, so it is an error rather
+    than a silent zero.
+    """
+    first_audio = None
+    video = []
+    for packet in packets:
+        try:
+            stream = int(packet["stream_index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if stream not in (int(video_index), int(audio_index)):
+            continue
+        try:
+            pts = float(packet["pts_time"])
+            size = int(packet["size"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("a packet lacks a presentation time or size")
+        if stream == int(audio_index):
+            first_audio = pts if first_audio is None else min(first_audio, pts)
+        else:
+            video.append((pts, size))
+    if first_audio is None:
+        raise ValueError("the file has no audio packets")
+    return first_audio, sum(size for pts, size in video if pts < first_audio)
+
+
+def verify_late_audio(path, spec, streams, rec, problems):
+    """Prove the clip really starts its audio late AND queues enough video ahead of it.
+
+    A `delay` the muxer silently dropped, or a bitrate too low to fill the video lane before the
+    first audio packet, builds a file that verifies clean on every other axis and then passes on a
+    player that has the bug: it never parks the demuxer.
+    """
+    want = spec["late_audio"]
+    vs = [s for s in streams if s["codec_type"] == "video"]
+    aus = [s for s in streams if s["codec_type"] == "audio"]
+    delays = [a.get("delay") for a in spec.get("audio", [])]
+    if len(vs) != 1 or len(aus) != 1 or len(delays) != 1 or not delays[0]:
+        problems.append("late_audio shape wants exactly one video stream and one delayed audio "
+                        "stream; found %d video, %d audio" % (len(vs), len(aus)))
+        return
+    try:
+        doc = json.loads(run(["ffprobe", "-v", "error", "-show_entries",
+                              "packet=stream_index,pts_time,size", "-of", "json", str(path)]))
+        first_audio, ahead = late_audio_lead(
+            doc.get("packets", []), vs[0]["index"], aus[0]["index"])
+    except (Fail, ValueError) as e:
+        problems.append("could not read the first audio packet back: %s" % e)
+        return
+    rec["late_audio"] = {"first_audio_s": round(first_audio, 3), "video_bytes_before_audio": ahead}
+    # +-0.1 s: ffmpeg's -itsoffset lands within a packet of the request (an E-AC-3 frame is 32 ms),
+    # and a codec priming offset can shift the first timestamp slightly negative.
+    if abs(first_audio - delays[0]) > 0.1:
+        problems.append("first audio packet at %.3fs, wanted %.3fs (+-0.1) -- the container delay "
+                        "did not land" % (first_audio, delays[0]))
+    if ahead < want["min_video_bytes_before_audio"]:
+        problems.append("%d bytes of video before the first audio packet, wanted at least %d (the "
+                        "video lane's cap) -- this clip would not park the demuxer, so it grades "
+                        "nothing" % (ahead, want["min_video_bytes_before_audio"]))
 
 
 def verify_resolution_spike(path, spec, dur, rec, problems):
@@ -2505,6 +2637,9 @@ def verify(key, spec, dur, path, ep=None):
                 if title != w["title"]:
                     problems.append("audio[%d] title %r, wanted %r" % (i, title, w["title"]))
 
+    if spec.get("late_audio"):
+        verify_late_audio(path, spec, streams, rec, problems)
+
     want_subs = [s for s in spec.get("subs", []) if not s.get("sidecar")]
     rec["subtitles"] = [{"codec": s.get("codec_name"),
                          "language": (s.get("tags") or {}).get("language"),
@@ -2737,7 +2872,7 @@ BREW = {
 
 def shape_requirements(key, spec):
     encs = set()
-    encs.add({"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}[spec["video"]["codec"]])
+    encs.add({"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1", "vp9": "libvpx-vp9"}[spec["video"]["codec"]])
     for a in spec.get("audio", []):
         encs.add(AENC[a["codec"]][0])
     return sorted(encs), list(spec.get("tools", []))

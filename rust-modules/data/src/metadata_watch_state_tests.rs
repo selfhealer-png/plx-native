@@ -121,7 +121,8 @@ fn an_optimistic_watch_flip_reaches_the_item_its_episodes_and_the_season_tabs_co
                 resume_ms: 60_000,
                 ..Default::default()
             },
-        ],
+        ]
+        .into(),
         ..Default::default()
     }));
 
@@ -130,9 +131,10 @@ fn an_optimistic_watch_flip_reaches_the_item_its_episodes_and_the_season_tabs_co
         "an episode of the loaded season"
     );
     let d = current(test_state()).unwrap();
-    assert!(d.episodes[1].watched);
+    let e2 = d.episodes.get(1).expect("the season has two episodes");
+    assert!(e2.watched);
     assert_eq!(
-        d.episodes[1].resume_ms, 0,
+        e2.resume_ms, 0,
         "…and its still stops drawing a resume bar"
     );
     assert!(!d.watched, "marking one episode does not finish the show");
@@ -210,7 +212,8 @@ fn an_optimistic_watch_flip_reaches_the_related_shelf_the_menu_was_opened_on() {
         episodes: vec![Episode {
             rk: "e1".into(),
             ..Default::default()
-        }],
+        }]
+        .into(),
         related: vec![rel(SRV_A, "r0"), rel(SRV_A, "r1")],
         ..Default::default()
     }));
@@ -232,7 +235,7 @@ fn an_optimistic_watch_flip_reaches_the_related_shelf_the_menu_was_opened_on() {
     );
     assert!(d.related[0].resume_frac().is_some(), "no other tile moved");
     assert!(!d.watched, "the page's own item is not what was pressed");
-    assert!(!d.episodes[0].watched, "…nor is any episode of it");
+    assert!(!d.episodes.get(0).expect("the show has one episode").watched, "…nor is any episode of it");
 
     // the way back, from the second row a part-watched tile offers
     assert!(set_watched_local(test_state(), SRV_A, "r1", false));
@@ -332,6 +335,41 @@ fn the_playing_item_cache_hits_only_for_the_same_item_on_the_same_server() {
         cached_playing(test_state(), SRV_A, "42").is_none(),
         "no streams loaded yet — go and fetch"
     );
+    clear(test_state(), test_adapter());
+}
+
+/// `PlayingItem.kind` is the played item's own Plex type, read from the same wire `type` the
+/// detail page reads. The three kinds the player meets (episode, movie, track) must each survive
+/// the conversion from the server's item, and an absent item has no type.
+#[test]
+fn the_playing_item_carries_its_plex_type() {
+    for wire in ["episode", "movie", "track"] {
+        let it: plx_plex::plex::Metadata =
+            serde_json::from_value(serde_json::json!({ "type": wire })).unwrap();
+        let item = playing_item_from(SRV_A, "42", Some(&it));
+        assert_eq!(item.kind, wire, "the played item's own type");
+    }
+    assert_eq!(
+        playing_item_from(SRV_A, "42", None).kind,
+        "",
+        "an item the server did not return has no type"
+    );
+}
+
+/// The cache hit must hand back the same `kind` the page loaded, so a play from a detail page
+/// that skips the PMS fetch still knows what it is playing.
+#[test]
+fn the_playing_item_cache_round_trips_the_kind() {
+    let _serial = plx_base::testlock::serial();
+    set_current_for_test(test_state(), Some(Detail {
+        sid: SRV_A,
+        rk: "42".into(),
+        kind: "episode".into(),
+        audio: vec![Stream { id: 7, ..Default::default() }],
+        ..Default::default()
+    }));
+    let hit = cached_playing(test_state(), SRV_A, "42").expect("the loaded page IS this item");
+    assert_eq!(hit.kind, "episode", "the cache carries the page's own type");
     clear(test_state(), test_adapter());
 }
 

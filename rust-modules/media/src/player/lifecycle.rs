@@ -747,6 +747,8 @@ pub fn drive_foreground<A: ForegroundActuator>(
     input: ForegroundInput,
     actuator: &mut A,
 ) -> ForegroundActivation {
+    // The restoring Load's window create is a step of the foreground cycle (`window::CycleScope`).
+    let _cycle = plx_telemetry::telemetry::window::CycleScope::enter();
     let effect = match lifecycle.claim(input) {
         ForegroundClaimResult::Ordinary => return ForegroundActivation::Ordinary,
         ForegroundClaimResult::Suppressed => return ForegroundActivation::Handled,
@@ -764,15 +766,18 @@ fn run_foreground_effects<A: ForegroundActuator>(
     let mut launched = false;
     while let Some(next) = effect.take() {
         effect = match next {
-            ForegroundEffect::Prepare { id, resume_ns } => match actuator.prepare_resume(ps, resume_ns) {
-                crate::player::ResumeStart::Settled(outcome) => {
-                    lifecycle.finish_prepare(id, matches!(outcome, crate::player::ResumeOutcome::Prepared))
+            ForegroundEffect::Prepare { id, resume_ns } => {
+                // The restore reopens the engine at the parked position: that open is a resume.
+                crate::player::report::note_attempt(crate::player::report::AttemptOrigin::Resume);
+                match actuator.prepare_resume(ps, resume_ns) {
+                    crate::player::ResumeStart::Settled(outcome) => lifecycle
+                        .finish_prepare(id, matches!(outcome, crate::player::ResumeOutcome::Prepared)),
+                    crate::player::ResumeStart::Pending => {
+                        let _ = lifecycle.finish_prepare_pending(id);
+                        None
+                    }
                 }
-                crate::player::ResumeStart::Pending => {
-                    let _ = lifecycle.finish_prepare_pending(id);
-                    None
-                }
-            },
+            }
             ForegroundEffect::Load {
                 id,
                 resume_ns,
@@ -838,6 +843,9 @@ pub fn poll_foreground_flight<A: ForegroundActuator>(
     ps: &mut crate::route::PlaybackSession,
     actuator: &mut A,
 ) -> ForegroundActivation {
+    // A restore whose Load waited for a flight starts it here, frames after `foreground_done`;
+    // its exported-window create is still the foreground cycle's.
+    let _cycle = plx_telemetry::telemetry::window::CycleScope::enter();
     match lifecycle.state {
         ForegroundState::PreparePending { .. } => match actuator.land_prepare(ps) {
             FlightLanding::Waiting => ForegroundActivation::Handled,

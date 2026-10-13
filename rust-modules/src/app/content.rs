@@ -850,13 +850,14 @@ fn library_requests(app: &mut App, now: u32) {
                 bridge::open_item_menu(&mut app.pages, arg);
                 app.ok_armed = false;
             }
-            LibraryReq::Detail { sid, ref rk } | LibraryReq::Play { sid, ref rk, .. } => {
+            LibraryReq::Detail { sid, ref rk, .. } | LibraryReq::Play { sid, ref rk, .. } => {
                 let Some((mut item, _)) = app.bridge.library_selection(&app.pages, entry, ret.focus) else { continue };
                 if item.sid != sid || &item.rk != rk { continue; }
                 let play = matches!(request, LibraryReq::Play { .. });
+                let from_deck = matches!(request, LibraryReq::Detail { from_deck: true, .. });
                 if let LibraryReq::Play { resume_ns, .. } = request { item.resume_ms = resume_ns / 1_000_000; }
-                unsafe { activate_card(&mut app.player.session, &mut app.adapters.player, &item, play, HUD_LINGER_MS,
-                    Some(ret), &mut app.pages, &mut app.bridge, &mut app.menu_play_await, now); }
+                unsafe { activate_deck_card(&mut app.player.session, &mut app.adapters.player, &item, from_deck, play,
+                    HUD_LINGER_MS, Some(ret), &mut app.pages, &mut app.bridge, &mut app.menu_play_await, now); }
             }
         }
     }
@@ -1056,7 +1057,7 @@ mod library_publication_tests {
                 season: 2,
                 title: "Episode A".into(),
                 ..Default::default()
-            }],
+            }].into(),
             ..Default::default()
         }
     }
@@ -1492,7 +1493,7 @@ mod library_publication_tests {
             };
             if show {
                 d = detail_with_episode(sid, x_rk, "X", false);
-                d.episodes[0].title = "Pilot".into();
+                d.episodes.edit("episode-a", |e| e.title = "Pilot".into());
             }
             d
         };
@@ -2301,8 +2302,10 @@ fn activate_home_item(app: &mut App, source: MachineId, entry: EntryId,
     // above it to spend — `Trail::reset()` stood here and was a no-op in the only case that could
     // reach it (see `apply_item_action`'s note on `from_home`).
     let _ = (source, entry);
-    unsafe { activate_card(&mut app.player.session, &mut app.adapters.player, &item, resume_ns.is_some(), HUD_LINGER_MS,
-        Some(ret), &mut app.pages, &mut app.bridge, &mut app.menu_play_await, now); }
+    let from_deck = home_menu_from_deck(&ret);
+    unsafe { activate_deck_card(&mut app.player.session, &mut app.adapters.player, &item, from_deck,
+        resume_ns.is_some(), HUD_LINGER_MS, Some(ret), &mut app.pages, &mut app.bridge,
+        &mut app.menu_play_await, now); }
 }
 
 // (`cancel_content_navigation` and `freeze_request` stood here. The first re-checked the queued
@@ -2334,6 +2337,13 @@ pub(crate) fn restore_played_entry(app: &mut App) {
         .and_then(|_| meta.now_playing())
         .filter(|n| n.is_episode && n.detail_rk == *rk)
         .map(|n| { spot.season = Some(n.season); plx_media::route::cur_rk(&app.player.session) });
+    // The page still holds the resume point it fetched when it opened, and its Play reads that
+    // copy; the session that just ended moved it on the server. Re-read once the stop has landed.
+    app.refresh_detail = Some(plx_data::stores::viewstate::DetailRefresh {
+        sid: *sid,
+        rk: rk.clone(),
+        keep: episode.clone().filter(|rk| !rk.is_empty()),
+    });
     if episode.is_some() {
         app.pages.emit(MachineId::Nav, Fx::Deliver(MachineId::Instance(instance),
             Delivery::Screen(ScreenEvent::App(AppMsg::DetailRestore {
@@ -2341,6 +2351,27 @@ pub(crate) fn restore_played_entry(app: &mut App) {
                 episode,
                 refresh: plx_screens::registry::DetailRefreshPhase::None,
             }))));
+    }
+}
+
+/// Re-read the Detail page a playback returned to, once the stop report has landed.
+///
+/// A Detail page plays from the `viewOffset` it fetched when it opened, and a return from the
+/// player is a restored enter, which reuses that copy (issue #575: the second Play after a stop
+/// started from the first one's position, or from 0:00). The server is the only one that knows
+/// what the stop committed (it ignores a short position, and a position past the watched
+/// threshold counts as a viewing instead), so the page asks it, through the same reconciliation a
+/// watched toggle uses ([`refresh_content`]) - after the stop has been POSTed, or the read would
+/// race the write it is meant to see.
+pub(crate) fn refresh_after_playback(app: &mut App) {
+    if app.refresh_detail.is_none()
+        || bridge::player(&app.pages).is_some()
+        || !plx_media::route::scrobble_settled()
+    {
+        return;
+    }
+    if let Some(target) = app.refresh_detail.take() {
+        refresh_content(&mut app.pages, &mut app.bridge, target);
     }
 }
 

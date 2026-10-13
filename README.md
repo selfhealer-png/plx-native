@@ -6,6 +6,8 @@ page — the interface is drawn straight on the GPU at 60 fps, and video plays o
 **Website: [plxnative.com](https://plxnative.com/)** · [Install guide](https://plxnative.com/install/) ·
 [Troubleshooting](https://plxnative.com/troubleshooting/)
 
+<a href="https://trendshift.io/repositories/244171?utm_source=repository-badge&utm_medium=badge&utm_campaign=badge-repository-244171" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/244171" alt="GLinnik21/plx-native | Trendshift" width="250" height="55"/></a>
+
 *In daily use on a 2019 LG set. PlxNative is an independent project and is not affiliated with Plex, Inc.
 or LG. The same install steps are in the repo: [installation guide](docs/install-and-verify.md).*
 
@@ -54,17 +56,20 @@ itself. (In this capture the frame under it was decoded by the simulator.)
 - **Sign in on the TV** with an on-screen QR code and pick a Plex Home profile.
 - **Browse and search your libraries** — on your own servers and on ones shared with you. Your
   servers' libraries, that is, not Plex's catalogue or Watchlist.
-- **Direct play** H.264 and HEVC — 4K, 10-bit, Dolby Vision profiles 5 and 8, E-AC-3 Atmos —
-  decided against your television's own codec table where it publishes one. Anything else the
-  server transcodes, and you can switch a playback to Auto to follow a link whose speed changes.
+- **Direct play** H.264 and HEVC — 4K, 10-bit, Dolby Vision profiles 5 and 8, E-AC-3 Atmos, and AV1 or VP9 (10-bit VP9 only on webOS 4 sets)
+  on televisions whose codec table lists that decoder — decided against your television's own
+  codec table where it publishes one. Anything else the server transcodes, and you can switch a
+  playback to Auto to follow a link whose speed changes.
 - **Everything you expect while watching**: resume, seek and scrub, chapters, audio and subtitle
   tracks (including image subtitles), Skip Intro, Skip Credits, Up Next with auto-advance, and
   progress reported back to your server.
 
 ## Will it work on my television?
 
-**It needs webOS 4.0 or newer**; older firmware won't start — you'd get a tile that does nothing.
-Past that, it most likely will. I develop and test on a 2019 set, and opt-in usage reports show
+**It needs webOS 4.0 or newer**, with one tested exception: a 2016 set on **webOS 3.4.3** signs
+in, browses, searches and plays (direct play, transcodes, subtitles and seeking) through Developer
+Mode. Other 3.x releases are untested, and anything older than 3.4 is unknown. Past that, it most
+likely will. I develop and test on a 2019 set, and opt-in usage reports show
 video playing on sets from 2018 through the newest, on webOS 11 — both direct play and server
 transcodes, Developer Mode installs included.
 
@@ -74,6 +79,7 @@ transcodes, Developer Mode installs included.
 |---|---|
 | **Some 2019 sets on LG's k5lp or k3lp chip**, installed through Developer Mode | Video won't play. On these sets LG's Developer Mode sandbox can withhold a device the video path needs — Kodi and Moonlight hit the same wall. The app checks for it and says so instead of crashing; other sets on the same chip play normally. On a rooted TV with Homebrew Channel, the failure screen offers **Repair**, which applies the Homebrew Channel fix to the sandbox (one owner fixed it this way from a root shell; the button itself hasn't been run on an affected set yet). Without root there is no fix. |
 | **2018 sets on firmware that reports platform release 3.9.3** | Sign-in and browsing work, but video has never been seen to start on one, and no error is reported either: [#249](https://github.com/GLinnik21/plx-native/issues/249). |
+| **webOS 3.x** | Seeking restarts the stream at the new position instead of jumping in place, so each seek takes a moment longer. In-place seek depends on the internal layout of LG's 4.x media player, and on 3.4 that layout differs. |
 | **Sets on LG's k6hp chip** | A crash seen in opt-in crash reports and not reproduced here, because I have no such set: [#174](https://github.com/GLinnik21/plx-native/issues/174). |
 
 ### Rooted or not

@@ -5,8 +5,8 @@ This page is about what to do when something doesn't work.
 
 ## The app tile does nothing
 
-PlxNative needs **webOS 4.0 or newer** — older firmware can't start it at all, so the tile just
-does nothing when you select it. See [Will it work on my
+PlxNative needs **webOS 4.0 or newer** (webOS 3.4.3 has also been tested and works). Older
+firmware may not be able to start it at all, so the tile just does nothing when you select it. See [Will it work on my
 television?](../README.md#will-it-work-on-my-television) for the full picture, including sets
 that start but hit a specific known problem.
 
@@ -183,6 +183,30 @@ crash report, and also a short report when playback reaches the failure screen: 
 and coarse connection and quality details, with no title, address or token. It does not send these
 log files, and it does not replace an issue with your TV details. Turning it on is your choice and
 never needed to get help.
+
+## AV1 and VP9 files don't play
+
+PlxNative direct plays AV1 only on a television whose own codec table lists an AV1 decoder, and
+VP9 only on one whose table lists a VP9 decoder, and 10-bit (Profile 2) VP9, HDR10 included, only on a
+webOS 4 television, the one family it has been measured on. On any other set, or for a 10-bit VP9 file
+on a newer webOS, the server has to convert the item, which fails when your server can't transcode or
+transcoding is switched off.
+
+AV1 and VP9 direct play are new. An owner of an LG OLED A2 (webOS 10.3.1) reported AV1 playing, with no log
+to read it from; VP9 has been played on the dev set: 8-bit and 10-bit SDR files, and a PQ-tagged file whose HDR
+the television picked up (webOS 4 family only). That is a handful of models. Both reach
+people through the [nightly build](nightly-builds.md) first. If your TV
+decodes AV1 or VP9 and you want to try it:
+
+1. Install **PlxNative Nightly** by adding `https://plxnative.com/nightly/repo.json` to Homebrew
+   Channel, as the [nightly builds guide](nightly-builds.md) describes. The newest build is always
+   linked from [plxnative.com/nightly/latest.json](https://plxnative.com/nightly/latest.json).
+2. Play the AV1 or VP9 item.
+3. If it still doesn't play, [collect the event log](#collecting-logs) before you reopen the app
+   and attach it to a [GitHub issue](https://github.com/GLinnik21/plx-native/issues/new/choose).
+   The log's `devcaps:` line says `av1=true` (or `vp9=true`) when the TV reports that decoder, and
+   `av1=false` (`vp9=false`) when it doesn't, which tells us right away whether the TV or the app is
+   at fault.
 
 ## Other playback failures
 

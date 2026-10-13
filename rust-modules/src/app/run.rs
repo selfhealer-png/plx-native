@@ -272,6 +272,7 @@ pub(crate) unsafe fn run(app: &mut App) {
         // dithers on every frame.)
         fr.underlay_moving |= tree_report.underlay_moving;
         if was_player && super::bridge::player(&app.pages).is_none() { restore_played_entry(app); }
+        refresh_after_playback(app);
         content_requests(app, fr);
         crate::dev::scenarios::advance_content_boot(app, fr);
         loop_requests(app);
@@ -279,7 +280,9 @@ pub(crate) unsafe fn run(app: &mut App) {
         update(app, fr);
         app.rec.content_results();
         app.instr.mark(plx_base::diag::heartbeat::Phase::TickDrain); // tick_drain
+        plx_platform::tv::window::frame_probe_prepare_begin();
         prepare_window(app, fr);
+        plx_platform::tv::window::frame_probe_prepare_end();
         present_and_swap(
             app,
             fr,
@@ -729,6 +732,22 @@ fn ingest_text(app: &mut App, text: &str, panel: bool, source: plx_machine::mach
     plx_machine::idle::invalidate();
 }
 
+/// Revoke the borrowed SDL window handles on background. `release` answers whether a surface was
+/// held; only a real release is a crash-report step, since WILL and DID background both arrive.
+fn release_borrowed_window(release: impl FnOnce() -> bool) {
+    if release() {
+        window_step(plx_telemetry::telemetry::window::Stage::WaylandReleased, None);
+    }
+}
+
+/// One closed lifecycle step on a native crash event (`window::Stage`): consent-gated and a no-op
+/// while the crash backend is off. `playing` is the same flag the WILL/DID edges carry.
+fn window_step(stage: plx_telemetry::telemetry::window::Stage, playing: Option<bool>) {
+    plx_telemetry::telemetry::window::record(
+        plx_telemetry::telemetry::window::Observation::step(stage, playing),
+    );
+}
+
 /// One polled event. Shared by ordinary polling and ordered FIFO/replay ingestion.
 unsafe fn ingest_sdl_event(app: &mut App, fr: &mut Frame) {
     ingest_sdl_event_with_window(app, fr, plx_platform::tv::window::grab);
@@ -740,7 +759,8 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
     restore_window: impl FnOnce(*mut c_void)) {
     let et = rd_u32(&app.ev, 0);
     app.window_activity.event(et);
-    plx_telemetry::telemetry::window::lifecycle(et, matches!(app.route(), AppArg::Player));
+    let playing = matches!(app.route(), AppArg::Player);
+    plx_telemetry::telemetry::window::lifecycle(et, playing);
     if controlled_replay(app) {
         // The tape owns logical ingress; real SDL startup notifications must not be
         // counted a second time. The real compositor still owns window safety.
@@ -847,7 +867,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         super::bridge::background(&mut app.pages);
         // Revoke our borrowed SDL proxies before another frame can use them while backgrounded.
         // SDL owns their lifetime; foreground must query its current window again.
-        plx_platform::tv::window::release();
+        release_borrowed_window(plx_platform::tv::window::release);
         // A trailer preview is not parked: the OS taking the screen ends it, like any other way
         // off its page (`content::halt_preview_off_its_page`). A Load that has not returned is
         // left Abandoning, and a preview session is never parked for the foreground reload —
@@ -907,6 +927,11 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             // now, so destroying entries destroys the way back. See
             // `an_app_switch_parks_the_page_stack_and_gives_the_same_entries_back`.
         }
+        // The DID edge finished its work (the WILL edge is only the notice): a crash after this
+        // crumb is not inside the background arm.
+        if et == 0x104 {
+            window_step(plx_telemetry::telemetry::window::Stage::BackgroundDone, Some(playing));
+        }
     } else if et == 0x105 || et == 0x106 {
         // WILL/DID ENTER FOREGROUND
         log(&format!(
@@ -939,6 +964,7 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
             if matches!(activation, ForegroundActivation::Launched) {
                 finish_foreground_launch(app);
             }
+            window_step(plx_telemetry::telemetry::window::Stage::ForegroundDone, Some(playing));
         }
     } else if et == SDL_KEYDOWN || et == SDL_KEYUP {
         let (state, wcode, sym) = decode_key(&app.ev);
@@ -2466,6 +2492,9 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                             app.diagnostics.draw();
                         }
                     } else {
+                        // dev (`/tmp/plxnative-framecb`): the page's first clear is this route's
+                        // first framebuffer command, so `gfx` brackets the back-buffer wait there.
+                        plx_gfx::gfx::arm_clear_probe();
                         // Open the shared popover frame FIRST: it takes this frame's page damage
                         // and decides whether the frozen-host snapshot still describes the page. Route-agnostic by construction —
                         // see `ui::popover::host::begin_frame`.
@@ -2505,12 +2534,17 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                             plx_base::diag::spans::span("disc", || page(Z::ALL));
                         }
                         sources.borrow_mut().resolve();
+                        // `plxnative-framedrop` armed: which recorded draw invalidated a source.
+                        // Empty (no allocation, no work) unarmed.
+                        for line in sources.borrow_mut().take_diffs() {
+                            log(&line);
+                        }
                         let jobs = sources.borrow().jobs();
                         // Independent bands replay only the strict prefix below their ceiling.
                         // A band intersecting lower glass captures that composite in visible order.
                         for (ceiling, rect) in jobs {
                             let _source_walk = plx_ui::frame::backdrop::enter(sources.clone(), ceiling);
-                            let reg = plx_gfx::gfx::blur_region(rect.x, rect.y, rect.w, rect.h);
+                            let reg = plx_gfx::gfx::blur_region_for(plx_ui::frame::backdrop::rises(ceiling), rect.x, rect.y, rect.w, rect.h);
                             // `src`: one blur source job, its replay of the page prefix included.
                             plx_base::diag::spans::span("src", || {
                                 if plx_gfx::gfx::blur_snapshot_direct(reg, &mut || page(ceiling)) {
@@ -2752,6 +2786,9 @@ pub(crate) unsafe fn report(app: &mut App, fr: &mut Frame) {
                 app.running = false;
             }
         }
+        // `plxnative-focusx`: the card read-out belongs to the frame just sampled.
+        #[cfg(feature = "devtriggers")]
+        plx_ui::card_probe::clear();
         // `coldopen screen=<name> ms=<n> prepared=<bool>` — one line per screen MOUNT, on every
         // build, no trigger (spec §8.4). The dispatcher owns both ends of the measurement (the
         // mount at nav commit, the first prepared+drawn frame); this drains what it closed.
@@ -3125,6 +3162,7 @@ mod lifecycle_regression_tests {
             menu_play_await: Default::default(),
             prev: Default::default(),
             refresh_hubs_at: Default::default(),
+            refresh_detail: None,
             plaintext_upgrade: Default::default(),
             ev: [0; 128],
             remote: Default::default(),
@@ -3251,6 +3289,66 @@ mod lifecycle_regression_tests {
         unsafe {
             ingest_sdl_event(app, fr);
         }
+    }
+
+    /// Crash-report consent for the test's duration, so `window::record` reaches its test capture;
+    /// the previous answer comes back on drop.
+    struct CrashReports(Option<plx_telemetry::telemetry::consent::Consent>);
+
+    impl CrashReports {
+        fn granted() -> Self {
+            use plx_telemetry::telemetry::consent::{self, Consent};
+            let previous = consent::current();
+            let mut granted = Consent::default();
+            granted.errors = true;
+            granted.asked_version = consent::POLICY_VERSION;
+            consent::install(granted);
+            plx_telemetry::telemetry::window::take_recorded_for_test();
+            Self(previous)
+        }
+    }
+
+    impl Drop for CrashReports {
+        fn drop(&mut self) {
+            plx_telemetry::telemetry::consent::install(self.0.take().unwrap_or_default());
+            plx_telemetry::telemetry::window::take_recorded_for_test();
+        }
+    }
+
+    /// S12a: one WILL/DID background and foreground cycle leaves exactly these closed steps, in
+    /// this order. `*_done` close the DID edges only (the WILL edge has not finished the step), and
+    /// the rig holds no Wayland surface, so no `wayland_released` appears.
+    #[test]
+    fn background_cycle_records_closed_steps_in_order() {
+        let _serial = plx_base::testlock::serial();
+        let _consent = CrashReports::granted();
+        let mut app = app();
+        let mut fr = Frame::begin(&app.player.session, app.bridge.metadata_view());
+        for et in [0x103, 0x104, 0x105, 0x106] {
+            event(&mut app, &mut fr, et);
+        }
+        assert_eq!(
+            plx_telemetry::telemetry::window::take_recorded_for_test(),
+            [
+                "will_background",
+                "did_background",
+                "background_done",
+                "will_foreground",
+                "did_foreground",
+                "foreground_done",
+            ],
+        );
+    }
+
+    /// `wayland_released` is a step only when a borrowed surface was actually released (the second
+    /// of WILL + DID background finds none), so a reader can tell "released" from "nothing held".
+    #[test]
+    fn wayland_release_is_a_step_only_when_a_surface_was_held() {
+        let _serial = plx_base::testlock::serial();
+        let _consent = CrashReports::granted();
+        release_borrowed_window(|| true);
+        release_borrowed_window(|| false);
+        assert_eq!(plx_telemetry::telemetry::window::take_recorded_for_test(), ["wayland_released"]);
     }
 
     #[test]
@@ -3843,6 +3941,78 @@ mod lifecycle_regression_tests {
         }
     }
 
+    /// **The GL-while-backgrounded audit (S12a), as far as a host can run it.** One iteration of
+    /// `run`'s loop from the playback tick to the end of `present_and_swap`, the way `step` runs
+    /// its first half, and then the two phases `step` leaves out. With the gate closed
+    /// (`fr.present == false`) `present_and_swap` takes only its `else` branch, so this is the
+    /// whole frame the loop runs between WILL background and DID foreground.
+    fn backgrounded_iteration(app: &mut App, t: &mut u32) -> bool {
+        *t += 16;
+        let mut fr = Frame::begin(&app.player.session, app.bridge.metadata_view());
+        fr.now = *t;
+        fr.dt = 0.016;
+        let was_player = super::super::bridge::player(&app.pages).is_some();
+        unsafe { playback_tick(app, &mut fr); }
+        super::super::bridge::frame(&mut app.pages, &mut app.bridge,
+            plx_machine::machine::Tick { ms: *t, dt_us: 16_000 }, std::mem::take(&mut app.inputs));
+        if was_player && super::super::bridge::player(&app.pages).is_none() {
+            restore_played_entry(app);
+        }
+        content_requests(app, &fr);
+        loop_requests(app);
+        unsafe {
+            update(app, &mut fr);
+            prepare_window(app, &mut fr);
+            if !fr.present {
+                present_and_swap(
+                    app,
+                    &mut fr,
+                    #[cfg(all(feature = "hostsim", target_os = "linux"))]
+                    None,
+                );
+            }
+        }
+        fr.present
+    }
+
+    /// Is a texture specified or deleted (through `gfx::tex_ledger`, which every `upload_rgba` and
+    /// `delete_tex` goes through) anywhere between WILL background and DID foreground, on the frames
+    /// the loop runs while the player page is mounted? The meter is proved live first: a delete
+    /// moves it. Not covered, because they bypass the ledger: VAO/VBO/FBO creation and deletion, and
+    /// `glCopyTexSubImage2D` into existing textures (the snapshot, blur, field and ground-probe
+    /// captures), all of which sit under `if fr.present` or in `frame_end` calls that do.
+    #[test]
+    fn no_texture_work_between_background_and_did_foreground() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("SKIPPED no_texture_work_between_background_and_did_foreground: \
+                 lifecycle fixture worker thread could not be spawned");
+            return;
+        };
+        let before_probe = plx_gfx::gfx::tex_ledger::mutations();
+        plx_gfx::gfx::delete_tex(0xfeed);
+        assert_eq!(plx_gfx::gfx::tex_ledger::mutations(), before_probe + 1, "the meter is live");
+
+        let mut fr = rig.due_up_next();
+        assert!(super::super::bridge::player(&rig.app.pages).is_some(), "the player page is mounted");
+        let mut t = fr.now;
+        let start = plx_gfx::gfx::tex_ledger::mutations();
+        event(&mut rig.app, &mut fr, 0x103);
+        event(&mut rig.app, &mut fr, 0x104);
+        for i in 0..30 {
+            let presented = backgrounded_iteration(&mut rig.app, &mut t);
+            assert!(!presented, "iteration {i} presented while backgrounded");
+        }
+        assert_eq!(
+            plx_gfx::gfx::tex_ledger::mutations(), start,
+            "texture work between background and DID foreground"
+        );
+        event(&mut rig.app, &mut fr, 0x105);
+        assert!(!rig.app.window_activity.allow_present(true), "WILL foreground authorizes nothing");
+        event(&mut rig.app, &mut fr, 0x106);
+        assert!(rig.app.window_activity.allow_present(true), "DID foreground allows the next present");
+    }
+
     #[test]
     fn did_background_cancels_accepted_resolve_before_player_mount() {
         let _serial = plx_base::testlock::serial();
@@ -4138,6 +4308,7 @@ mod lifecycle_regression_tests {
         if was_player && super::super::bridge::player(&app.pages).is_none() {
             restore_played_entry(app);
         }
+        refresh_after_playback(app);
         content_requests(app, &fr);
         loop_requests(app);
         unsafe { update(app, &mut fr); }
@@ -4414,6 +4585,43 @@ mod lifecycle_regression_tests {
             rig.app.route().id(),
         );
         assert_eq!(rig.app.pages.nav.top_page().map(|e| e.id), Some(origin));
+    }
+
+    /// **Issue #575: a stop is not reflected in the page it returns to.** The Detail page keeps
+    /// the `viewOffset` it fetched when it opened, and Play reads its resume point from that copy,
+    /// so a second Play after a stop starts from where the FIRST one did (or from 0:00 when the
+    /// page opened on an item with no offset). The return must re-read the item once the stop
+    /// report has landed - the server is the only one that knows what it committed.
+    #[test]
+    fn back_from_the_player_rereads_the_page_so_play_resumes_where_the_stop_left_off() {
+        let _serial = plx_base::testlock::serial();
+        let Some(mut rig) = Rig::serving(false) else {
+            eprintln!("SKIPPED back_from_the_player_rereads_the_page_so_play_resumes_where_the_stop_left_off: \
+                lifecycle fixture worker thread could not be spawned");
+            return;
+        };
+        let mut t = product_transition(&mut rig.app);
+        settle(&mut rig.app, &mut t);
+        super::super::bridge::open_detail(&mut rig.app.pages, &mut rig.app.bridge, rig.sid, "1", None, None);
+        settle(&mut rig.app, &mut t);
+        play_with_a_landing_inside_the_dip(&mut rig, &mut t);
+        let reads_before = plx_data::metadata::detail_generation_for_test(rig.app.bridge.metadata_mut().adapter_ref());
+        let back = back_key(t + 16);
+        step(&mut rig.app, &mut t, vec![back]);
+        settle(&mut rig.app, &mut t);
+        assert!(super::super::bridge::player(&rig.app.pages).is_none(), "premise: BACK left the player");
+        // The re-read waits for the stop report, which a worker thread posts. These frames take no
+        // wall time, so counting them races that thread (a loaded host lost the race and the page
+        // had re-read nothing "yet"). Wait for the report itself, then give the loop the one frame
+        // in which `refresh_after_playback` finds it settled.
+        plx_media::route::drain_scrobble();
+        step(&mut rig.app, &mut t, vec![]);
+        let reads_after = plx_data::metadata::detail_generation_for_test(rig.app.bridge.metadata_mut().adapter_ref());
+        assert!(
+            reads_after > reads_before,
+            "returning to the page re-read nothing: its resume point is still the one it opened with",
+        );
+        assert!(rig.app.refresh_detail.is_none(), "the re-read is asked for once, not left owed");
     }
 
     /// The same session drained to its end with nothing queued after it: `finish_playback` leaves

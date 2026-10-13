@@ -191,7 +191,12 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   and `ci/test_ci_split.py` fails on a test file that no gate runs. Because steps overlap, a step
   must write only to a directory it made, bind port 0 and not touch the checkout
   (`ci/test_check_collisions.py` runs a mix of them together and scans for fixed ports); the manifest's
-  header lists the rules. CI runs the three cargo targets plus those two as five parallel jobs
+  header lists the rules. Two of those gates are registries rather than tests: `ci/check-plex-requests.py` makes every
+  request the plex layer can make say whether it pages, and `ci/check-list-caps.py` (registry `ci/list-caps.ini`) makes every
+  cap-shaped bound on a collection (`.take(N)`, `.truncate`, a length `.min(N)`, a `MAX`/`CAP`/`LIMIT` constant, a `[..N]` cut) say
+  whether it bounds work, previews a list that is reached some other way (the `route`), is a format limit, or is an open `reach` cap on
+  what the user can reach, which is the only class that is tracked rather than accepted; `--sites` lists every hit with its class.
+  CI runs the three cargo targets plus those two as five parallel jobs
   (`host-lint`, `host-unit-default`, `host-unit-hostsim`, `host-python`, `host-python-harness`) behind an aggregator named
   `host checks (NOT a device gate)`; `ci/test_ci_split.py` pins that no gate falls between them. The cargo half runs `cargo test --lib -p plxnative-modules -p plx_base -p plx_machine -p plx_platform -p plx_gfx -p plx_net -p plx_ui -p plx_plex -p plx_telemetry -p plx_data -p plx_session -p plx_media -p plx_appkit -p plx_screens`
   **twice: once on the default feature set and once with `--features hostsim`**, which is not a
@@ -624,6 +629,15 @@ the pinned Sentry Native cross-build), and `sshpass` (Homebrew; deploy/run use y
   exact binary/debug pair with source context; it requires `SENTRY_AUTH_TOKEN`. The release
   workflow treats a missing token, unusable DIF or failed upload as a release failure, because an
   accepted native event with no matching DIF is not a working crash report.
+  **`make symbols-libs`** does the same for the bundled shared objects (the FFmpeg libraries and
+  libass, which ship stripped): `pkg/symbols/<soname>.debug`, extracted from the unstripped link
+  output (`vendor/ffmpeg-prefix/lib/unstripped/`, `vendor/libass-prefix/lib/`). Their links carry
+  `-Wl,--build-id=sha1` too, and `ci/extract-so-symbols.sh` refuses a library without one, a
+  `.debug` whose id differs, or one with no `.symtab` function symbols; `ci/check-debug-files.py`
+  (used by `sentry-symbols` and the release workflow) then requires `sentry-cli debug-files check`
+  to report `debug` or `symtab` features on each file, because that command exits 0 for a
+  symbol-less object. `sentry-crash` is not uploaded: it never sends a report, so no event frame
+  lands in it. Independent of `SYMBOLS=1`.
 - `make ipk` — repackage the installable `pkg/<app id>_<version>_arm.ipk`. The version
   comes from `pkg/appinfo.json` (the single source; `ci/check-package.py` asserts the control
   file agrees), and the archive is **reproducible** — `ci/mkipk.py` normalises tar identity and
@@ -1113,7 +1127,7 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
 - `site/` — the landing page (`index.html`/`styles.css`/`site.js`/`CNAME`); `.github/workflows/
   pages.yml` stages its screenshots, logo and fonts from their existing README/app locations
   rather than copying them into `site/`. The close-up stills `site/media/closeup-*.jpg` and the
-  link-preview card `site/media/og-card.jpg` are `make screenshots` outputs (`ui-sim` skill,
+  link-preview card `site/media/og-card.jpg` are `make screenshots` outputs (the page shows `closeup-glass` and `closeup-tiles` in its Features look panels; phones crop the wide `closeup-glass` rather than use `closeup-glass-narrow`; `closeup-player` and the narrow glass cut are no longer referenced, though still rendered and staged; the page's four app screenshots are `docs/screenshots/{home,library,search,player}.jpg`, staged by `pages.yml`) (`ui-sim` skill,
   "Documentation screenshots"): the card is `site/og/card.html` (not deployed) rendered around
   the home figure by `tools/render-og-card.sh`; re-render after editing the card. Their WebP and
   phone (`-narrow`) copies come from those JPEGs through `tools/render-site-variants.py`, and the
@@ -1335,7 +1349,7 @@ every thin back-edge with `file:line` (the work list for breaking it up); `--dot
   inside `is_back`, in `consts.rs` itself, beside the constant and the comment explaining it).
   Preserve this raw-offset reading if you touch input.
 - **Starfish/ACB ABI + bind-order rules** (the C++-from-C mangled-symbol seam, `Load` with
-  `uid=NULL`, the exact ACB bind sequence, sourceInfo-verbatim, never feed audio to ACB, the
+  `uid=NULL`, the exact ACB bind sequence, sourceInfo-verbatim (one exception: PQ VP9 is rewritten to HDR10), never feed audio to ACB, the
   3-arg taskId ABI) — moved to **`rust-modules/media/src/player/CLAUDE.md`**; read it before touching
   playback or `src/starfish.c`.
 - **Wayland transparency** (`system.rs`)**:** the UI surface is forced to a 32-bit RGBA config and
@@ -1827,10 +1841,10 @@ resume, the `/:/timeline` reporter — which is also why it needs somebody's lib
 It needs a TV address and nothing else — no token, no ratingKey, no `manifest.local.json`, no
 sharing — so it is the only tier a stranger can run, and it is what separates "the player is
 broken" from "the library layer is broken" when a server case fails. **What it covers, precisely:**
-the player feeds `{h264,hevc}` × `{aac,ac3,eac3,dts}` in mkv/mp4/m4v. Auto intersects this
+the player feeds `{h264,hevc}` (plus `av1` / `vp9` on a set whose codec table lists that decoder's row) × `{aac,ac3,eac3,dts}` in mkv/mp4/m4v. Auto intersects this
 software set with the device table and per-codec channel ceilings; DTS requires a measured
 DTS row and feeds only the DTS core when an HD extension is present. The implemented Load
-strings are `H264`/`H265` and `AC3`/`AC3 PLUS`/`AAC`/`DTS`; these are not the firmware's whole
+strings are `H264`/`H265`/`AV1`/`VP9` (AV1 and VP9 only on a set whose table lists that decoder; elsewhere the Load is refused) and `AC3`/`AC3 PLUS`/`AAC`/`DTS`; these are not the firmware's whole
 vocabulary. The six AC3/EAC3/AAC combinations and H264/DTS are covered
 here, plus DV 8.1, both containers, in-place seek in each, and the FRAME-RATE axis added the same
 day (`pipe_h264_1080p5994` is the only fixture that reaches `fps_rational`'s 1001-denominator
@@ -1856,9 +1870,11 @@ gap — `devcaps` reads the table's `maxFrameRate` only into the per-codec rows 
 envelope clamps against (since 2026-09-03), so the profile sent to PMS still bounds no frame rate
 at all. Three things about it
 are worth knowing before reading a result. **(1)** The declaration is the interesting half and the
-main false-PASS risk: `engine`'s `_ =>` arm maps an unrecognised audio codec to `"AC3"` and a
-non-`hevc` video codec to the H264 payload, so a trigger that was never read produces exactly the
-right payload for the AC-3 baseline case — which is why the matrix carries cases expecting
+main false-PASS risk: `engine`'s `_ =>` arm maps an unrecognised AUDIO codec to `"AC3"`, but the video side no longer
+defaults: `LoadVideo::of_stream` is case-insensitive, `""` and `h264` are the only H264, `hevc`/`h265`, `av1` and `vp9` get their own
+payloads (`av1` and `vp9` only where the device's codec table lists the row, otherwise the Load is refused), and any other `vcodec` in a
+`playurl` declaration refuses the Load with a log line naming it. So a trigger that was never read (`""`) still produces exactly the right
+payload for the AC-3 baseline case — which is why the matrix carries cases expecting
 `"AC3 PLUS"` and `"AAC"`, and why the engine now logs one `load: v=… a=… fps=… dv=… atmos=…` line
 per streamed playback (the only place an event log says what the app told the television the stream
 WAS, as opposed to what the demuxer found in it). **(2)** `python3 -m http.server` is DISQUALIFIED

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::{Landing, LandingClient, SourceBuild};
 
-pub const SHAPE: &str = "HubsResultV1{gen:u32,seq:u32,sid:u16,client:Option<u32>,token_gen:u32,build:Option<{cw:[{last_viewed_at:i64,m:PmsMovie}],shelves:[{title:str,hub_id:str,key:str,items:[PmsMovie],total:u64}]}>};PmsMovie{sid:u16,sec:i64,title:str,year:i32,rating:str,dur_ns:i64,part:str,thumb:str,still:str,art:str,summary:str,rk:str,vcodec:str,acodec:str,blur:[[f32bits;3];4],has_blur:bool,kind:i32,resume_ms:i64,show_rk:str,season_index:i32,show_title:str,ep_index:i32,unwatched:bool,watched:bool,aired:str,child_count:i64}";
+pub const SHAPE: &str = "HubsResultV1{gen:u32,seq:u32,sid:u16,client:Option<u32>,token_gen:u32,build:Option<{cw:[{last_viewed_at:i64,m:PmsMovie}],shelves:[{title:str,hub_id:str,key:str,items:[PmsMovie],positions:[u64],total:u64,offset:u64,end:u64,more:bool}]}>};PmsMovie{sid:u16,sec:i64,title:str,year:i32,rating:str,dur_ns:i64,part:str,thumb:str,still:str,art:str,summary:str,rk:str,vcodec:str,acodec:str,blur:[[f32bits;3];4],has_blur:bool,kind:i32,resume_ms:i64,show_rk:str,season_index:i32,show_title:str,ep_index:i32,unwatched:bool,watched:bool,aired:str,child_count:i64}";
 
 pub fn encode(landing: &Landing) -> Value {
     let Landing { gen, seq, sid, client, token_gen, build } = landing;
@@ -76,9 +76,8 @@ pub(super) mod server_id {
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<plx_plex::plex::ServerId, D::Error> {
         let n = u16::deserialize(d)?;
-        if usize::from(n) >= plx_plex::plex::MAX_SERVERS && n != u16::MAX {
-            return Err(serde::de::Error::custom("invalid server slot"));
-        }
+        // No range check: the registry issues every `u16` except the reserved UNSET, which is
+        // itself a valid recorded value (`ServerId::UNSET` round-trips as `u16::MAX`).
         Ok(plx_plex::plex::ServerId::from_raw(n))
     }
 }
@@ -116,9 +115,10 @@ mod tests {
         };
         Landing { gen: 7, seq: 19, sid: m.sid, client: None, token_gen: 5,
             build: Some(SourceBuild {
-                cw: vec![CwItem { last_viewed_at: i64::MAX, m: Arc::new(m.clone()) }],
-                shelves: vec![Shelf { title: "Shelf".into(), hub_id: "provider.hub".into(),
-                    key: "/hub/key".into(), items: vec![Arc::new(m)], total: 0 }],
+                lane: Default::default(),
+                cw: vec![CwItem { last_viewed_at: i64::MAX, m: Arc::new(m.clone()), position: 0 }],
+                shelves: vec![Shelf { epoch: 0, positions: Vec::new(), title: "Shelf".into(), hub_id: "provider.hub".into(),
+                    key: "/hub/key".into(), items: vec![Arc::new(m)], total: 0, offset: 0, end: 0, more: false, shown: 0, row: Default::default() }],
             }) }
     }
 
@@ -148,11 +148,27 @@ mod tests {
             absent.as_object_mut().unwrap().remove(key);
             assert!(decode(absent, |_| None).is_err(), "missing {key} must not acquire a default");
         }
-        for (key, value) in [("version", json!(2)), ("sid", json!(100)), ("unexpected", json!(1))] {
+        // Every u16 is a slot number or the reserved UNSET, so a bad `sid` is a wrong TYPE, not a
+        // number past some ceiling.
+        for (key, value) in [("version", json!(2)), ("sid", json!("3")), ("unexpected", json!(1))] {
             let mut bad = failed.clone();
             bad[key] = value;
             assert!(decode(bad, |_| None).is_err());
         }
+    }
+
+    #[test]
+    fn a_server_id_past_the_old_sixteen_slot_table_round_trips() {
+        // Slot 40 is a server the registry issues once a household has signed out enough times;
+        // a recorded landing for it must decode, not be refused as an invalid slot.
+        let mut l = landing();
+        l.sid = plx_plex::plex::ServerId::from_raw(40);
+        l.build = None;
+        let encoded = encode(&l);
+        assert_eq!(encoded["sid"], json!(40));
+        let decoded = decode(encoded.clone(), |_| None).unwrap();
+        assert_eq!(decoded.sid.raw(), 40);
+        assert_eq!(encode(&decoded), encoded);
     }
 
     #[test]

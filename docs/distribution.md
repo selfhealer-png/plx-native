@@ -328,6 +328,9 @@ refinements the table understated:
   corrected 2026-08-05**: 3.9.2 *has* `libAcbAPI.so.1`. It fails on the FFmpeg SONAMEs (it ships
   55/55/52/2, not 57/57/55/4) and on `StarfishMediaAPIs::Feed`, which carries a pre-C++11
   `std::string` mangling there. Check either with `tools/fwcompat.py --release 3.9.2`.
+  **Update 2026-10-09:** both reasons are gone (bundled FFmpeg; `Feed` and
+  `SDL_webOSCursorVisibility` resolved at runtime), and a 3.4.3 set plays. The `>=4.0` catalogue
+  bound in `docs/webosbrew-package.yml` is unchanged pending wider 3.x testing.
 
 ### 3.3 The pinning inside our own code (`audit:portability`, file-cited)
 
@@ -662,7 +665,9 @@ world-readable `/tmp` on the TV across many runs.
   and the C-side
   `fprintf(elogf, …)` lines in `src/starfish.c` bypass the scrubber (they carry
   pointers, library paths, Starfish pipeline ids and Starfish JSON replies, no credential); the
-  crash log is a signal, a faulting PC, one `/proc/self/maps` line, the build id and panic text; the
+  crash log is a signal, a faulting PC, the crash's wall-clock second (a `time:` line, also written
+  under the panic text by the Rust hook), the `/proc/self/maps` lines holding the pc, the lr and
+  our own binary, the build id and panic text; the
   stderr log is whatever aborts, panics, GL info logs and the television's own libraries print,
   and **the stderr log does not go through `scrub_local`, nor do the C tracer's records in the
   crash log** (the panic text the Rust hook appends to it does, since the follow-up of the same day).
@@ -1868,7 +1873,7 @@ section closed anything at all.
 **Superseded: the UI is localized now.** When this section was written the UI was English-only,
 with ~203 display literals across 45 files and no string ownership story, and the native UI was
 locale-blind apart from a best-effort `X-Plex-Language` read from the POSIX locale environment.
-Both are gone. The app's own text comes from bundled catalogs (English, Spanish, Belarusian), the
+Both are gone. The app's own text comes from bundled catalogs (English, Spanish, French, Belarusian), the
 UI language resolves from a saved Settings → Language override, then the TV UI language reported
 by the native Settings Service, then the process locale, then English, and
 `plex::identity::language` now sends that resolved language as `X-Plex-Language`.

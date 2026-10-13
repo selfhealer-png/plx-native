@@ -677,13 +677,21 @@ fn land_recovery_flight(
 /// Settle a synchronous native reload effect.  A failed `start_bufferfeed` used to be only a log:
 /// callers had already advanced the route reducer and then returned, leaving no Engine to publish
 /// the failure and (for Original) an `OriginalTrial` which could never receive its first frame.
-fn settle_reload(outcome: super::engine::ReloadOutcome, operation: &str) -> bool {
+pub(super) fn settle_reload(outcome:super::engine::ReloadOutcome, operation: &str) -> bool {
     if outcome == super::engine::ReloadOutcome::Started {
         return true;
     }
     super::log(&format!(
         "route transition: {operation} failed synchronously ({outcome:?})",
     ));
+    // The reload's teardown parked a Load that had already passed its budget and cleared the
+    // session flags with the rest of that session's state, then the start was refused for the
+    // outstanding object. Without the cause the report says `unspecified`; the cause is the
+    // timeout, so publish it again beside the Error.
+    if outcome == super::engine::ReloadOutcome::StartFailed && SHARED.native_load_abandoned() {
+        SHARED.load_failed.store(true, Release);
+        SHARED.load_timed_out.store(true, Release);
+    }
     set_state(super::shared::PlaybackState::Error);
     false
 }
@@ -1577,6 +1585,7 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         eng.seek_retries = 0;
         eng.max_fed_video_pts = 0;
         eng.max_fed_audio_pts = 0;
+        eng.audio_start_fp = None;
         // Drop any AU held from BEFORE the seek (the per-lane BufferFull retry). drain_aq cleared the
         // QUEUES but not these pending AUs; feeding a stale pre-seek AU after the seek re-bases it to
         // the NEW pts_shift → a big A/V desync — the stale audio pts advances max_fed_audio_pts, then
@@ -1762,11 +1771,24 @@ pub fn pump(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         }
     }
 
-    // ---------- send the WHOLE sourceInfo envelope VERBATIM, once frames flow, then
+    // ---------- send the WHOLE sourceInfo envelope once frames flow (verbatim, except a
+    // container-PQ VP9 stream, see below), then
     // window + PLAYING (setMediaVideoData -> setDisplayWindow -> setState PLAYING) ----------
     if eng.stage == Stage::Bound && !eng.video_info_sent && SHARED.frames.load(Relaxed) >= 2 {
         let bytes = SHARED.source_info.lock().unwrap().clone();
-        if let Some(bytes) = bytes {
+        if let Some(mut bytes) = bytes {
+            // A VP9 stream's PQ lives in the container, which the pipeline never sees, so its own
+            // envelope says "hdrType":"none". Say HDR10 here when the demuxer found PQ (see
+            // `vp9_hdr`). `/tmp/plxnative-novp9hdr` sends the envelope as the pipeline made it.
+            let container_hdr = *SHARED.container_hdr.lock().unwrap();
+            if let Some(h) = container_hdr {
+                if !plx_base::devtrig::flag("novp9hdr") {
+                    if let Some(rewritten) = super::vp9_hdr::rewrite_source_info(&bytes, &h) {
+                        super::log(&super::vp9_hdr::log_line(&h));
+                        bytes = rewritten;
+                    }
+                }
+            }
             let rv = unsafe { super::sink().plane_send_video_data(mt, bytes.as_ptr() as *const c_char) };
             super::log(&format!(
                 "setMediaVideoData rv={rv} frames={}",
