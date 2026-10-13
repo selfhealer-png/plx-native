@@ -143,9 +143,9 @@ impl AccountClient {
     /// empty Watchlist. **Unmeasured on this codebase's own wire**: the first answer logs its row
     /// count and the key set of its first row, so a drifted shape is visible in one device log.
     pub fn watchlist(&self, size: usize) -> Option<Vec<WatchlistItem>> {
-        let url = format!(
-            "{DISCOVER}/library/sections/watchlist/all?includeCollections=0&includeExternalMedia=0\
-             &X-Plex-Container-Start=0&X-Plex-Container-Size={size}"
+        let url = super::paging::paged_path(
+            &format!("{DISCOVER}/library/sections/watchlist/all?includeCollections=0&includeExternalMedia=0"),
+            super::PageReq { start: 0, size },
         );
         let env: WatchlistEnvelope = self.get(&url)?;
         let Some(container) = env.media_container else {
