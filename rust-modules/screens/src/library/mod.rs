@@ -435,7 +435,7 @@ impl LibraryScreen {
                     let group = GroupId(self.keys.register(
                         LibraryIdentity::Control { section: section.clone(), kind: "shelf-group".into(), key: shelf.id.clone() },
                         GroupId(0), index));
-                    let elems = shelf.items.iter().enumerate().map(|(col, item)| {
+                    let mut elems: Vec<u32> = shelf.items.iter().enumerate().map(|(col, item)| {
                         let identity = if item.rk.is_empty() {
                             LibraryIdentity::ShelfSlot { section: section.clone(), hub: shelf.id.clone(), publication: self.query.unwrap_or(0), slot: col as u32 }
                         } else {
@@ -461,6 +461,13 @@ impl LibraryScreen {
                             let elem = self.keys.register(control("shelf-heading"), heading_group, 0);
                             (heading_group, elem)
                         });
+                    // A collection shelf ends in a MORE card that opens the whole collection, under
+                    // the key its linked heading held; the heading itself is plain text now, so DOWN
+                    // goes shelf to shelf. It takes the last slot of a full row.
+                    if let Some((_, elem)) = heading {
+                        elems.truncate(plx_data::pms::MAX_SHELF_ITEMS - 1);
+                        elems.push(elem);
+                    }
                     self.shelves.push(HubShelf { id: shelf.id.clone(), group, heading, elems, landscape: shelf.landscape, cards });
                 }
             }
@@ -573,7 +580,7 @@ impl LibraryScreen {
         let want = if let Some(index) = self.pair.detail.index_of(key.elem) {
             Some(self.target_layout.row_reveal(index / self.layout.cols()))
         } else if let Some(index) = self.shelves.iter().position(|row|
-            row.elems.contains(&key.elem) || row.heading_elem() == Some(key.elem)) {
+            row.elems.contains(&key.elem)) {
             Some(self.target_layout.shelf_reveal(&self.target_run, index))
         } else if matches!(key.elem, TYPE | SORT | FILTER) {
             Some(self.target_layout.grid_block_top().clamp(0.0, self.target_layout.max_scroll()))
@@ -722,7 +729,7 @@ impl LibraryScreen {
         }
         if region_of_elem(elem) == Some(KeyRegion::Rail) { self.follow(elem, fx); return Handled::Yes; }
         if let Some(index) = self.shelves.iter().position(|row| row.heading_elem() == Some(elem)) {
-            // OK on a linked heading opens the collection its shelf lists.
+            // OK on a collection shelf's MORE card opens the collection its shelf lists.
             let hubs = H::section_hubs(cx);
             if let Some(link) = hubs.shelves().get(index).and_then(|shelf| shelf.link.as_ref()) {
                 fx.push(Fx::App(AppFx::Content(crate::registry::ContentReq::Push(
@@ -1187,14 +1194,7 @@ impl<H: LibraryLike> Focusable<H> for LibraryScreen {
             out.push(row_group(LIBRARY_GROUP, self.libraries.len(), Rect::new(MARGIN_X, CONTENT_TOP - self.scroll.pos, layout::GRID_RIGHT - MARGIN_X, 52.0), ElemKind::Control));
         }
         for (index, row) in self.shelves.iter().enumerate() {
-            let mut shelf = row_group(row.group, row.elems.len(), Rect::new(MARGIN_X, self.target_layout.shelf_y(&self.target_run, index, self.scroll_target) + CARD_DY, SCR_W - 2.0 * MARGIN_X, row_style(row).h), ElemKind::Card);
-            if let Some((group, elem)) = row.heading {
-                if let Some(rect) = self.heading_rect(index, cx, At::SpringTarget) {
-                    out.push(plx_ui::linked_heading::group_spec(group, rect));
-                }
-                // DOWN from the heading returns to the card this shelf remembered.
-                shelf.seat = plx_ui::linked_heading::shelf_seat(&cx.focus, elem, row.group, shelf.seat);
-            }
+            let shelf = row_group(row.group, row.elems.len(), Rect::new(MARGIN_X, self.target_layout.shelf_y(&self.target_run, index, self.scroll_target) + CARD_DY, SCR_W - 2.0 * MARGIN_X, row_style(row).h), ElemKind::Card);
             out.push(shelf);
         }
         if self.layout.grid_head {
@@ -1216,7 +1216,6 @@ impl<H: LibraryLike> Focusable<H> for LibraryScreen {
         if let Some(answer) = self.plaintext_alert.group_of(*elem) { return answer; }
         if self.libraries.iter().any(|(key, _)| key == elem) { return Some(LIBRARY_GROUP); }
         if let Some(row) = self.shelves.iter().find(|row| row.elems.contains(elem)) { return Some(row.group); }
-        if let Some((group, _)) = self.shelves.iter().find_map(|row| row.heading.filter(|(_, e)| e == elem)) { return Some(group); }
         if self.layout.grid_head && self.toolbar_elems().contains(elem) { return Some(self.toolbar); }
         if self.readout == Readout::Failed && *elem == RETRY { return Some(STATUS_GROUP); }
         self.pair.group_of(elem, cx)
@@ -1242,8 +1241,6 @@ impl<H: LibraryLike> Focusable<H> for LibraryScreen {
             shelf.elems.iter().position(|key| key == elem).map(|col| (row, col))) {
             if at == At::Drawn { return self.shelf_placed(row, elem, cx); }
             self.shelf_rect_at(row, col, cx)
-        } else if let Some(index) = self.shelves.iter().position(|row| row.heading_elem() == Some(*elem)) {
-            self.heading_rect(index, cx, at)?
         } else if self.toolbar_elems().contains(elem) && self.layout.grid_head { self.toolbar_chip_rect(*elem, cx, at) }
         else if *elem == RETRY && self.readout == Readout::Failed { self.status_rect(cx)? }
         else { return None };
@@ -1284,8 +1281,7 @@ impl LibraryScreen {
             Some(group) if group == self.toolbar => self.toolbar_elems().to_vec(),
             Some(STATUS_GROUP) => vec![RETRY],
             Some(group) => self.shelves.iter().find_map(|row| {
-                if row.group == group { return Some(row.elems.clone()); }
-                row.heading.filter(|(heading, _)| *heading == group).map(|(_, elem)| vec![elem])
+                (row.group == group).then(|| row.elems.clone())
             }).unwrap_or_default(),
             None => Vec::new(),
         }
@@ -1327,17 +1323,6 @@ impl LibraryScreen {
         Some(plx_ui::linked_heading::LinkedHeading::heading(&shelf.title, "").total(shelf.total)
             .bounded(layout::GRID_RIGHT - MARGIN_X))
     }
-    /// The linked heading's face, cap top where an unlinked heading's would be.
-    fn heading_rect<H: LibraryLike>(&self, index: usize, cx: &Cx<'_, H>, at: At) -> Option<Rect> {
-        let heading = self.heading_widget(index, cx)?;
-        let row = &self.shelves[index];
-        let focused = cx.focus.current.is_some_and(|key| key.entry == self.entry && Some(key.elem) == row.heading_elem());
-        let y = match at {
-            At::Drawn => self.layout.shelf_y(&self.run, index, self.scroll.pos) - plx_ui::consts::TITLE_DY - row.cards.heading_lift(),
-            At::SpringTarget => self.target_layout.shelf_y(&self.target_run, index, self.scroll_target) - plx_ui::consts::TITLE_DY,
-        };
-        Some(heading.face_rect(MARGIN_X, y, f32::from(focused), &heading.measure(cx.measure)))
-    }
     fn library_rect<H: LibraryLike>(&self, index: usize, cx: &Cx<'_, H>) -> Rect {
         let y = CONTENT_TOP - self.scroll.pos - self.shelves.first().map_or(0.0, |row| row.cards.heading_lift());
         // Geometry always comes from the shared pill strip now: a singleton never reaches this
@@ -1348,9 +1333,11 @@ impl LibraryScreen {
     }
 }
 impl HubShelf {
+    /// The MORE card's key, on a collection shelf (the key its linked heading held).
     fn heading_elem(&self) -> Option<u32> { self.heading.map(|(_, elem)| elem) }
-    /// The group a door INTO this shelf from above lands in: its linked heading when it has one.
-    fn entry_group(&self) -> GroupId { self.heading.map_or(self.group, |(group, _)| group) }
+    /// The group a door INTO this shelf from above lands in: the shelf itself (its heading is
+    /// plain text, not a stop).
+    fn entry_group(&self) -> GroupId { self.group }
 }
 fn row_style(row: &HubShelf) -> &'static RowStyle { hub_style(row.landscape) }
 fn hub_style(landscape: bool) -> &'static RowStyle { if landscape { &RowStyle::EPISODE } else { &RowStyle::HOME } }
@@ -1393,10 +1380,7 @@ impl<H: LibraryLike> Screen<H> for LibraryScreen {
         // passes the floating strip. Geometric ranking must not skip an intervening block.
         let mut document = Vec::new();
         if !self.libraries.is_empty() { document.push(LIBRARY_GROUP); }
-        // A collection shelf's linked heading is its own block, directly above its cards: UP from
-        // any card reaches it, DOWN returns to the remembered card (`groups`' seat).
         for row in &self.shelves {
-            if let Some((heading, _)) = row.heading { document.push(heading); }
             document.push(row.group);
         }
         if self.layout.grid_head { document.push(self.toolbar); }

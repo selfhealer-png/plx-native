@@ -157,9 +157,8 @@ impl LibraryScreen {
                 if !shelf_on_screen(origin, self.layout.shelf_pitch(&self.run, index)) { continue; }
                 let heading_y = origin - plx_ui::consts::TITLE_DY - row.cards.heading_lift();
                 if let Some(heading) = self.heading_widget(index, f.cx) {
-                    let focused = f.focus.current.is_some_and(|key| key.entry == self.entry
-                        && Some(key.elem) == row.heading_elem());
-                    heading.draw(p, MARGIN_X, heading_y, f32::from(focused), &heading.measure(f.measure), f.measure);
+                    // Plain text at rest, always: the shelf's MORE card is what takes focus.
+                    heading.draw(p, MARGIN_X, heading_y, 0.0, &heading.measure(f.measure), f.measure);
                 } else {
                     ui_cards::draw_heading(p, &shelf.title, "", MARGIN_X,
                         heading_y, layout::GRID_RIGHT - MARGIN_X, f.measure);
@@ -227,11 +226,6 @@ impl LibraryScreen {
             if !shelf_on_screen(origin, self.layout.shelf_pitch(&self.run, index)) { continue; }
             let cx = f.cx;
             row.cards.record_stops(f, f.painter, &self.hub_src(index, cx), self.shelf_frame(index));
-            // After the row's cards, so the heading wins where a popped card's glow overlaps it.
-            if let (Some(elem), Some(heading), Some(rect)) = (row.heading_elem(),
-                self.heading_widget(index, f.cx), self.heading_rect(index, f.cx, At::Drawn)) {
-                heading.stop(f, rect, self.key(elem));
-            }
         }
         if self.layout.grid_head { for &elem in self.toolbar_elems() { self.stop(elem, f); } }
         if self.readout == Readout::Failed { self.stop(RETRY, f); }
@@ -290,7 +284,25 @@ pub(super) struct HubSrc<'a> {
 }
 
 impl HubSrc<'_> {
-    fn item(&self, i: usize) -> Option<&plx_data::pms::PmsMovie> { self.shelf?.items.get(i) }
+    fn item(&self, i: usize) -> Option<&plx_data::pms::PmsMovie> {
+        if self.is_more(i) { return None; }
+        self.shelf?.items.get(i)
+    }
+    /// Card `i` is a collection shelf's trailing MORE card (the last element of a linked shelf).
+    fn is_more(&self, i: usize) -> bool {
+        self.shelf.is_some_and(|shelf| shelf.link.is_some()) && i + 1 == self.elems.len()
+    }
+}
+
+/// The MORE card's face: the neutral collection tile under the shared MORE mark, with the
+/// collection's member count. Absence is drawn on `CARD_ABSENT` and never counted as loading.
+fn more_facts(total: usize) -> plx_ui::tile::TileFacts<'static> {
+    plx_ui::tile::TileFacts {
+        kind: plx_ui::tile::TileKind::Collection,
+        title: plx_platform::i18n::msg::browse_action_more(),
+        child_count: total as i64,
+        ..plx_ui::tile::TileFacts::default()
+    }
 }
 
 impl<H: Host<Elem = u32>> CardSource<H> for HubSrc<'_> {
@@ -298,8 +310,11 @@ impl<H: Host<Elem = u32>> CardSource<H> for HubSrc<'_> {
     fn elem(&self, i: usize) -> u32 { self.elems.get(i).copied().unwrap_or(0) }
     fn index_of(&self, e: &u32) -> Option<usize> { self.elems.iter().position(|elem| elem == e) }
     /// A card whose item the hub has not published draws nothing (its stop still registers).
-    fn loaded(&self, i: usize) -> bool { self.item(i).is_some() }
+    fn loaded(&self, i: usize) -> bool { self.is_more(i) || self.item(i).is_some() }
     fn art(&self, i: usize) -> Art<'_> {
+        if self.is_more(i) {
+            return Art::Poster(Some(more_facts(self.shelf.map_or(0, |shelf| shelf.total))));
+        }
         match (self.item(i), self.shelf) {
             (Some(item), Some(shelf)) if shelf.landscape => Art::Still(Some(tile_facts::of(item))),
             (Some(item), _) => Art::Poster(Some(tile_facts::of(item))),
@@ -307,6 +322,7 @@ impl<H: Host<Elem = u32>> CardSource<H> for HubSrc<'_> {
         }
     }
     fn label(&self, i: usize) -> ui_cards::TileLabel {
+        if self.is_more(i) { return ui_cards::TileLabel::title(""); }
         self.shelf.map_or_else(|| ui_cards::TileLabel::title(""), |shelf| shelf_label(shelf, i))
     }
     fn progress(&self, i: usize) -> Option<f32> {
