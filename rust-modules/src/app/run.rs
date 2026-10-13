@@ -1046,6 +1046,16 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         if crate::lab::key_press(sym, wcode, &app.player.session) {
             return;
         }
+        // IrisPlex only: the hidden door to Settings (`iris.rs`), above the tree so it sees every
+        // fresh press on Home. Its last press is spent opening Settings; the others act as usual.
+        if plx_base::paths::iris_mode()
+            && app.iris_combo.press(key, app.last_input)
+            && matches!(app.pages.top_arg(), Some(AppArg::Home))
+        {
+            log("iris: settings combination");
+            super::bridge::open_settings(&mut app.pages);
+            return;
+        }
 
         // ---- the route-scoped arms, each of which `continue`s once it has taken the
         // press. That makes the chain itself the priority statement: an earlier guard
@@ -3111,6 +3121,7 @@ mod lifecycle_regression_tests {
             buffer_flip_count: Default::default(),
             down_sym: Default::default(),
             modal_repeat: RepeatGate::IDLE,
+            iris_combo: Default::default(),
             diagnostics: Default::default(),
             player: plx_media::player::machine::Player::new(),
             adapters: Adapters {

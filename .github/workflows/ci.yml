@@ -528,6 +528,12 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Package IrisPlex
+        # The same binary, packaged a second time under the iris install (`com.beb.plxnative.iris`,
+        # titled IrisPlex, its own artwork): `paths::iris_mode` reads the install, not the build.
+        # Last, after every gate above has graded the debug package on its own.
+        run: make ipk FLAVOR=iris WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: plxnative-${{ github.sha }}

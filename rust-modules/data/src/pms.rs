@@ -797,6 +797,14 @@ struct SourceBuild {
 /// comparison downstream then trusts). A `&'static Client` also pins the exact address this fetch
 /// was aimed at even if the registry re-points that slot mid-request.
 fn fetch_source(c: &'static plx_plex::plex::Client, sid: ServerId) -> Option<SourceBuild> {
+    // IrisPlex (`paths::iris_mode`): Home is the Iris list and nothing else, so no hub or Continue
+    // Watching request is made at all. The list rides the Watchlist's matcher (see
+    // `watchlist_guids`), so it is never waited for either.
+    if plx_base::paths::iris_mode() {
+        let mut build = SourceBuild::default();
+        build.shelves.extend(watchlist_shelf(c, sid));
+        return Some(build);
+    }
     let mc = c.home_hubs(HUB_FETCH_COUNT)?;
     // The Continue Watching shelf comes from the DEDICATED hub (see `project`). Its failure fails
     // THIS SOURCE (`?`) — nothing of it commits and it retries on its own backoff. Losing the most
@@ -865,8 +873,14 @@ fn watchlist_guids(token: &str, client_id: &str) -> Option<Arc<Vec<String>>> {
             return Some(Arc::clone(list));
         }
     }
-    let rows = plx_plex::plex::account::AccountClient::new(client_id, Some(token))
-        .watchlist(MAX_SHELF_ITEMS)?;
+    let account = plx_plex::plex::account::AccountClient::new(client_id, Some(token));
+    // IrisPlex reads one of the account's plex.tv Lists in the Watchlist's place; everything
+    // downstream (matching, memo, refetch) is the same machinery.
+    let rows = if plx_base::paths::iris_mode() {
+        account.custom_list(plx_base::paths::IRIS_LIST_TITLE)?
+    } else {
+        account.watchlist(MAX_SHELF_ITEMS)?
+    };
     let list: Arc<Vec<String>> = Arc::new(
         rows.iter().map(|r| r.join_guid()).filter(|g| !g.is_empty()).collect(),
     );
@@ -883,7 +897,7 @@ fn watchlist_guids(token: &str, client_id: &str) -> Option<Arc<Vec<String>>> {
 fn watchlist_shelf(c: &'static plx_plex::plex::Client, sid: ServerId) -> Option<Shelf> {
     let s = plx_plex::plex::session::peek();
     // Settings > Libraries > Watchlist on Home. Off costs nothing: no plex.tv fetch, no lookups.
-    if s.account_token.is_empty() || !s.watchlist_shown() {
+    if s.account_token.is_empty() || !(s.watchlist_shown() || plx_base::paths::iris_mode()) {
         return None;
     }
     let (shelf, fresh) = {
@@ -965,9 +979,14 @@ fn match_watchlist(
     if failed == list.len() && !list.is_empty() {
         return;
     }
+    let (title, hub_id) = if plx_base::paths::iris_mode() {
+        (plx_base::paths::IRIS_LIST_TITLE.to_string(), IRIS_HUB_ID)
+    } else {
+        (plx_platform::i18n::msg::browse_home_watchlist().to_string(), "home.watchlist")
+    };
     let shelf = (!items.is_empty()).then(|| Shelf {
-        title: plx_platform::i18n::msg::browse_home_watchlist().to_string(),
-        hub_id: "home.watchlist".to_string(),
+        title,
+        hub_id: hub_id.to_string(),
         key: String::new(),
         total: items.len(),
         items,
@@ -1209,6 +1228,15 @@ fn catalog_bytes(cat: &[Arc<PmsMovie>]) -> usize {
         .sum()
 }
 
+/// IrisPlex's one Home row (`paths::iris_mode`).
+const IRIS_HUB_ID: &str = "home.iris";
+
+/// The same title on two servers: the row is a list of titles, so a second server's copy of one
+/// adds nothing (the first server's card plays it).
+fn same_title(a: &PmsMovie, b: &PmsMovie) -> bool {
+    a.kind == b.kind && a.year == b.year && a.title.eq_ignore_ascii_case(&b.title)
+}
+
 fn merge_with_scope(srcs: &[Src], scope: &BrowseScope) -> HubBuild {
     let pins = &scope.pins;
     let live = live_sources(srcs);
@@ -1279,6 +1307,26 @@ fn merge_with_scope(srcs: &[Src], scope: &BrowseScope) -> HubBuild {
                 row_handle.push(handle);
             }
             rows_left -= new_cat.len() - start;
+            // IrisPlex: every server's matches are ONE row, the first server holding a title
+            // keeping it. The Iris row is the only row there is, so the previous row is it and
+            // these cards land contiguous with it.
+            if let Some(row) = new_hubs.last_mut().filter(|h| h.hub_id == IRIS_HUB_ID && sh.hub_id == IRIS_HUB_ID) {
+                let mut kept = start;
+                for i in start..new_cat.len() {
+                    let m = Arc::clone(&new_cat[i]);
+                    let dup = new_cat[row.start..kept].iter().any(|o| same_title(o, &m));
+                    if !dup {
+                        new_cat[kept] = m;
+                        row_handle[kept] = row_handle[i];
+                        kept += 1;
+                    }
+                }
+                new_cat.truncate(kept);
+                row_handle.truncate(kept);
+                row.len = kept - row.start;
+                row.total = row.len;
+                continue;
+            }
             new_hubs.push(HubRow {
                 title: sh.title.clone(),
                 hub_id: sh.hub_id.clone(),

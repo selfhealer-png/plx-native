@@ -133,6 +133,18 @@ pub fn flavour() -> Option<&'static str> {
     app_id().strip_prefix(STABLE_APP_ID)?.strip_prefix('.')
 }
 
+/// **IrisPlex** — the `iris` install (`com.beb.plxnative.iris`, `ci/install-identities.json`): the
+/// same binary, locked down to one row, the account's plex.tv list named [`IRIS_LIST_TITLE`].
+/// Home shows that list and nothing else, the top bar is gone, and Settings is behind a remote
+/// combination (`app::iris`). Decided by where the binary is installed, like every flavour fact,
+/// so one CI build packages both apps.
+pub fn iris_mode() -> bool {
+    flavour() == Some("iris")
+}
+
+/// The plex.tv list IrisPlex shows (Watchlist > Lists, matched by title, case-insensitively).
+pub const IRIS_LIST_TITLE: &str = "Iris";
+
 /// The closed-enum sandbox fact for every telemetry event — `devmode` / `homebrew` / `unknown` —
 /// derived from [`app_dir`]'s prefix rather than from a second read of `/proc/self/exe`. **Never
 /// the path itself**: the two real prefixes are `/media/developer/…` and `/media/cryptofs/…`, and

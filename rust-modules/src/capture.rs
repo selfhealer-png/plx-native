@@ -84,6 +84,7 @@ pub(crate) fn default_port() -> u16 {
         None => STABLE_PORT,
         Some("debug") => STABLE_PORT + 1,
         Some("nightly") => STABLE_PORT + 2,
+        Some("iris") => STABLE_PORT + 3,
         // Defensive rather than reachable: the Makefile's FLAVORS whitelist and `paths::app_id`'s
         // install-directory read are what actually decide a real television's flavour, so any
         // OTHER suffix here means something outside that whitelist got installed by hand. Falling

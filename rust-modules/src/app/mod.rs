@@ -115,6 +115,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod words;
 pub(crate) mod clock;
 mod clock_notice;
+mod iris;
 mod recorder;
 mod window_activity;
 pub(crate) mod events;
@@ -256,6 +257,8 @@ pub(crate) struct App {
     /// and there is no second copy to keep in step.
     down_sym: u32,
     modal_repeat: RepeatGate,
+    /// IrisPlex's hidden Settings combination, as far as it has got (`iris.rs`).
+    iris_combo: iris::Combo,
     /// **The diagnostics read-out's own state** (phase 10, spec §0 done-criterion 1): what was
     /// nine `static mut`s in `ui/stats.rs`. Not a `ModalStack` surface, and `diagnostics.rs`'s
     /// `Diagnostics` doc says why — the panel takes no keys and draws at two different z-positions.

@@ -171,8 +171,8 @@ EVENTLOG     = $(RUNDIR)/plxnative-events.log
 # the other install's FIFO. `capture::default_port` is the same rule in Rust; ci/flavor.py's
 # selftest compares them. Nightly was the third flavour that comment warned about: "stable, or one
 # higher" stopped being a rule with three installs, so each flavour now gets its own explicit slot
-# instead of a wildcard — stable 8910, debug 8911, nightly 8912.
-APPPORT      = $(if $(filter stable,$(FLAVOR)),8910,$(if $(filter nightly,$(FLAVOR)),8912,8911))
+# instead of a wildcard — stable 8910, debug 8911, nightly 8912, iris 8913.
+APPPORT      = $(if $(filter stable,$(FLAVOR)),8910,$(if $(filter nightly,$(FLAVOR)),8912,$(if $(filter iris,$(FLAVOR)),8913,8911)))
 
 # The default goal, stated rather than inherited. Make takes the FIRST target in the file, and the
 # seven query targets below are the first ones now — so a bare `make` printed the flavour and
@@ -1096,8 +1096,9 @@ TURBOJPEG_SO := $(firstword $(wildcard $(SYSROOT)/usr/lib/libturbojpeg.so.0.*))
 # under that name and fail an otherwise correct package.)
 APPINFO   = $(if $(filter stable,$(FLAVOR)),pkg/appinfo.json,pkg/.flavor/$(FLAVOR)/appinfo.json)
 # Each non-stable flavour wears its OWN badge — `pkg/dev/` (amber DEV) for debug, `pkg/nightly/`
-# (grey NIGHTLY) for nightly — because all three tiles sit side by side in one launcher.
-ICONDIR   = $(if $(filter nightly,$(FLAVOR)),pkg/nightly,pkg/dev)
+# (grey NIGHTLY) for nightly — because all three tiles sit side by side in one launcher. IrisPlex
+# (`iris`) is a different product on the same binary and wears its own artwork, `pkg/iris/`.
+ICONDIR   = $(if $(filter nightly,$(FLAVOR)),pkg/nightly,$(if $(filter iris,$(FLAVOR)),pkg/iris,pkg/dev))
 ICONS     = $(if $(filter stable,$(FLAVOR)),pkg/icon.png pkg/largeIcon.png,$(ICONDIR)/icon.png $(ICONDIR)/largeIcon.png)
 # `pkg/lab.json` is in this list ONLY under LAB=1, and it is the whole handoff between the two
 # halves of the Cloud Lab bridge: `tools/plxnative-lab start` writes it (endpoint, session,

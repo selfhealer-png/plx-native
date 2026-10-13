@@ -13,5 +13,10 @@
     "name": "nightly",
     "app_id": "com.beb.plxnative.nightly",
     "object_id": "plxstate.night"
+  },
+  {
+    "name": "iris",
+    "app_id": "com.beb.plxnative.iris",
+    "object_id": "plxstate.iris"
   }
 ]

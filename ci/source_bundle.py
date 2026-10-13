@@ -73,7 +73,8 @@ def allowed(name):
         return (name[4:] in PKG_FILES or
                 (len(p.parts) == 4 and p.parts[1] == 'resources' and p.name == 'appinfo.json') or
                 name in {'pkg/dev/icon.png', 'pkg/dev/largeIcon.png',
-                         'pkg/nightly/icon.png', 'pkg/nightly/largeIcon.png'})
+                         'pkg/nightly/icon.png', 'pkg/nightly/largeIcon.png',
+                         'pkg/iris/icon.png', 'pkg/iris/largeIcon.png'})
     return (name.startswith('vendor/nanosvg/') or name == 'vendor/sentry-native/webos-arm32.patch'
             or name.startswith('.github/'))
 

@@ -236,10 +236,13 @@ def stage_resources(repo: Path, data: Path, app: dict) -> list:
     if not src.is_dir():
         return []
     base_title = json.loads((repo / "pkg" / "appinfo.json").read_text())["title"]
-    if not app["title"].startswith(base_title):
+    # A product named in its own right (IrisPlex, `flavor.IRIS_TITLE`) has no translated title to
+    # suffix: every locale gets its one name, or a Korean set would retitle it "PlxNative".
+    own_title = app["title"] if app["title"] == flavor.IRIS_TITLE else None
+    if own_title is None and not app["title"].startswith(base_title):
         raise SystemExit(f"flavour title {app['title']!r} is not {base_title!r} plus a suffix — "
                          "stage_resources can no longer reapply it; see ci/flavor.py")
-    suffix = app["title"][len(base_title):]
+    suffix = "" if own_title else app["title"][len(base_title):]
     locales = []
     for loc_dir in sorted(p for p in src.iterdir() if p.is_dir()):
         f = loc_dir / "appinfo.json"
@@ -256,7 +259,7 @@ def stage_resources(repo: Path, data: Path, app: dict) -> list:
         # Rewritten rather than copied, so the staged bytes are this script's output on every host:
         # `ensure_ascii=False` keeps the translations readable in the archive, UTF-8 with no BOM is
         # LG's stated requirement for non-Latin text, and the key order is the input file's.
-        body = json.dumps({**loc, "title": loc["title"] + suffix},
+        body = json.dumps({**loc, "title": own_title or loc["title"] + suffix},
                           ensure_ascii=False, indent=2) + "\n"
         (out_dir / "appinfo.json").write_bytes(body.encode("utf-8"))
         locales.append(loc_dir.name)

@@ -847,7 +847,10 @@ impl Bridge {
         let route = d.top_or_mounting_arg().cloned().unwrap_or(AppArg::Home);
         let route = &route;
         let search = *route == AppArg::Search;
-        if matches!(route, AppArg::Home | AppArg::Library) || search {
+        // IrisPlex has no top bar: its Home is one row, and Library/Search/the profile chip are
+        // exactly what it exists to put out of reach (`paths::iris_mode`). An empty strip is
+        // also what makes the dispatcher treat the bar as unreachable.
+        if (matches!(route, AppArg::Home | AppArg::Library) || search) && !plx_base::paths::iris_mode() {
             d.nav.tabs.strip_fallback = Some(if search { plx_ui::dispatch::STRIP_BASE + 3 } else { plx_screens::home::STRIP_HOME_ELEM });
             if let Some(io) = &self.home_io {
                 refresh_chrome(&mut self.chrome, &self.measure, self.directory.view(),
@@ -896,6 +899,9 @@ impl Bridge {
 
     pub(crate) fn update_home_chrome(&mut self, d: &mut Dispatcher<AppHost>,
         glass: &mut plx_ui::frame::glass::GlassPlan, dt: f32) {
+        if plx_base::paths::iris_mode() {
+            return;
+        }
         let selected = self.navigation_presentation().view_tab.unwrap_or(self.chrome_selection) as i32;
         let focus = Self::home_focus(d);
         let labels = self.chrome.labels();
@@ -1314,7 +1320,7 @@ impl Bridge {
     /// route over" — has nothing left to resolve and went with the routes in D1.
     fn draws_chrome_for(arg: &AppArg) -> bool {
         use plx_ui::screen::ScreenArg;
-        arg.chrome() == plx_machine::machine::Chrome::TabBar
+        arg.chrome() == plx_machine::machine::Chrome::TabBar && !plx_base::paths::iris_mode()
     }
 }
 

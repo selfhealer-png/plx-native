@@ -161,6 +161,139 @@ impl AccountClient {
         ));
         Some(rows)
     }
+
+    /// The account's plex.tv **List** titled `title` (Watchlist > Lists, matched case-insensitively),
+    /// as Watchlist-shaped rows in the list's own order — IrisPlex's whole catalogue.
+    ///
+    /// Lists (2026) have no documented API and are not on the Discover provider. They are served by
+    /// `luma.plex.tv`, the server-driven-UI backend `watch.plex.tv` renders, as SCREENS: measured
+    /// 2026-10-13 through the website's own proxy, `GET {LUMA}/api/screen/watchlist/my-lists`
+    /// answers `ui.lists[] {id, title, link.url}` and the list's `link.url` route, asked of the same
+    /// `/api/screen` door, answers `ui.list[] {id, title, subtitle, link.url}`. Each row's `id` is
+    /// the bare catalog id (`5d9c08034eefaa001f5d3874`), and its `link.url` (`/show/peppa-pig`,
+    /// `/movie/…`) is the only place its kind is stated. Unauthenticated, the host answers
+    /// `401 {"ui":{"title":"Unauthorized","message":"A valid token is required."}}`; the account
+    /// token on [`AccountClient`]'s ordinary header set is what the website's proxy adds.
+    ///
+    /// `None` = a failed fetch, or no list of that name (both logged, and the caller keeps what it
+    /// had). An empty list is `Some(vec![])`.
+    pub fn custom_list(&self, title: &str) -> Option<Vec<WatchlistItem>> {
+        let lists: LumaLists = self.get(&format!("{LUMA}/api/screen/watchlist/my-lists"))?;
+        let Some(found) = lists.ui.lists.iter().find(|l| l.title.eq_ignore_ascii_case(title)) else {
+            plx_base::eventlog::log(&format!(
+                "iris: no list titled {title:?} among {} list(s)",
+                lists.ui.lists.len()
+            ));
+            return None;
+        };
+        let route = found.link.url.split('?').next().unwrap_or_default();
+        if !route.starts_with('/') {
+            plx_base::eventlog::log("iris: the list carries no route");
+            return None;
+        }
+        let mut url = format!("{LUMA}/api/screen{route}");
+        let mut rows = Vec::new();
+        // A long list pages; a cap keeps a provider that never stops paging from holding a worker.
+        for _ in 0..LUMA_PAGES {
+            let page: LumaList = self.get(&url)?;
+            rows.extend(page.ui.list.iter().filter_map(LumaListItem::row));
+            match page.ui.pagination.and_then(|p| p.next_url) {
+                Some(next) if !next.is_empty() => url = luma_url(&next),
+                _ => break,
+            }
+        }
+        plx_base::eventlog::log(&format!("iris: list rows={}", rows.len()));
+        Some(rows)
+    }
+}
+
+const LUMA: &str = "https://luma.plex.tv";
+const LUMA_PAGES: usize = 8;
+
+/// A luma pagination link, which may be absolute, a full `/api/...` path or a bare screen route.
+fn luma_url(next: &str) -> String {
+    if next.starts_with("https://") {
+        next.to_owned()
+    } else if next.starts_with("/api/") {
+        format!("{LUMA}{next}")
+    } else {
+        format!("{LUMA}/api/screen{next}")
+    }
+}
+
+// ---- plex.tv Lists (luma screens) --------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct LumaLists {
+    #[serde(default)]
+    ui: LumaListsUi,
+}
+
+#[derive(Deserialize, Default)]
+struct LumaListsUi {
+    #[serde(default)]
+    lists: Vec<LumaListRef>,
+}
+
+#[derive(Deserialize, Default)]
+struct LumaListRef {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    link: LumaLink,
+}
+
+#[derive(Deserialize, Default)]
+struct LumaLink {
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Deserialize, Default)]
+struct LumaList {
+    #[serde(default)]
+    ui: LumaListUi,
+}
+
+#[derive(Deserialize, Default)]
+struct LumaListUi {
+    #[serde(default)]
+    list: Vec<LumaListItem>,
+    #[serde(default)]
+    pagination: Option<LumaPagination>,
+}
+
+#[derive(Deserialize, Default)]
+struct LumaPagination {
+    #[serde(rename = "nextUrl", default)]
+    next_url: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct LumaListItem {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    link: LumaLink,
+}
+
+impl LumaListItem {
+    /// The Watchlist row this list entry is, when its route says it is a film or a show.
+    fn row(&self) -> Option<WatchlistItem> {
+        let kind = match self.link.url.split('/').nth(1)? {
+            "movie" => "movie",
+            "show" => "show",
+            _ => return None,
+        };
+        (!self.id.is_empty()).then(|| WatchlistItem {
+            kind: kind.to_owned(),
+            title: self.title.clone(),
+            rating_key: self.id.clone(),
+            ..Default::default()
+        })
+    }
 }
 
 // ---- the watchlist -----------------------------------------------------------------------------
@@ -408,5 +541,30 @@ mod watchlist_tests {
         assert!(empty.media_container.unwrap().metadata.is_empty());
         let missing: WatchlistEnvelope = serde_json::from_str(r#"{"error":"nope"}"#).unwrap();
         assert!(missing.media_container.is_none());
+    }
+
+    /// The two luma screens as measured 2026-10-13 (trimmed to the fields read, plus neighbours
+    /// that must be ignored): the list index finds "Iris" by title, and the list's rows join on the
+    /// same `plex://<kind>/<id>` a Watchlist row does, with the kind read off the row's route.
+    #[test]
+    fn a_plex_list_screen_yields_watchlist_rows_in_list_order() {
+        let index: LumaLists = serde_json::from_str(r#"{"actions":[],"ui":{"title":"My Lists",
+            "lists":[{"id":"0a8891ad","title":"Iris","subtitle":"1 Item",
+            "link":{"url":"/u/someone/lists/LrwH-iris?context.page=watchlist.myLists","external":false}}],
+            "pagination":{}},"data":{"route":"/watchlist/my-lists"}}"#).unwrap();
+        let found = index.ui.lists.iter().find(|l| l.title.eq_ignore_ascii_case("iris")).unwrap();
+        assert_eq!(found.link.url.split('?').next(), Some("/u/someone/lists/LrwH-iris"));
+
+        let list: LumaList = serde_json::from_str(r#"{"ui":{"title":"Iris","itemCountRaw":3,"list":[
+            {"id":"5d9c08034eefaa001f5d3874","title":"Peppa Pig","subtitle":"2004",
+             "link":{"url":"/show/peppa-pig","external":false},"actions":[]},
+            {"id":"5d776b59ad5437001f79c6f8","title":"Ponyo","link":{"url":"/movie/ponyo"}},
+            {"id":"abc","title":"Someone","link":{"url":"/person/someone"}}]}}"#).unwrap();
+        let rows: Vec<WatchlistItem> = list.ui.list.iter().filter_map(LumaListItem::row).collect();
+        let guids: Vec<String> = rows.iter().map(WatchlistItem::join_guid).collect();
+        assert_eq!(guids, ["plex://show/5d9c08034eefaa001f5d3874", "plex://movie/5d776b59ad5437001f79c6f8"]);
+        assert!(list.ui.pagination.is_none());
+        assert_eq!(luma_url("/api/screen/x?page=2"), "https://luma.plex.tv/api/screen/x?page=2");
+        assert_eq!(luma_url("/u/a/lists/b?page=2"), "https://luma.plex.tv/api/screen/u/a/lists/b?page=2");
     }
 }

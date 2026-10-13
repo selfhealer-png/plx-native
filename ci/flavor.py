@@ -54,6 +54,8 @@ INSTALL_IDENTITIES = json.loads((ROOT / "ci/install-identities.json").read_text(
 FLAVORS = tuple(identity["name"] for identity in INSTALL_IDENTITIES)
 STABLE_ID = next(identity["app_id"] for identity in INSTALL_IDENTITIES
                  if identity["name"] == "stable")
+IRIS_TITLE = "IrisPlex"
+IRIS_ICON_COLOR = "#7d4dfe"
 
 
 def _release_line_content() -> "str | None":
@@ -108,6 +110,13 @@ def appinfo_for(flavor: str, nightly_date: "str | None" = None) -> dict:
     # suffix debug uses, so it is spelled out rather than titlecased generically.
     suffix = "Nightly" if flavor == "nightly" else flavor
     a["title"] = f"{a['title']} {suffix}"
+    # IRIS is not a build of PlxNative but a second product on the same binary (the locked-down
+    # one-list app, `plx_base::paths::iris_mode`), so it is named in its own right rather than
+    # suffixed, and its own full-bleed artwork (`pkg/iris/`) needs the tile colour behind it to be
+    # that artwork's corner — the rule `ci/check-package.py` grades on whatever is packaged.
+    if flavor == "iris":
+        a["title"] = IRIS_TITLE
+        a["iconColor"] = IRIS_ICON_COLOR
     # NIGHTLY ONLY: the package version itself moves — to the next minor (or next patch, on a
     # maintenance line) with the CUT DATE as its patch (`version_rule.nightly_package_triplet`),
     # e.g. `0.7.20260919`. Two properties are wanted and both come from that. It is ahead of
@@ -262,18 +271,29 @@ def _selftest() -> int:
     rs_stable = re.search(r"(?m)^const STABLE_PORT: u16 = (\d+);", cap)
     mk_port = re.search(
         r"(?m)^APPPORT\s*=\s*\$\(if \$\(filter stable,\$\(FLAVOR\)\),(\d+),"
-        r"\$\(if \$\(filter nightly,\$\(FLAVOR\)\),(\d+),(\d+)\)\)", mk)
+        r"\$\(if \$\(filter nightly,\$\(FLAVOR\)\),(\d+),"
+        r"\$\(if \$\(filter iris,\$\(FLAVOR\)\),(\d+),(\d+)\)\)\)", mk)
     check(rs_stable is not None and mk_port is not None
           and rs_stable.group(1) == mk_port.group(1)
-          and int(mk_port.group(3)) == int(mk_port.group(1)) + 1
+          and int(mk_port.group(4)) == int(mk_port.group(1)) + 1
           and int(mk_port.group(2)) == int(mk_port.group(1)) + 2
+          and int(mk_port.group(3)) == int(mk_port.group(1)) + 3
           and 'Some("debug") => STABLE_PORT + 1,' in cap
-          and 'Some("nightly") => STABLE_PORT + 2,' in cap,
+          and 'Some("nightly") => STABLE_PORT + 2,' in cap
+          and 'Some("iris") => STABLE_PORT + 3,' in cap,
           "capture port: Makefile APPPORT and capture::default_port agree "
-          "(stable, debug=+1, nightly=+2)")
-    check(len(FLAVORS) == 3,
-          "the capture-port rule now names debug and nightly explicitly — a FOURTH flavour needs "
-          "a real decision in both capture.rs and the Makefile, the same way nightly just did")
+          "(stable, debug=+1, nightly=+2, iris=+3)")
+    check(len(FLAVORS) == 4,
+          "the capture-port rule names debug, nightly and iris explicitly — a FIFTH flavour needs "
+          "a real decision in both capture.rs and the Makefile, the same way iris just did")
+
+    # IrisPlex is its own product: its own name, and a tile colour that is its own artwork's.
+    iris = appinfo_for("iris")
+    check(iris["id"] == f"{STABLE_ID}.iris" and iris["title"] == IRIS_TITLE,
+          f'iris appinfo is {STABLE_ID}.iris titled {IRIS_TITLE!r} (got {iris["id"]}, {iris["title"]!r})')
+    moved_iris = {k for k in tracked_appinfo if iris.get(k) != tracked_appinfo[k]}
+    check(moved_iris == {"id", "title", "iconColor"},
+          f"only id, title and iconColor differ between iris and stable (saw {sorted(moved_iris)})")
 
     # The seven query targets are the FIRST targets in the Makefile, and make takes the first
     # target it sees as the default goal. That made a bare `make` print the flavour and exit 0
