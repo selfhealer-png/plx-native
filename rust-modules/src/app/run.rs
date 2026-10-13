@@ -1246,6 +1246,8 @@ unsafe fn ingest_sdl_event_with_window(app: &mut App, fr: &mut Frame,
         app.last_input = clock::now();
         app.ptr.last_motion = app.last_input;
         app.ptr.cur_hidden = false;
+        // webOS 3.x: SDL drew and hid the pointer itself, and it does not come back by itself.
+        show_cursor();
         let (mx, my) = ptr_xy(&app.ev);
         if app.boot_initial.is_none() {
             app.rec.input(super::recorder::enc_pointer("pointer", mx as i32, my as i32));

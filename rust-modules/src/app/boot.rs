@@ -390,20 +390,79 @@ mod seam_order_tests {
 /// Resolved at runtime rather than linked: webOS 3.4 ships SDL 2.0.3, which has none of LG's
 /// `SDL_webOS*` extensions, and a strong reference there is a lazily-bound PLT slot that kills
 /// the process on the first D-pad press (`tools/fwcompat.py --release 3.4.0`).
+///
+/// **Where LG's call is absent (webOS 3.x), SDL draws the pointer itself**, so the hide falls back
+/// to the stock `SDL_ShowCursor(SDL_DISABLE)` (issue #642: on a 3.9.3 set the pointer otherwise
+/// stayed up for about five minutes, until LG's own idle timeout). Unlike the compositor's pointer
+/// on webOS 4+, SDL's does not come back on its own when the remote moves, so [`show_cursor`]
+/// re-enables it on pointer motion — and only when this fallback was the one that hid it.
 #[inline]
 pub(crate) unsafe fn hide_cursor() {
     #[cfg(not(feature = "hostsim"))]
     {
-        type CursorVisibility = unsafe extern "C" fn(c_int) -> c_int;
-        static SYM: std::sync::OnceLock<Option<CursorVisibility>> = std::sync::OnceLock::new();
-        let f = SYM.get_or_init(|| {
-            let p = plx_base::dynlib::Handle::self_handle().sym("SDL_webOSCursorVisibility")?;
-            (!p.is_null()).then(|| std::mem::transmute::<*mut std::ffi::c_void, CursorVisibility>(p))
-        });
-        if let Some(f) = f {
-            f(0);
+        match webos_cursor_visibility() {
+            Some(f) => {
+                f(0);
+            }
+            None => {
+                if let Some(show) = sdl_show_cursor() {
+                    if !SDL_CURSOR_HIDDEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        show(SDL_DISABLE);
+                    }
+                }
+            }
         }
     }
+}
+
+/// Pointer motion: bring back a pointer [`hide_cursor`]'s SDL fallback took away. A no-op on
+/// webOS 4+, where the compositor shows its own pointer on motion, and when nothing was hidden.
+#[inline]
+pub(crate) unsafe fn show_cursor() {
+    #[cfg(not(feature = "hostsim"))]
+    {
+        if SDL_CURSOR_HIDDEN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(show) = sdl_show_cursor() {
+                show(SDL_ENABLE);
+            }
+        }
+    }
+}
+
+/// `SDL_webOSCursorVisibility`, where LG's SDL fork has it (webOS 4 and later).
+#[cfg(not(feature = "hostsim"))]
+fn webos_cursor_visibility() -> Option<unsafe extern "C" fn(c_int) -> c_int> {
+    type CursorVisibility = unsafe extern "C" fn(c_int) -> c_int;
+    static SYM: std::sync::OnceLock<Option<CursorVisibility>> = std::sync::OnceLock::new();
+    *SYM.get_or_init(|| {
+        let p = plx_base::dynlib::Handle::self_handle().sym("SDL_webOSCursorVisibility")?;
+        // SAFETY: the symbol is LG's `int SDL_webOSCursorVisibility(int)`.
+        (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut std::ffi::c_void, CursorVisibility>(p) })
+    })
+}
+
+/// Whether [`hide_cursor`]'s `SDL_ShowCursor` fallback is what hid the pointer right now.
+#[cfg(not(feature = "hostsim"))]
+static SDL_CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `SDL_ShowCursor`'s toggles, from `SDL_events.h`.
+#[cfg(not(feature = "hostsim"))]
+const SDL_DISABLE: c_int = 0;
+#[cfg(not(feature = "hostsim"))]
+const SDL_ENABLE: c_int = 1;
+
+/// Stock SDL2's `SDL_ShowCursor`, exported by every SDL2 on every webOS release (2.0.3 on 3.4,
+/// 2.0.4 on 3.9). Looked up rather than linked all the same, so a host test binary that reaches
+/// the pointer path needs no SDL symbol at link time (see `input::note_global_press`).
+#[cfg(not(feature = "hostsim"))]
+fn sdl_show_cursor() -> Option<unsafe extern "C" fn(c_int) -> c_int> {
+    type ShowCursor = unsafe extern "C" fn(c_int) -> c_int;
+    static SYM: std::sync::OnceLock<Option<ShowCursor>> = std::sync::OnceLock::new();
+    *SYM.get_or_init(|| {
+        let p = plx_base::dynlib::Handle::self_handle().sym("SDL_ShowCursor")?;
+        // SAFETY: the symbol is SDL's `int SDL_ShowCursor(int toggle)`.
+        (!p.is_null()).then(|| unsafe { std::mem::transmute::<*mut std::ffi::c_void, ShowCursor>(p) })
+    })
 }
 /// Advance the once-per-second LOOP-RATE window: bump `iters_ct` and, when a full second has
 /// elapsed, recompute `loop_shown`, reset the window, and return `true` so the caller logs the
