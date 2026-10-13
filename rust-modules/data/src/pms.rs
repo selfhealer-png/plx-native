@@ -1311,19 +1311,14 @@ fn merge_with_scope(srcs: &[Src], scope: &BrowseScope) -> HubBuild {
             // keeping it. The Iris row is the only row there is, so the previous row is it and
             // these cards land contiguous with it.
             if let Some(row) = new_hubs.last_mut().filter(|h| h.hub_id == IRIS_HUB_ID && sh.hub_id == IRIS_HUB_ID) {
-                let mut kept = start;
-                for i in start..new_cat.len() {
-                    let m = Arc::clone(&new_cat[i]);
-                    let dup = new_cat[row.start..kept].iter().any(|o| same_title(o, &m));
-                    if !dup {
-                        new_cat[kept] = m;
-                        row_handle[kept] = row_handle[i];
-                        kept += 1;
+                let batch: Vec<_> = new_cat.drain(start..).zip(row_handle.drain(start..)).collect();
+                for (m, h) in batch {
+                    if !new_cat[row.start..].iter().any(|o| same_title(o, &m)) {
+                        new_cat.push(m);
+                        row_handle.push(h);
                     }
                 }
-                new_cat.truncate(kept);
-                row_handle.truncate(kept);
-                row.len = kept - row.start;
+                row.len = new_cat.len() - row.start;
                 row.total = row.len;
                 continue;
             }

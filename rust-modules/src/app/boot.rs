@@ -1628,6 +1628,7 @@ pub(crate) unsafe fn construct(
         buffer_flip_count,
         down_sym,
         modal_repeat,
+        iris_combo: Default::default(),
         diagnostics: crate::app::diagnostics::Diagnostics::default(),
         player,
         adapters,
