@@ -422,8 +422,12 @@ the outcome, and a dim diagnostics footer. The row always ends in **Back**. For 
 it offers **Change quality**, which opens the same quality ladder the `…` menu does on the rung
 this playback is already using, preceded by **Try again** when the failure may be transient. With
 Force Direct Play enabled no rung can help, so the row offers **Switch to Auto and play** instead:
-OK turns Force off and retries in place, with no trip to Settings. A file with no video track gets
-Back alone, because nothing the viewer picks puts a picture in it. A failure is therefore terminal
+OK turns Force off and retries in place, with no trip to Settings. When another source holds the
+same title (the copy the detail page's *Also available* would list), **Another copy** sits just
+before Back and opens that server's page for it, so a copy a server cannot play is not a dead end;
+like *Also available* it navigates rather than swapping the copy under the viewer. A file with no
+video track gets Back alone (or Another copy and Back), because nothing the viewer picks puts a
+picture in that file. A failure is therefore terminal
 for the pipeline, not a trap for the viewer.
 
 The verdict in the figure (*"Cannot convert this item. Implementation for video encoder 'hevc' not

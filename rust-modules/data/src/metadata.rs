@@ -1986,6 +1986,13 @@ pub fn set_playing_markers_for_test(state: &mut MetadataState, markers: Vec<Mark
     state.playing = Some(PlayingItem { markers, ..PlayingItem::with_subs(Vec::new()) });
 }
 
+/// TEST-ONLY installer for the playing item's ADDRESS: lets a rig name which `(server, ratingKey)`
+/// is playing, so a reader keyed on it (the failure read-out's *Another copy*) finds its copies.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_playing_item_for_test(state: &mut MetadataState, sid: plx_plex::plex::ServerId, rk: &str) {
+    state.playing = Some(PlayingItem { sid, rk: rk.to_string(), ..PlayingItem::with_subs(Vec::new()) });
+}
+
 /// A compact descriptor of the item currently *playing*, for the in-player Info card. Unlike
 /// `current()` (which stays on the detail page's show/movie), this always describes the playing
 /// **leaf**: an episode carries the show title + SxEy + episode name + its still; a movie carries the

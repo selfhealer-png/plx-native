@@ -204,6 +204,10 @@ pub enum PlayerReq {
     /// failure read-out's own BACK escape all perform (`exit_player`; restructure phase 12,
     /// replacing `app/run.rs`'s direct calls to it from the player's own key arms).
     Exit,
+    /// The failure read-out's *Another copy*: leave through [`Exit`](PlayerReq::Exit)'s ritual and
+    /// land on THIS source's page for the title (`player_hud::other_copy` chose it). A page, not a
+    /// play: the viewer sees which copy, and its own resume position, before pressing Play.
+    OpenCopy { sid: plx_plex::plex::ServerId, rk: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

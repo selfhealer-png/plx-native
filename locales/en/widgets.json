@@ -1063,5 +1063,9 @@
   "widgets.failure.change_quality": {
     "value": "Change quality",
     "description": "Failed-playback button: opens the quality ladder; picking a rung retries at it."
+  },
+  "widgets.failure.other_copy": {
+    "value": "Another copy",
+    "description": "Failed-playback button: leaves the player for another server's page for the same title (the copy *Also available* lists). Short: it shares a row with up to three other buttons."
   }
 }

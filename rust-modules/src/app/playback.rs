@@ -628,6 +628,15 @@ pub(crate) fn player_requests(
             PlayerReq::Exit => {
                 exit_player(ps, pa, refresh_hubs_at, pages);
             }
+            // The failure read-out's *Another copy*: the Info card's "Go to Movie" shape — THE exit
+            // ritual, then a landing on the named page — with the other SOURCE's address, which
+            // the screen read from the *Also available* store before asking.
+            PlayerReq::OpenCopy { sid, rk } => {
+                exit_player(ps, pa, refresh_hubs_at, pages);
+                super::bridge::show_page(pages, AppArg::Content(
+                    plx_screens::registry::ContentArg::Detail { sid, rk },
+                ));
+            }
         }
     }
 }

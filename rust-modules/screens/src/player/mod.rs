@@ -583,7 +583,7 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Machine<H> for PlayerScreen 
                         self.handle_key(ps, consts::classify_input(*key, *sym, *wcode), *edge, input.at.ms, fx, H::metadata(cx))
                     }
                     InputKind::Click { hit, x, .. } => {
-                        self.handle_click(ps, *hit, *x, input.at.ms, fx)
+                        self.handle_click(ps, *hit, *x, input.at.ms, fx, H::metadata(cx))
                     }
                     // §7.5: a drag drives its CONTROL. Only the scrubber has one here, and only
                     // once a click has seated the gesture on it — a drag that began anywhere else
@@ -623,9 +623,15 @@ impl PlayerScreen {
     /// Perform control `idx` of the failure read-out's row — the ONE resolution a key and a click
     /// share, through the same table the row was drawn from (`player::failure_actions`), so a
     /// press can only ever do what the focused control says.
-    fn failure_activate<H: AppLike>(&mut self, ps: &plx_media::route::PlaybackSession, idx: usize, fx: &mut Effects<'_, H>) {
+    fn failure_activate<H: AppLike>(
+        &mut self,
+        ps: &plx_media::route::PlaybackSession,
+        meta: plx_data::metadata::MetadataView<'_>,
+        idx: usize,
+        fx: &mut Effects<'_, H>,
+    ) {
         use plx_media::player::FailureAction as A;
-        let readout = player_hud::FailureReadout::now(ps);
+        let readout = player_hud::FailureReadout::now(ps, meta);
         let Some(action) = readout.actions().get(idx).copied() else { return };
         self.failure_sel = idx;
         match action {
@@ -637,6 +643,12 @@ impl PlayerScreen {
                     self.repair_scroll = 0;
                     self.repair_alert.open_with_body(plx_platform::i18n::msg::widgets_repair_question_c(), plx_platform::i18n::msg::widgets_repair_body());
                     Self::repair_focus(fx, GROUP_REPAIR);
+                }
+            }
+            A::OtherCopy => {
+                // the same answer that drew the control, so a drawn control always has a target
+                if let Some((sid, rk)) = player_hud::other_copy(meta) {
+                    Self::ask(fx, PlayerReq::OpenCopy { sid, rk });
                 }
             }
             A::Back => Self::ask(fx, PlayerReq::Exit),
@@ -674,6 +686,7 @@ impl PlayerScreen {
         x: f32,
         now: u32,
         fx: &mut Effects<'_, H>,
+        meta: plx_data::metadata::MetadataView<'_>,
     ) -> Handled {
         use player_hud::{ELEM_FAILURE_BASE, ELEM_FAILURE_END, ELEM_ROW_BASE, ELEM_SCRUB, ELEM_TAB_BASE};
         let failed = plx_appkit::player_hud::transport_hidden(ps);
@@ -703,7 +716,7 @@ impl PlayerScreen {
                 // the same gate `group_drawn` registers the row behind: a row that is not drawn
                 // is not clickable
                 if player_hud::failure_row_drawn(self.busy) {
-                    self.failure_activate(ps, (e - ELEM_FAILURE_BASE) as usize, fx);
+                    self.failure_activate(ps, meta, (e - ELEM_FAILURE_BASE) as usize, fx);
                 }
                 Handled::Yes
             }
@@ -819,13 +832,13 @@ impl PlayerScreen {
                     Key::Right { .. } => input::FailedKey::Right,
                     _ => input::FailedKey::Other,
                 };
-                let n = player_hud::FailureReadout::now(ps).actions().len();
+                let n = player_hud::FailureReadout::now(ps, meta).actions().len();
                 match input::failed_key_action(key, self.failure_sel, n) {
                     input::FailedKeyAction::Focus(i) => {
                         self.failure_sel = i;
                         plx_machine::idle::invalidate();
                     }
-                    input::FailedKeyAction::Activate(i) => self.failure_activate(ps, i, fx),
+                    input::FailedKeyAction::Activate(i) => self.failure_activate(ps, meta, i, fx),
                     input::FailedKeyAction::Return => Self::ask(fx, PlayerReq::Exit),
                     input::FailedKeyAction::Ignore => {}
                 }
@@ -1214,7 +1227,7 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Focusable<H> for PlayerScree
             self.busy,
             plx_appkit::player_hud::Busy::Readout(plx_ui::widgets::StatusKind::Failed, _)
         ) {
-            let frames = player_hud::FailureReadout::now(H::session(cx)).frames(cx.measure);
+            let frames = player_hud::FailureReadout::now(H::session(cx), H::metadata(cx)).frames(cx.measure);
             let extent = frames.iter().flatten().copied().reduce(|a, b| a.union(b)).unwrap_or(Rect::FULL);
             out.push(GroupSpec {
                 id: GROUP_FAILURE,
@@ -1271,7 +1284,7 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Focusable<H> for PlayerScree
                 cx.measure,
             )?,
             e if (ELEM_FAILURE_BASE..ELEM_FAILURE_END).contains(&e) => {
-                player_hud::FailureReadout::now(H::session(cx)).frames(cx.measure)[(e - ELEM_FAILURE_BASE) as usize]?
+                player_hud::FailureReadout::now(H::session(cx), H::metadata(cx)).frames(cx.measure)[(e - ELEM_FAILURE_BASE) as usize]?
             }
             _ => return None,
         };
@@ -1382,7 +1395,7 @@ impl<H: PlayerLike + crate::registry::MetadataLike> Screen<H> for PlayerScreen {
         // terminal `Error` (which is not `is_busy()`, so it does not pin the HUD) keeps its message
         // instead of vanishing with the 4.5 s linger. AFTER the transport, so it is never dimmed by
         // the scrim; BEFORE the overlay panels, which the container draws above this page.
-        plx_appkit::player_hud::draw_readout(ps, self.busy, now, self.failure_sel, f.measure);
+        plx_appkit::player_hud::draw_readout(ps, self.busy, now, self.failure_sel, f.measure, H::metadata(f.cx));
         if self.repair_alert.visible() {
             self.repair_alert.draw_scrim();
             self.repair_alert.draw(plx_platform::i18n::msg::settings_cancel_c(), plx_platform::i18n::msg::widgets_repair_action_c(), f.measure);
@@ -1856,7 +1869,7 @@ mod step_ladder_tests {
         assert!(matches!(skip, ControlSlot::Skip(_)) && matches!(up_next, ControlSlot::UpNext(_)));
         let failed = Busy::Readout(plx_ui::widgets::StatusKind::Failed, c"Playback failed");
         let row = |n: u32| (0..n).map(|i| ELEM_ROW_BASE + i).collect::<Vec<_>>();
-        let failure_n = player_hud::FailureReadout::now(TestHost::session(&cx())).actions().len() as u32;
+        let failure_n = player_hud::FailureReadout::now(TestHost::session(&cx()), <TestHost as crate::registry::MetadataLike>::metadata(&cx())).actions().len() as u32;
         assert!(failure_n >= 1, "Back is always offered");
         let cases: [(&str, ControlSlot, Busy, Vec<u32>); 4] = [
             ("discs", ControlSlot::Discs, Busy::None, [row(3), vec![ELEM_TAB_BASE]].concat()),
@@ -2817,7 +2830,7 @@ mod repair_confirmation_tests {
         for state in [plx_platform::tv::sandbox::State::Running, plx_platform::tv::sandbox::State::Repaired, plx_platform::tv::sandbox::State::Failed(plx_platform::tv::sandbox::Failure::Timeout)] {
             let mut ps = blocked(); ps.repair_status = state;
             plx_media::route::reset_player_control_for_test(&ps);
-            let row = plx_appkit::player_hud::FailureReadout::now(&ps).actions().to_vec();
+            let row = plx_appkit::player_hud::FailureReadout::now(&ps, test_store().view()).actions().to_vec();
             assert!(!row.contains(&plx_media::player::FailureAction::Repair), "{state:?}: {row:?}");
             let mut page = PlayerScreen::new(EntryId(1));
             // OK performs the row's first control, which is no longer the repair question: with

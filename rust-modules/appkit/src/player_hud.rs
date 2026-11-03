@@ -1279,6 +1279,7 @@ pub fn draw_readout(
     now: u32,
     failure_focus: usize,
     measure: &dyn plx_machine::machine::Measure,
+    meta: plx_data::metadata::MetadataView<'_>,
 ) {
     let Busy::Readout(kind, caption) = busy else {
         return;
@@ -1288,7 +1289,7 @@ pub fn draw_readout(
         // constant verdict, one reason, a row of controls. The caption is not drawn here: the
         // verdict line is constant by design, so a viewer who has seen it once recognises it
         // before reading, and the caption's suffix is re-derived as the reason.
-        draw_failed_readout(ps, Painter::root(), failure_focus, measure);
+        draw_failed_readout(ps, Painter::root(), failure_focus, measure, meta);
         return;
     }
     StatusOverlay::new(readout_frame(), caption, kind)
@@ -1346,8 +1347,30 @@ pub fn failure_action_label(a: plx_media::player::FailureAction) -> &'static std
         A::TryAgain => msg::browse_action_retry_c(),
         A::ChangeQuality => msg::widgets_failure_change_quality_c(),
         A::Repair => msg::widgets_repair_action_c(),
+        A::OtherCopy => msg::widgets_failure_other_copy_c(),
         A::Back => msg::settings_back_c(),
     }
+}
+
+/// **Where the failure read-out's *Another copy* goes**: the played item's best copy on a
+/// DIFFERENT registered source, as the `(server, ratingKey)` its Detail page is addressed by.
+/// `None` when no other source holds it, which is also when the control is not drawn — one
+/// answer for both, so a drawn control always has somewhere to go.
+///
+/// The copies are the *Also available* store's, which is filed under the item whose page landed
+/// last; for a film played from its page (and for a resumed one, whose page the player fetches)
+/// that is the played item. An episode's page is its SHOW's, so an episode finds no copies here
+/// and the control stays absent rather than naming the wrong item. Among the other sources a
+/// copy of the household's own (no owner credit) comes first, because it cannot go offline the
+/// way a friend's can; otherwise the store's order stands.
+pub fn other_copy(meta: plx_data::metadata::MetadataView<'_>) -> Option<(plx_plex::plex::ServerId, String)> {
+    let playing = meta.playing()?;
+    let copies = meta.alt_copies(playing.sid, &playing.rk);
+    let elsewhere = || copies.iter().filter(|c| c.sid != playing.sid && c.sid != plx_plex::plex::ServerId::UNSET && !c.rk.is_empty());
+    elsewhere()
+        .find(|c| c.owner.is_none())
+        .or_else(|| elsewhere().next())
+        .map(|c| (c.sid, c.rk.clone()))
 }
 
 /// The glyph above the verdict, by cause — read off the same `FailureKind` the words come from, so
@@ -1364,8 +1387,9 @@ fn failure_glyph(kind: plx_media::player::FailureKind) -> plx_ui::icons::Icon {
 }
 
 impl FailureReadout {
-    /// The read-out for the failure on screen now (main thread).
-    pub fn now(ps: &plx_media::route::PlaybackSession) -> Self {
+    /// The read-out for the failure on screen now (main thread). `meta` answers whether another
+    /// source holds the played item ([`other_copy`]).
+    pub fn now(ps: &plx_media::route::PlaybackSession, meta: plx_data::metadata::MetadataView<'_>) -> Self {
         let mut e = plx_media::player::error_now(ps);
         if e.kind == plx_media::player::FailureKind::JailMissingRtkmem {
             use plx_platform::tv::sandbox::State;
@@ -1385,7 +1409,8 @@ impl FailureReadout {
                 }
             }
         }
-        let actions = plx_media::player::failure_actions(e.kind, plx_media::player::failure_context(ps));
+        let cx = plx_media::player::failure_context(ps, other_copy(meta).is_some());
+        let actions = plx_media::player::failure_actions(e.kind, cx);
         Self::of(&e, actions, plx_media::player::support_line(e.kind))
     }
 
@@ -1566,6 +1591,7 @@ fn draw_failed_readout(
     p: Painter,
     focus: usize,
     measure: &dyn plx_machine::machine::Measure,
+    meta: plx_data::metadata::MetadataView<'_>,
 ) {
     // The GROUND, first: a full-bleed opaque black, one quad. Without it the read-out stood on
     // whatever the video plane happened to be holding: `app.rs` clears the graphics plane to alpha
@@ -1574,7 +1600,7 @@ fn draw_failed_readout(
     // Error to Failed for BOTH values of `seen_frame`, i.e. a mid-playback failure over a held
     // frame is a state the code contemplates.
     p.rrect(Rect::FULL, 0.0, 0.0, theme::scrim_black(1.0));
-    FailureReadout::now(ps).draw(p, focus, measure);
+    FailureReadout::now(ps, meta).draw(p, focus, measure);
 }
 
 /// x of control button `idx`, left to right: 0 = Subtitles, 1 = Audio, 2 = More.
@@ -2896,7 +2922,7 @@ mod tests {
     }
 
     fn readout_of(e: &plx_media::player::ErrorShape) -> FailureReadout {
-        let cx = plx_media::player::FailureContext { forced: true, can_retry: true, repair_idle: true };
+        let cx = plx_media::player::FailureContext { forced: true, can_retry: true, repair_idle: true, other_copy: false };
         FailureReadout::of(e, plx_media::player::failure_actions(e.kind, cx), "0.7.0 · webOS 4.5 · code".into())
     }
 
@@ -2948,8 +2974,8 @@ mod tests {
         use plx_platform::i18n::{language_on_this_thread_for_test, Preference};
         use plx_media::player::FailureAction as A;
         let rows: [&[A]; 3] = [
-            &[A::PlayAutomatically, A::TryAgain, A::Back],
-            &[A::TryAgain, A::ChangeQuality, A::Back],
+            &[A::PlayAutomatically, A::TryAgain, A::OtherCopy, A::Back],
+            &[A::TryAgain, A::ChangeQuality, A::OtherCopy, A::Back],
             &[A::Repair, A::Back],
         ];
         let mut out = Vec::new();
@@ -2968,6 +2994,49 @@ mod tests {
             }
         }
         assert!(out.is_empty(), "rows wider than the screen:\n  {}", out.join("\n  "));
+    }
+
+    /// **The read-out's *Another copy* names a copy on ANOTHER source**, and nothing at all when
+    /// the only copies are on the failing server or the copies belong to a different item than the
+    /// one playing. (The own-before-a-friend's preference is not graded here: installing restamps
+    /// every owner credit from the live server registry, which a host test does not have.)
+    #[test]
+    fn another_copy_is_the_played_items_copy_on_a_different_source() {
+        use plx_data::metadata::{set_playing_item_for_test, AltCopy};
+        use plx_data::stores::metadata::{MetadataCmd, MetadataStore};
+        use plx_plex::plex::ServerId;
+        let copy = |s: u16, owner: Option<&str>, rk: &str| AltCopy {
+            sid: ServerId::from_raw(s),
+            library: "Movies".into(),
+            owner: owner.map(str::to_string),
+            rk: rk.into(),
+            dur_ms: 0,
+            res: String::new(),
+            width: 0,
+            height: 0,
+        };
+        let (friend, home) = (ServerId::from_raw(0), ServerId::from_raw(1));
+        let mut store = MetadataStore::default();
+        assert_eq!(other_copy(store.view()), None, "nothing playing");
+        set_playing_item_for_test(store.state_mut(), friend, "1587404");
+        assert_eq!(other_copy(store.view()), None, "no copies landed");
+        // the owner's case: the friend's copy fails, the household's own server holds the film
+        store.run(MetadataCmd::AltInstall {
+            sid: friend,
+            rk: "1587404".into(),
+            copies: vec![copy(0, Some("friend"), "1587404"), copy(1, None, "4242")],
+        });
+        assert_eq!(other_copy(store.view()), Some((home, "4242".into())), "the other server's copy");
+        // only the failing server's copies: nowhere to go
+        store.run(MetadataCmd::AltInstall {
+            sid: friend,
+            rk: "1587404".into(),
+            copies: vec![copy(0, Some("friend"), "1587404"), copy(0, Some("friend"), "9")],
+        });
+        assert_eq!(other_copy(store.view()), None);
+        // copies filed under another item never leak onto this one
+        store.run(MetadataCmd::AltInstall { sid: friend, rk: "5".into(), copies: vec![copy(2, None, "6")] });
+        assert_eq!(other_copy(store.view()), None);
     }
 
     /// The sandbox failure's help sentence ends in a URL that cannot break, and it is drawn as the

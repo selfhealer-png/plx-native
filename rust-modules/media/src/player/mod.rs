@@ -796,6 +796,10 @@ pub enum FailureAction {
     ChangeQuality,
     /// Review the sandbox repair (the confirmation `Player.repair` guards).
     Repair,
+    /// Leave the player for ANOTHER SOURCE's page for this title — the copy *Also available*
+    /// would list. It navigates rather than swapping the copy under the viewer, for the reason
+    /// `screens::alt_sources` gives: a resume position belongs to a copy, not to the title.
+    OtherCopy,
     /// Leave the player.
     Back,
 }
@@ -812,6 +816,9 @@ pub struct FailureContext {
     pub can_retry: bool,
     /// The sandbox repair can still be started (nothing is running or finished).
     pub repair_idle: bool,
+    /// A DIFFERENT source holds this title (the played item's *Also available* copies). The player
+    /// cannot see the metadata store, so the caller that can samples it and passes it in.
+    pub other_copy: bool,
 }
 
 /// **The failure read-out's row, as ONE table** — every control the read-out draws, in draw order;
@@ -829,7 +836,9 @@ pub struct FailureContext {
 ///   no [`TryAgain`](FailureAction::TryAgain): the same request gets the same answer. A different
 ///   rung is a different request, so the ladder stays where a transcode or a direct play could
 ///   succeed instead.
-/// * A file with no video track and an unrepairable sandbox get nothing but *Back*.
+/// * A file with no video track and an unrepairable sandbox get nothing but *Back* — unless
+///   another source holds the title: a different FILE can change the outcome of every failure
+///   except the sandbox's, which is a fact about this TV.
 pub fn failure_actions(kind: FailureKind, cx: FailureContext) -> Vec<FailureAction> {
     use FailureAction as A;
     use FailureKind as K;
@@ -865,16 +874,21 @@ pub fn failure_actions(kind: FailureKind, cx: FailureContext) -> Vec<FailureActi
             }
         }
     }
+    if cx.other_copy && kind != K::JailMissingRtkmem {
+        v.push(A::OtherCopy);
+    }
     v.push(A::Back);
     v
 }
 
-/// The live [`FailureContext`] (main thread).
-pub fn failure_context(ps: &crate::route::PlaybackSession) -> FailureContext {
+/// The live [`FailureContext`] (main thread). `other_copy` is the caller's sample of the metadata
+/// store (see [`FailureContext::other_copy`]).
+pub fn failure_context(ps: &crate::route::PlaybackSession, other_copy: bool) -> FailureContext {
     FailureContext {
         forced: crate::route::forced_direct_play(ps) || failtest_forced(),
         can_retry: crate::route::can_retry_current_play(ps),
         repair_idle: ps.repair_status == plx_platform::tv::sandbox::State::Idle,
+        other_copy,
     }
 }
 
@@ -2451,8 +2465,10 @@ pub fn every_failure_row() -> Vec<(FailureKind, FailureContext, Vec<FailureActio
         for forced in [false, true] {
             for can_retry in [false, true] {
                 for repair_idle in [false, true] {
-                    let cx = FailureContext { forced, can_retry, repair_idle };
-                    out.push((kind, cx, failure_actions(kind, cx)));
+                    for other_copy in [false, true] {
+                        let cx = FailureContext { forced, can_retry, repair_idle, other_copy };
+                        out.push((kind, cx, failure_actions(kind, cx)));
+                    }
                 }
             }
         }
@@ -2540,7 +2556,7 @@ mod tests {
     /// every rung Force overrides. The fix is the one change that re-enables the fallback.
     #[test]
     fn forced_direct_play_offers_the_fix_and_never_the_quality_ladder() {
-        let cx = FailureContext { forced: true, can_retry: true, repair_idle: true };
+        let cx = FailureContext { forced: true, can_retry: true, repair_idle: true, other_copy: false };
         let row = failure_actions(FailureKind::PlaybackPolicy, cx);
         assert_eq!(row.first(), Some(&FailureAction::PlayAutomatically));
         assert!(!row.contains(&FailureAction::ChangeQuality), "{row:?}");
@@ -2577,14 +2593,40 @@ mod tests {
                 assert!(!row.contains(&A::TryAgain), "a deterministic refusal repeats — {at}");
             }
             if matches!(kind, K::NoVideoTrack) {
-                assert_eq!(row, [A::Back], "{at}");
+                let want: &[A] = if cx.other_copy { &[A::OtherCopy, A::Back] } else { &[A::Back] };
+                assert_eq!(row, want, "{at}");
             }
             assert_eq!(row.contains(&A::Repair), kind == K::JailMissingRtkmem && cx.repair_idle, "{at}");
+            assert_eq!(
+                row.contains(&A::OtherCopy),
+                cx.other_copy && kind != K::JailMissingRtkmem,
+                "another file can change every outcome but the sandbox's — {at}"
+            );
         }
         // and a transient failure without Force keeps both of its recoveries
-        let cx = FailureContext { forced: false, can_retry: true, repair_idle: true };
+        let cx = FailureContext { forced: false, can_retry: true, repair_idle: true, other_copy: false };
         let row = failure_actions(K::PlaybackInterrupted, cx);
         assert_eq!(&row[..2], &[A::TryAgain, A::ChangeQuality]);
+    }
+
+    /// **The owner's 2026-11-03 failure**: a friend's server answered the decision with
+    /// general=2007 "no media" and the stream with HTTP 400, while the household's other server
+    /// held the same film. The read-out offered *Change quality* and *Back*, and neither reaches
+    /// that copy. With another source known, the row offers it, just before *Back*.
+    #[test]
+    fn a_refused_item_held_by_another_source_offers_that_copy() {
+        use FailureAction as A;
+        let cx = FailureContext { forced: false, can_retry: true, repair_idle: true, other_copy: true };
+        assert_eq!(
+            failure_actions(FailureKind::MediaSource, cx),
+            [A::TryAgain, A::ChangeQuality, A::OtherCopy, A::Back]
+        );
+        assert_eq!(
+            failure_actions(FailureKind::DecisionRefused, cx),
+            [A::ChangeQuality, A::OtherCopy, A::Back]
+        );
+        // a fact about the TV, not the file: no copy helps
+        assert!(!failure_actions(FailureKind::JailMissingRtkmem, cx).contains(&A::OtherCopy));
     }
 
     #[test]
