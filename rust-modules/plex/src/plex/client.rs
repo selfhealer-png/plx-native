@@ -57,7 +57,7 @@ pub(super) enum JsonStatusOutcome {
 /// here rather than in [`Client::playback_identity`]: it selects server-returned metadata for
 /// browse/search reads too, not only playback protocol calls. Owned strings keep the optional
 /// locale value alive while `crate::http` borrows the slice.
-fn pms_headers(headers: &[&str]) -> Vec<String> {
+pub(super) fn pms_headers(headers: &[&str]) -> Vec<String> {
     let mut out: Vec<String> = headers.iter().map(|h| (*h).to_string()).collect();
     if let Some(language) = super::identity::language() {
         out.push(format!("X-Plex-Language: {language}"));
@@ -402,6 +402,9 @@ impl Client {
     /// changes a logical result; a controlled replay must supply that result through ingress.
     pub fn disable_data_io(&self) { self.data_io_disabled.store(true, Relaxed); }
     pub fn denied_data_requests(&self) -> u32 { self.denied_data_requests.load(Relaxed) }
+    /// Has [`Client::disable_data_io`] been called? The pure read: unlike `may_send` it counts no
+    /// denied request, so a caller may ask as often as it likes.
+    pub fn data_io_disabled(&self) -> bool { self.data_io_disabled.load(Relaxed) }
     fn may_send(&self) -> bool {
         if !self.data_io_disabled.load(Relaxed) { return true; }
         self.denied_data_requests.fetch_add(1, Relaxed);
@@ -902,6 +905,15 @@ impl QueryBuilder {
         self.parts.push(format!("{k}={v}"));
         self
     }
+    /// A term whose KEY carries the filter operator: `rating>>` with `9.49` is `rating>>=9.49` on the
+    /// wire (PMS reads the operator out of the key, `docs/pms-api.md` "Count probes at band edges").
+    /// `.str` encodes only the value, so a key with an operator in it would go out raw; here BOTH
+    /// are encoded (`rating%3E%3E=9.49`). A plain key such as `type` or `genre` comes out unchanged,
+    /// so this is also the spelling of a listing's own filter terms.
+    pub(super) fn range(mut self, field_op: &str, v: &str) -> Self {
+        self.parts.push(format!("{}={}", urlenc_str(field_op), urlenc_str(v)));
+        self
+    }
     pub(super) fn opt_int(self, k: &str, v: i64) -> Self {
         if v != 0 {
             self.int(k, v)
@@ -1145,8 +1157,9 @@ mod tests {
     /// rather than inventing a client-side substitute catalog for server-owned strings.
     #[test]
     fn pms_headers_carry_the_literal_selected_ui_language_be_included() {
-        use plx_platform::i18n::{language_on_this_thread_for_test, Preference};
-        for (pref, tag) in [(Preference::En, "en"), (Preference::Es, "es"), (Preference::Be, "be"), (Preference::Fr, "fr")] {
+        use plx_platform::i18n::{language_on_this_thread_for_test};
+        for pref in plx_platform::i18n::SHIPPED {
+            let tag = pref.tag();
             let _guard = language_on_this_thread_for_test(pref);
             let headers = pms_headers(&[ACCEPT_JSON]);
             let sent = headers.iter().find_map(|h| h.strip_prefix("X-Plex-Language: "));

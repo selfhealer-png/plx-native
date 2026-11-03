@@ -342,8 +342,10 @@ machine name (`nas-home`) only in the Sources list and the failure read-out.
   once/sec heartbeat's `route=` field no longer reads `onboard` for the Settings-opened case — only
   for the first-run one. A picker that could
   turn into an editor would let a library be un-favourited from inside the list of favourites and
-  then vanish out of it under the cursor. **Browse** is a picker — one tick, OK closes, scoped to
-  the FAVOURITES of the type being browsed. **On Home** is a toggle — the word `On`/`Off` at the
+  then vanish out of it under the cursor. **Browse** is a picker — one tick, OK closes. The "+N"
+  panel scopes it to the favourites the header fold hid; the Library's Sort & Filter menu draws the
+  same level over every library of the type that is a favourite or sits on a server the list would
+  open. **On Home** is a toggle — the word `On`/`Off` at the
   trailing edge, OK flips, the list stays open.
   Grouped by server: header = machine, accessory = person. The last favourite library uses `value_dim`;
   an unreachable server's whole group dims at .52, header included. "Check for shared libraries" sits last
@@ -390,7 +392,15 @@ not move with the words: `BrowseSection::pinned`, `HomePins`, `plex/pins.rs` and
 `home_pins` key are all unchanged, deliberately — renaming the persisted key breaks ROLLBACK rather
 than upgrade. What still comes from the GRANT and not from the setting: access itself, the grid,
 sort, the A–Z rail, and Search, which stays grant-wide and only RANKS favourite-library hits first.
-The grant decides what you can reach; the favourite decides what the app offers.
+The grant decides what you can reach; the favourite decides what the app offers, with one
+exception: Library options (the persistent ellipsis) offers hidden favorites and available
+non-favorites of the viewed type. Favorite shortcuts stay in their original positions; a hidden
+current library appears as a selected temporary pill before the ellipsis and is ticked in the
+picker. A non-favorite visit survives child-page returns, including Settings, without replacing
+the saved favorite. Leaving Library or switching media types clears that visit; the next entry
+returns to the last-used favorite. Sort & Filter changes only the listing.
+Library options also refreshes shared libraries and opens the favorites editor with a library
+breadcrumb. Back and Done return directly to that opener.
 
 **Two divergences between the canvas and main, both because main moved while it was drawn**, neither
 requiring the design to change: its toolbar frames include an `Unwatched` chip that `0d9a4f6f`
@@ -449,7 +459,7 @@ re-read cannot recover.
 - The host suite is **424** tests as of 2026-08-14 — it was recorded as 284, then as 396 in this
   note's own first draft, which was already stale when it was written. **Do not trust any number in
   any document, including this one.** Re-derive:
-  `cd rust-modules && cargo +nightly test --lib -- --list | grep -c ': test'`.
+  `cd rust-modules && cargo test --lib -- --list | grep -c ': test'`.
 
 ---
 
@@ -564,7 +574,7 @@ Step 1's registry now has its first real consumer, and deliverable A of the desi
   favourite, a stranger's included.
 - **The tab strip's vocabulary is permanent; its LENGTH is not.** A library pill names a type, never
   a discovered row, so it survives reset and failed/delayed discovery — but a type with no favourite
-  library draws no pill at all, so the row is `Home … Search` with two to four stops in between.
+  library draws no pill at all, so the row is `Home … Search` (the Watchlist bookmark sits before Search) with the row three to five stops in all.
   Store a `Pill`, never a `usize`. The
   selected type resolves to the library this profile last chose, else household-first, then to the
   first usable outside section; the Source panel
@@ -645,6 +655,44 @@ per source, off the SDL thread).
 that the pressed copy is not written twice, that a deck removal does not propagate) and the landing's
 local edit; the two-server round trip itself needs a television and both servers awake.
 
+### One tile per show in Continue Watching (#892, discussion #884)
+
+A show both your own server and a friend's hold used to be two tiles ("Social Studies" and
+"Estudios sociales"). Continue Watching now copies the official client: Plex Web 4.163.0 merges the
+row in the browser from each source's `continuewatching` hub, and so does `stores::deck_group`, run
+after `deck::merge_deck` and the pin filter.
+
+- **Episodes group by the show's catalog id** (`grandparentGuid`, decoded to `PmsMovie::show_guid`).
+  A movie, a season, and an episode whose server sent no decodable show guid never group. Legacy
+  agent guids decode to nothing, so two legacy libraries do not group (Plex Web compares the raw
+  strings and may).
+- **The first copy in roster order wins**, and a copy without Media yields to one that has it.
+  Roster order is Home's source order: the household's servers first, then each shared one
+  (`roster_with_scope`). That is not always the Library's Sources panel order, which is the
+  registry's. `lastViewedAt` only SORTS: the tile sits where its winning copy sorts.
+- **Only a copy that would be shown, from a server that answered its deck in this process and whose
+  latest deck read did not fail, can win**: a copy in a library unpinned from Home, a source that only
+  holds what was restored from earlier, or one whose deck read failed never hides another server's
+  copy. A refresh in flight does not count against a server (its tile does not flip while the
+  refresh lands), and another shelf's failing page is not a failing deck.
+- **Remove acts on the pressed copy only** (§11 is unchanged), so the other server's copy is the tile
+  afterwards, if that server's deck still lists the show. app.plex.tv does the same.
+- **Hidden only when the winner is known.** Each server's source remembers the copy of each show it
+  has listed, past the lane's trim (`deck_group::Held`, dropped by `deck::order` span, not by
+  position, because a ledger lane's positions are an order). A non-winner is hidden whenever a
+  winner is known, wherever it sorts. The residual: a winner beyond what the lane has read (past the
+  lookahead) is unknown, so two tiles of one show can appear until it is read. The published window
+  can be short when copies are hidden (about half in a household that mirrors every show); a move
+  that lands on a window of nothing but hidden copies asks on, a page further each time and
+  publishing nothing in between, until a window has a card; if the listing ends first the deck stays
+  where it was. A copy removed with Remove leaves the facts at once; one a server stops listing
+  deeper than its lane has read is dropped only when the lane next covers its place.
+- **Mark watched** flags the pressed copy and, a round trip later, the other copy in place (§11);
+  neither leaves the deck until the refetch, so the tile does not flip to the other server's copy
+  at the press. There is no separate retirement. One transient remains: if the winner's server
+  drops a finished show first, the other server's copy shows until its own refetch lands, as in
+  Plex Web.
+
 ## 12. The Home selection, per PROFILE — deliverable F (2026-08-21)
 
 The canvas's first-run route was built in `ui/onboard.rs` (phase 5b, 2026-09-07, moved it to
@@ -703,9 +751,9 @@ writes for retry when the worker queue cannot admit them. `browse.rs` is the plu
 around them, and a selection PERSISTS: every flip was in-memory before 2026-08-21, so a selection
 made in the Sources panel was gone by the next boot and the default came back, which reads as the
 switch not working. Since 2026-09-04 the write
-is `browse::apply_pins`, once, when the Home editor's `Done`/`Start watching` commits its draft — a
-flip edits the in-memory draft and nothing is written until then (`toggle_pin`, the old per-press
-write, is a test-only fixture now).
+is `browse::apply_pins_from`. First run stages the choices until `Start watching`; the Settings
+and contextual Library editors send `ApplyPins` on each switch, so Back and Done both retain the
+changes. `toggle_pin`, the old direct mutator, remains a test-only fixture.
 
 ### Where the implementation reinterprets the canvas
 
@@ -771,7 +819,7 @@ Two halves close it, both in `browse.rs`, and both keyed on the machine id becau
 name a record has:
 
 - **`RECORDED`** — the current profile's persisted answer, kept in memory from the read
-  `resolve_pins` already makes, and joined into `library_pins()` for every roster source the section
+  `resolve_pins_from` already makes, and joined into `library_pins()` for every roster source the section
   table does NOT hold. The record is on disk keyed by machine; that is exactly the join that was
   missing. It is a snapshot rather than a per-call read because `library_pins` is reached from
   Home's own pump, and `session.rs` forbids a per-frame file read.

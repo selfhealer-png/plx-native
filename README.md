@@ -35,10 +35,17 @@ simulator, browsing a demo library of openly licensed films
 
 ![Library](docs/screenshots/library.jpg)
 
-**Library** — a library opens on its own shelves: what you're partway through, with the time
-left under the focused card, and what just landed. Further down is the full grid, with sort,
-filter (including unwatched-only) and an A–Z rail down the side
+**Library** — a library opens on its full poster grid, with an A–Z rail down the side and one
+header row for sort & filter (including unwatched-only), a Collections page and a Recommended
+page. The shelves live on Recommended: what you're partway through, with the time left under
+the focused card, and what just landed
 ([pictured here](docs/screenshots/ux-library-grid.jpg)).
+Settings → Libraries → Under posters also has a **Sort value** switch (on by default, per
+profile). In a movie or TV show library sorted by something other than Title or Random (its movies, shows, seasons or
+episodes), every card shows the value it is sorted by on one line under it (a score, a length, a date as Today,
+Yesterday, 27 Oct or Oct 2024), in place of the title and details line; a sort with no value to show, such as
+the Show order of Seasons and Episodes, keeps the usual captions. It uses the existing sort menu; other poster
+surfaces keep their usual captions.
 
 ![Search](docs/screenshots/search.jpg)
 
@@ -55,7 +62,8 @@ itself. (In this capture the frame under it was decoded by the simulator.)
   frame-rate regression scenes that measure it on the television rather than trusting it.
 - **Sign in on the TV** with an on-screen QR code and pick a Plex Home profile.
 - **Browse and search your libraries** — on your own servers and on ones shared with you. Your
-  servers' libraries, that is, not Plex's catalogue or Watchlist.
+  servers' libraries, that is, plus the plex.tv Watchlist as its own tab, where any title can be added or
+  removed; search covers servers only.
 - **Direct play** H.264 and HEVC — 4K, 10-bit, Dolby Vision profiles 5 and 8, E-AC-3 Atmos, and AV1 or VP9 (10-bit VP9 only on webOS 4 sets)
   on televisions whose codec table lists that decoder — decided against your television's own
   codec table where it publishes one. Anything else the server transcodes, and you can switch a
@@ -66,20 +74,25 @@ itself. (In this capture the frame under it was decoded by the simulator.)
 
 ## Will it work on my television?
 
-**It needs webOS 4.0 or newer**, with one tested exception: a 2016 set on **webOS 3.4.3** signs
+**It needs webOS 4.0 or newer**, with two tested exceptions: a 2016 set on **webOS 3.4.3** signs
 in, browses, searches and plays (direct play, transcodes, subtitles and seeking) through Developer
-Mode. Other 3.x releases are untested, and anything older than 3.4 is unknown. Past that, it most
+Mode, and a 2018 set on **webOS 3.9.3** plays direct play the same way when built from source at
+or after [`60f99c7`](https://github.com/GLinnik21/plx-native/commit/60f99c7) — the catalogue's
+prebuilt v0.8.0 predates that fix (see [Known issues](#known-issues)). Other 3.x releases are
+untested, and anything older than 3.4 is unknown. Past that, it most
 likely will. I develop and test on a 2019 set, and opt-in usage reports show
 video playing on sets from 2018 through the newest, on webOS 11 — both direct play and server
 transcodes, Developer Mode installs included.
+
+Owners' reports, set by set, are in the [compatibility list](docs/compatibility.md).
 
 ### Known issues
 
 | Where | What happens |
 |---|---|
 | **Some 2019 sets on LG's k5lp or k3lp chip**, installed through Developer Mode | Video won't play. On these sets LG's Developer Mode sandbox can withhold a device the video path needs — Kodi and Moonlight hit the same wall. The app checks for it and says so instead of crashing; other sets on the same chip play normally. On a rooted TV with Homebrew Channel, the failure screen offers **Repair**, which applies the Homebrew Channel fix to the sandbox (one owner fixed it this way from a root shell; the button itself hasn't been run on an affected set yet). Without root there is no fix. |
-| **2018 sets on firmware that reports platform release 3.9.3** | Sign-in and browsing work, but video has never been seen to start on one, and no error is reported either: [#249](https://github.com/GLinnik21/plx-native/issues/249). |
-| **webOS 3.x** | Seeking restarts the stream at the new position instead of jumping in place, so each seek takes a moment longer. In-place seek depends on the internal layout of LG's 4.x media player, and on 3.4 that layout differs. |
+| **2018 sets on firmware that reports platform release 3.9.3** | Sign-in and browsing work. The prebuilt **v0.8.0** holds a strong ELF reference to the cxx11 `StarfishMediaAPIs::Feed` symbol, which 3.x `libplayerAPIs` does not export, so on the prebuilt video never starts and no error is reported: [#249](https://github.com/GLinnik21/plx-native/issues/249). A source build at or after [`60f99c7`](https://github.com/GLinnik21/plx-native/commit/60f99c7) resolves Feed with a dual-ABI `dlsym` and plays direct play on a 2018 C7 (W17H chassis, 3.9.3). |
+| **webOS 3.x** | Seeking jumps in place through LG's public `Seek`, as on webOS 5 and newer (tested on platform release 3.9.3 only). The in-place path webOS 4 uses depends on the internal layout of LG's 4.x media player, which differs on 3.x, so it is not used there. A set that refuses `Seek` falls back to restarting the stream at the new position, as all 3.x sets did before. Menus can drop frames at 1920x1080 on these sets; **Settings → System → Interface resolution** trades sharper text for smoother menus. |
 | **Sets on LG's k6hp chip** | A crash seen in opt-in crash reports and not reproduced here, because I have no such set: [#174](https://github.com/GLinnik21/plx-native/issues/174). |
 
 ### Rooted or not
@@ -91,7 +104,8 @@ A rooted TV with Homebrew Channel has no expiry.
 
 If something goes wrong, check [Troubleshooting](docs/troubleshooting.md) first, then
 [tell me what happened](https://github.com/GLinnik21/plx-native/issues/new/choose) — and if you own one of the
-sets above, it working is as useful a report as it failing.
+sets above, it working is as useful a report as it failing: post it under
+[Discussions > Compatibility](https://github.com/GLinnik21/plx-native/discussions/categories/compatibility).
 
 ## Installing
 
@@ -148,7 +162,8 @@ the final release over it either: reinstall the final by hand once it is out.
 ## Privacy
 
 **Your library data never reaches me.** The app talks to your Plex server, to `plex.tv` to sign in,
-and to `discover.provider.plex.tv` for cast biographies.
+and to `discover.provider.plex.tv` for cast biographies and the Watchlist (reading it, and adding or
+removing a title when you ask, with the active profile's plex.tv token).
 
 **Crash reports and usage analytics are off until you turn them on** — two separate first-run
 questions, each answerable with Don't Share, both reversible later under Account → Settings →

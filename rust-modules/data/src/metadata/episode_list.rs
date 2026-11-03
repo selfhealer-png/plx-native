@@ -75,12 +75,13 @@ impl EpisodeList {
     }
 
     /// The loaded index closest to `i`; a tie goes to the lower. `None` when nothing has landed.
+    /// An index past a page's last row is not on it, so the answer is always a loaded index.
     pub fn nearest_loaded(&self, i: usize) -> Option<usize> {
         let pages = self.cache.page_count();
         let held = |p: usize| self.cache.page_rows(p).filter(|rows| !rows.is_empty());
         let home = (i / PAGE).min(pages.checked_sub(1)?);
         let below = (0..=home).rev().find_map(|p| held(p).map(|rows| (p * PAGE + rows.len() - 1).min(i)));
-        let above = (home..pages).find_map(|p| held(p).map(|_| (p * PAGE).max(i)));
+        let above = (home..pages).find_map(|p| held(p).filter(|rows| i < p * PAGE + rows.len()).map(|_| (p * PAGE).max(i)));
         match (below, above) {
             (Some(lo), Some(hi)) => Some(if i - lo <= hi - i { lo } else { hi }),
             (lo, hi) => lo.or(hi),
@@ -98,6 +99,23 @@ impl EpisodeList {
         rows.truncate(self.span(page));
         if self.cache.set_rows(page, rows) {
             self.rev += 1;
+        }
+    }
+
+    /// Puts the pages `old` holds, and this list lacks, onto this one. For a fresh read of the SAME
+    /// season (the caller has checked that): the read brings page 0 alone, and the pages the strip
+    /// had reached stay in place so the episode under the focus is still there. A list of another
+    /// length is another listing, and carries nothing.
+    pub fn carry_pages_from(&mut self, old: &EpisodeList) {
+        if old.len() != self.len() {
+            return;
+        }
+        for page in 0..self.cache.page_count() {
+            if self.cache.page_rows(page).is_none() {
+                if let Some(rows) = old.cache.page_rows(page) {
+                    self.set_page(page, rows.to_vec());
+                }
+            }
         }
     }
 
@@ -310,6 +328,25 @@ mod tests {
         assert_eq!(list.position("e75"), Some(75));
         assert_eq!(list.position("e0"), None, "page 0 has not landed");
         assert_eq!(list.position("e125"), None, "page 2 has not landed");
+    }
+
+    #[test]
+    fn nearest_loaded_is_always_a_loaded_index() {
+        // A short season is one partly filled page: an index past its last row is not loaded.
+        let short = EpisodeList::from(rows(0, 3));
+        assert_eq!(short.nearest_loaded(1), Some(1));
+        assert_eq!(short.nearest_loaded(3), Some(2), "past the last row is the last row");
+        assert_eq!(short.nearest_loaded(59), Some(2));
+        // Pages 0 and 2 of three loaded, page 1 a hole: the closer edge wins, a tie goes lower.
+        let mut holey = EpisodeList::with_total(130);
+        holey.set_page(0, rows(0, 60));
+        holey.set_page(2, rows(120, 130));
+        assert_eq!(holey.nearest_loaded(65), Some(59));
+        assert_eq!(holey.nearest_loaded(100), Some(120));
+        assert_eq!(holey.nearest_loaded(89), Some(59), "30 from 59 and 31 from 120");
+        assert_eq!(holey.nearest_loaded(90), Some(120), "31 from 59 and 30 from 120");
+        assert_eq!(holey.nearest_loaded(500), Some(129), "past the season is the last row");
+        assert_eq!(EpisodeList::with_total(130).nearest_loaded(5), None, "nothing has landed");
     }
 
     #[test]

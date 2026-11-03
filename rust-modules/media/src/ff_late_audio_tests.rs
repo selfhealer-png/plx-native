@@ -27,6 +27,21 @@
 //! A fourth pins the other side of the grant: an ORDINARY interleaved file, whose video lane never
 //! fills before its first audio packet, never has its cap raised at all.
 //!
+//! **The mirror image (issue #600, the tests at the end of the file).** Audio stored AHEAD of the
+//! first video block fills the audio lane instead. The audio lane may run past its soft cap while
+//! the video lane is starved ([`AUDIO_AHEAD_HEADROOM`], `aq::PushGate`): the same harness pins that
+//! the first video AU still arrives for an audio-only PREFIX (`tests/mkv_audio_lead.py`), that a
+//! CONSTANT skew (every audio block stored beside the video 48 s earlier, the likelier real layout)
+//! primes and then plays on without the demuxer parking, that the ceiling fails the open even when
+//! the pipeline has popped some audio, and that an interleaved file never queues audio past its
+//! soft cap. The skew test drives the real lanes with a stand-in consumer ([`drive_consumer`]).
+//!
+//! **A video stream that is not length-prefixed (issue #1084, the tests at the very end).** The
+//! route direct-plays by the part's file NAME, so an MPEG-TS called `.mp4` reaches the demuxer with
+//! start codes in every packet and no avcC record. The same harness pins that its H.264 arrives as
+//! whole access units (SPS, PPS and the IDR slice, not a five-byte delimiter), that a capture cut
+//! mid-GOP starts on its first keyframe, and that HEVC in a transport stream is refused.
+//!
 //! **The fixture.** H.264 from a noise source at 12 Mbit/s: noise is how ~13 MB of video is made
 //! to precede the first audio packet in a few seconds of encoding (the real film got there with
 //! 9.5 Mbit/s of near-black frames over 11 s; black would need the same bitrate to be forced, and
@@ -35,13 +50,14 @@
 //!
 //! Like `ff_image_subtitle_tests`, it needs the host FFmpeg libraries, so it is `#[ignore]`d in the
 //! plain suite. It skips (returns, loudly) when the `ffmpeg` / `ffprobe` command line tools are
-//! absent. Run it with:
+//! absent, except under `CI`, where that is a failure. Run it with:
 //! `cd rust-modules && PLX_FFMPEG_DIR=<dir holding libav*-plx.*.dylib> CARGO_INCREMENTAL=0
-//! cargo +nightly test --lib -p plx_media ff::late_audio_tests -- --ignored`
+//! cargo test --lib -p plx_media ff::late_audio_tests -- --ignored`
 //! (`make check-ffmpeg` stages the libraries into `pkg/`, which is the default directory).
 
 use super::*;
 use super::image_subtitle_tests::bind_host_ffmpeg;
+use crate::aq::AuNode;
 use std::io::{Read, Write};
 use std::os::raw::c_long;
 use std::path::{Path, PathBuf};
@@ -279,7 +295,8 @@ struct DemuxRun {
 }
 
 impl DemuxRun {
-    fn start(port: u16) -> DemuxRun {
+    /// `acodec` is the audio codec the Load payload names.
+    fn start(port: u16, acodec: &'static str) -> DemuxRun {
         let (video_cap, audio_cap) = crate::player::engine::aq_caps();
         let mut video = crate::aq::aq_new(video_cap as c_long);
         let mut audio = crate::aq::aq_new(audio_cap as c_long);
@@ -293,7 +310,7 @@ impl DemuxRun {
         let thread = std::thread::spawn(move || {
             let off = plx_base::task::OffFrame::for_test();
             // `acodec` is the Load payload's audio codec: the demuxer feeds the track that matches.
-            demux(&off, origin, "/library/parts/1/file.mkv".into(), "eac3".into(), None, None, vp, ap, hp)
+            demux(&off, origin, "/library/parts/1/file.mkv".into(), acodec.into(), None, None, vp, ap, hp)
         });
         DemuxRun { video, audio, thread: Some(thread), hs }
     }
@@ -306,6 +323,11 @@ impl DemuxRun {
     /// The video lane, for a probe that watches it from another thread.
     fn video_lane(&mut self) -> *mut AuQueue {
         &mut *self.video as *mut AuQueue
+    }
+
+    /// The audio lane, likewise.
+    fn audio_lane(&mut self) -> *mut AuQueue {
+        &mut *self.audio as *mut AuQueue
     }
 
     /// Pop the audio lane until it has delivered `want_span_ns` of audio (last AU's pts minus the
@@ -369,6 +391,7 @@ struct Prepared {
     video_before: u64,
     _server: FileServer,
     _scratch: Scratch,
+    _ffmpeg: super::image_subtitle_tests::HostFfmpeg,
 }
 
 /// Build the fixture, prove its shape, serve it and start demuxing it. `None` when the tools are
@@ -379,13 +402,26 @@ fn prepare(tag: &str, audio_delay_s: f64, video_s: u32) -> Option<Prepared> {
 
 /// [`prepare`] over a fixture `make` writes into the scratch directory.
 fn prepare_with(tag: &str, make: impl FnOnce(&Path) -> PathBuf) -> Option<Prepared> {
+    prepare_with_audio(tag, "eac3", make)
+}
+
+/// [`prepare_with`] for a fixture whose audio is `acodec` (the name the Load payload carries).
+fn prepare_with_audio(tag: &str, acodec: &'static str, make: impl FnOnce(&Path) -> PathBuf) -> Option<Prepared> {
+    prepare_at(tag, acodec, -1, make)
+}
+
+/// [`prepare_with_audio`] with a seek armed before the first read (`seek_ns`, content time; -1 for
+/// none): what a resume publishes, and what the demuxer services before it reads anything.
+fn prepare_at(tag: &str, acodec: &'static str, seek_ns: i64, make: impl FnOnce(&Path) -> PathBuf) -> Option<Prepared> {
     if !tool_present("ffmpeg") || !tool_present("ffprobe") {
+        // A skip is for a developer machine; CI installs the tools, and a gate that skips there
+        // is a gate that is not running (`CI` is set by GitHub Actions).
+        assert!(std::env::var_os("CI").is_none(), "{tag}: ffmpeg / ffprobe are missing under CI");
         eprintln!("SKIP {tag}: the ffmpeg / ffprobe command line tools are not installed");
         return None;
     }
-    bind_host_ffmpeg();
-    super::ABI_OK.store(true, Ordering::Relaxed);
-    SHARED.seek_to_ns.store(-1, Ordering::Relaxed);
+    let ffmpeg = bind_host_ffmpeg();
+    SHARED.seek_to_ns.store(seek_ns, Ordering::Relaxed);
     SHARED.desired_audio_idx.store(-1, Ordering::Relaxed);
     SHARED.dg_load_v.store(0, Ordering::Relaxed);
     SHARED.side_subs_owner.store(false, Ordering::Relaxed);
@@ -400,8 +436,61 @@ fn prepare_with(tag: &str, make: impl FnOnce(&Path) -> PathBuf) -> Option<Prepar
         "{tag}: fixture first audio packet at {first_audio_s:.3} s, {video_before} bytes of video before it"
     );
     let server = FileServer::start(&file);
-    let run = DemuxRun::start(server.port);
-    Some(Prepared { run, first_audio_s, video_before, _server: server, _scratch: scratch })
+    let run = DemuxRun::start(server.port, acodec);
+    Some(Prepared { run, first_audio_s, video_before, _server: server, _scratch: scratch, _ffmpeg: ffmpeg })
+}
+
+/// Watches one lane's cap and queued bytes from another thread while the demuxer runs.
+///
+/// A demux of a four second fixture ends in milliseconds, so the test thread can see it finished
+/// before the OS has scheduled this thread at all (a loaded CI runner did, twice: "0 bytes").
+/// The thread therefore reads the stop flag BEFORE each sample and stops only after a sample that
+/// followed it, so one sample is always taken after the demuxer has ended. The lanes the tests
+/// watch are never popped, so that last sample is also the peak.
+struct LaneProbe {
+    stop: std::sync::Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<(i64, i64)>,
+}
+
+impl LaneProbe {
+    fn start(lane: *mut AuQueue) -> LaneProbe {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let lane = lane as usize;
+        let thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let (mut max_cap, mut max_queued) = (0i64, 0i64);
+                loop {
+                    let last = stop.load(Ordering::Acquire);
+                    max_cap = max_cap.max(i64::from(crate::aq::aq_cap(lane as *mut AuQueue)));
+                    max_queued = max_queued.max(i64::from(crate::aq::aq_bytes(lane as *mut AuQueue)));
+                    if last {
+                        return (max_cap, max_queued);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        LaneProbe { stop, thread }
+    }
+
+    /// Stop the probe; `(largest cap seen, most bytes queued seen)`.
+    fn finish(self) -> (i64, i64) {
+        self.stop.store(true, Ordering::Release);
+        self.thread.join().expect("lane probe")
+    }
+}
+
+/// The probe samples at least once however soon it is finished (no ffmpeg needed).
+#[test]
+fn a_lane_probe_finished_at_once_still_samples_the_lane() {
+    let mut q = crate::aq::aq_new(4096);
+    let au = [0u8; 100];
+    assert_eq!(crate::aq::aq_push(&mut *q, au.as_ptr(), au.len() as std::os::raw::c_int, 0, 1, 1), 0);
+    for round in 0..200 {
+        let probe = LaneProbe::start(&mut *q);
+        assert_eq!(probe.finish(), (4096, 100), "round {round}");
+    }
 }
 
 /// [`prepare`], then report what reached the audio lane within the deadline.
@@ -572,34 +661,741 @@ fn an_ordinary_file_never_raises_the_video_lane_cap() {
     );
 
     // Watch the cap from outside while the demuxer runs.
-    let lane = p.run.video_lane() as usize;
-    let max_cap = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let sampler = {
-        let (max_cap, stop) = (max_cap.clone(), stop.clone());
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                let cap = i64::from(crate::aq::aq_cap(lane as *mut AuQueue));
-                max_cap.fetch_max(cap, Ordering::AcqRel);
-                std::thread::yield_now();
-            }
-        })
-    };
+    let probe = LaneProbe::start(p.run.video_lane());
     let until = Instant::now() + FIRST_AUDIO_DEADLINE;
     while !p.run.finished() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));
     }
-    stop.store(true, Ordering::Release);
-    sampler.join().expect("sampler");
+    let (max_cap, _) = probe.finish();
 
     assert!(p.run.finished(), "the demuxer must reach the end of a four second file");
     assert!(!SHARED.demux_failed.load(Ordering::Acquire), "the open must not fail");
     let held = i64::from(crate::aq::aq_bytes(&mut *p.run.video));
     assert!(held > 0 && held < base, "the whole file sits in the video lane: {held} bytes");
     assert_eq!(
-        max_cap.load(Ordering::Acquire),
-        base,
+        max_cap, base,
         "a file whose video never fills the lane must keep the lane's base cap throughout \
          (a grant was taken although no push ever parked)"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The mirror image: audio stored AHEAD of the video (issue #600).
+// ---------------------------------------------------------------------------------------------
+//
+// A muxer that leads with audio (issue #600's film: ~48 s of E-AC-3, 4.6 MB, before the first
+// video block, whose timestamp is still 0) fills the AUDIO lane (`engine::aq_caps().1`, 1 MiB,
+// ~10.9 s of 768 kbit/s audio) before the first video packet is read. The demuxer parked in
+// `aq_push` on the full audio lane, and nothing drains audio before video has started: a start
+// that buffered forever with `feed a#1..4` in the log and no `ff: AU#0`. The fixture here is a
+// normally interleaved file whose audio blocks below a lead are re-stored in front of the first
+// video block by `tests/mkv_audio_lead.py` (timestamps untouched), so the layout is the muxer's.
+
+/// How far ahead of the video the audio is stored in the first fixture: 20 s of 640 kbit/s E-AC-3
+/// is ~1.6 MB, over the audio lane's 1 MiB base cap and far under the headroom.
+const EARLY_AUDIO_LEAD_S: f64 = 20.0;
+
+/// E-AC-3 bitrate of the early-audio fixtures, bits per second (the most the encoder will write).
+const EARLY_AUDIO_BPS: i64 = 640_000;
+
+/// Write an interleaved MKV (`audio_s` seconds of E-AC-3, 4 s of low-rate H.264 noise) and re-store
+/// every audio block with a timestamp below `lead_s` ahead of the first video block with
+/// `tests/mkv_audio_lead.py`. Asserts the resulting layout: at least `min_audio_bytes` of audio
+/// precede the first video packet (file order) and that packet is still at pts 0.
+fn generate_early(dir: &Path, audio_s: u32, lead_s: f64, min_audio_bytes: u64) -> PathBuf {
+    let interleaved = dir.join("interleaved.mkv");
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "color=c=gray:s=640x360:r=25:d=4,noise=alls=100:allf=t+u"])
+        .args(["-f", "lavfi", "-i", &format!("sine=frequency=440:sample_rate=48000:duration={audio_s}")])
+        .args(["-map", "0:v", "-map", "1:a"])
+        // B-frames on (ultrafast turns them off): decode order differs from pts order, which is what
+        // `assert_video_order_kept` needs to see a fixture that re-sorts a track's blocks.
+        .args(["-c:v", "libx264", "-preset", "ultrafast", "-bf", "2", "-pix_fmt", "yuv420p", "-g", "25"])
+        .args(["-b:v", "1M", "-maxrate", "1M", "-bufsize", "1M"])
+        .args(["-c:a", "eac3", "-b:a", &format!("{}k", EARLY_AUDIO_BPS / 1000)])
+        .arg(&interleaved)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg could not write the interleaved fixture");
+    let out = dir.join("early_audio.mkv");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/mkv_audio_lead.py");
+    let status = Command::new("python3")
+        .arg("-I")
+        .arg(&script)
+        .arg(&interleaved)
+        .arg(&out)
+        .arg(format!("{lead_s}"))
+        .stdout(Stdio::null())
+        .status()
+        .expect("run python3");
+    assert!(status.success(), "tests/mkv_audio_lead.py could not reorder the fixture");
+    assert_video_order_kept(&interleaved, &out);
+    let (audio_before, first_video_s) = audio_bytes_before_first_video(&out);
+    eprintln!("fixture: {audio_before} bytes of audio precede the first video packet (pts {first_video_s:.3} s)");
+    assert!(first_video_s.abs() < 0.1, "fixture: the first video packet must still be at pts 0, got {first_video_s}");
+    assert!(
+        audio_before >= min_audio_bytes,
+        "fixture: {audio_before} bytes of audio must precede the first video packet, wanted at least {min_audio_bytes}"
+    );
+    out
+}
+
+/// The video packets' pts (as ffprobe prints them) in FILE order. A reordering fixture may change
+/// the interleave of audio against video but never a track's own order: video with B-frames is
+/// stored in decode order, and a file that sorts it by pts does not decode (#600).
+fn video_pts_in_file_order(path: &Path) -> Vec<String> {
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v", "-show_entries", "packet=pts", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(probe.status.success(), "ffprobe could not list the video packets of {}", path.display());
+    String::from_utf8_lossy(&probe.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+}
+
+/// Assert `out` keeps the video packet sequence of `src` exactly, in order.
+fn assert_video_order_kept(src: &Path, out: &Path) {
+    let (a, b) = (video_pts_in_file_order(src), video_pts_in_file_order(out));
+    assert!(!a.is_empty(), "the source fixture has no video packets");
+    assert_eq!(a, b, "tests/mkv_audio_lead.py must keep the video packets in their original (decode) order");
+}
+
+/// Read the fixture back in FILE order: `(bytes of audio packets before the first video packet,
+/// that video packet's pts in seconds)`.
+fn audio_bytes_before_first_video(path: &Path) -> (u64, f64) {
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "packet=stream_index,codec_type,pts_time,size"])
+        .args(["-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(probe.status.success(), "ffprobe could not read the early-audio fixture");
+    let mut audio = 0u64;
+    for line in String::from_utf8_lossy(&probe.stdout).lines() {
+        let f: Vec<&str> = line.trim().split(',').collect();
+        if f.len() < 4 {
+            continue;
+        }
+        let (Ok(pts), Ok(size)) = (f[2].parse::<f64>(), f[3].parse::<u64>()) else {
+            continue;
+        };
+        if f[0] == "audio" {
+            audio += size;
+        } else {
+            return (audio, pts);
+        }
+    }
+    panic!("the early-audio fixture has no video packets");
+}
+
+/// Wait until the video lane holds an AU, then pop it: `(pts_ns, key)`. `None` at the deadline.
+fn first_video_au(run: &mut DemuxRun, deadline: Duration) -> Option<(i64, i32)> {
+    first_video_au_bytes(run, deadline).map(|(pts, key, _)| (pts, key))
+}
+
+/// [`first_video_au`] with the access unit's bytes as the lane held them.
+fn first_video_au_bytes(run: &mut DemuxRun, deadline: Duration) -> Option<(i64, i32, Vec<u8>)> {
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        if crate::aq::aq_bytes(&mut *run.video) > 0 {
+            let node = crate::aq::aq_pop(&mut *run.video, std::ptr::null_mut());
+            if !node.is_null() {
+                let (es, key, pts, len, data) = unsafe { crate::aq::au_fields(node) };
+                let bytes = unsafe { std::slice::from_raw_parts(data, len.max(0) as usize) }.to_vec();
+                unsafe { libc::free(node as *mut c_void) };
+                assert_eq!(es, 1, "the video lane carries es=1 AUs");
+                return Some((pts, key, bytes));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+/// **Issue #600.** ~1.6 MB of audio is stored before the first video block, over the audio lane's
+/// base cap, and nothing drains audio. The first video AU (pts 0, a keyframe) must still reach the
+/// video lane: the demuxer must not park on the full audio lane in front of it.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI — see the module doc"]
+fn an_early_audio_track_does_not_park_the_demuxer_before_the_first_video_au() {
+    let _g = plx_base::testlock::serial();
+    let (_, audio_cap) = crate::player::engine::aq_caps();
+    let Some(mut p) = prepare_with("early", |d| {
+        generate_early(d, 30, EARLY_AUDIO_LEAD_S, audio_cap as u64 + 256 * 1024)
+    }) else {
+        return;
+    };
+    let au = first_video_au(&mut p.run, FIRST_AUDIO_DEADLINE);
+    let (pts, key) = au.unwrap_or_else(|| {
+        panic!(
+            "no video AU reached the video lane within {FIRST_AUDIO_DEADLINE:?}: the demuxer is parked \
+             behind a full audio lane (holds {} bytes, base cap {audio_cap}) and never read the first \
+             video packet",
+            crate::aq::aq_bytes(&mut *p.run.audio)
+        )
+    });
+    assert_eq!(pts, 0, "the first video AU is the one at pts 0");
+    assert_eq!(key, 1, "the first video AU is a keyframe");
+    assert!(!SHARED.demux_failed.load(Ordering::Acquire), "the open must not fail");
+}
+
+/// **The bound.** Audio so far ahead that it outruns even the audio headroom: no video will ever be
+/// read and the pipeline has accepted only a few audio AUs, so the demuxer must fail the open (`demux_io_failed`, the
+/// same way the late-audio path does) instead of parking, with the video lane still empty.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI — see the module doc"]
+fn an_audio_lane_filled_to_the_headroom_with_no_video_fails_the_open() {
+    let _g = plx_base::testlock::serial();
+    let cap = crate::player::engine::aq_caps().1 + AUDIO_AHEAD_HEADROOM as i64;
+    // Audio for the whole headroom and then some, at the encoder's top rate: 640 kbit/s is 80 KB/s.
+    let lead_s = (cap / (EARLY_AUDIO_BPS / 8)) as f64 + 20.0;
+    let Some(mut p) = prepare_with("early-exhausted", |d| {
+        generate_early(d, lead_s as u32 + 5, lead_s, cap as u64 + 1024 * 1024)
+    }) else {
+        return;
+    };
+    // The engine pops the audio lane BEFORE any video exists (`feed_audio_lane` feeds audio until the
+    // pipeline answers BufferFull; device log `feed a#1 ... qbytes=568320`). Do what it does: the
+    // pipeline accepts `AUDIO_ACCEPTED_AUS` AUs, then stops. A "spent, so the consumer is draining"
+    // rule reads those pops as a healthy consumer and parks untimed, which is the original hang.
+    // The pops must land WHILE the lane is filling (the demuxer pushes 17 MiB in tens of
+    // milliseconds), so wait for the lane to pass its base cap and then pop at once, a pop per
+    // 50 us, rather than after the demuxer has already reached the end of the headroom.
+    let base_cap = crate::player::engine::aq_caps().1 as i64;
+    let wait = Instant::now() + FIRST_AUDIO_DEADLINE;
+    while i64::from(crate::aq::aq_bytes(&mut *p.run.audio)) <= base_cap && Instant::now() < wait {
+        std::hint::spin_loop();
+    }
+    for _ in 0..AUDIO_ACCEPTED_AUS {
+        let node = crate::aq::aq_pop(&mut *p.run.audio, std::ptr::null_mut());
+        assert!(!node.is_null(), "the lane holds more than its base cap");
+        unsafe { libc::free(node as *mut c_void) };
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    let until = Instant::now() + FIRST_AUDIO_DEADLINE;
+    while !SHARED.demux_io_failed.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let held = i64::from(crate::aq::aq_bytes(&mut *p.run.audio));
+    assert!(
+        SHARED.demux_io_failed.load(Ordering::Acquire) && SHARED.demux_failed.load(Ordering::Acquire),
+        "the demuxer must report the exhausted headroom within {FIRST_AUDIO_DEADLINE:?} (audio lane holds {held} \
+         bytes, cap {cap}), not park on the full audio lane for good"
+    );
+    assert_eq!(crate::aq::aq_bytes(&mut *p.run.video), 0, "no video was ever read");
+    assert!(
+        held <= cap + 1024 * 1024 && held > crate::player::engine::aq_caps().1,
+        "the lane filled past its base cap into the headroom: {held} bytes"
+    );
+}
+
+/// **An ordinary file never sees the audio headroom.** Audio leads the first video packet by
+/// 0.3 s (a few KB, as in many muxers), far under the audio lane's base cap: the lane must never
+/// queue more than that soft cap, and its cap never moves, while the demuxer runs to the end of
+/// the file.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI — see the module doc"]
+fn an_interleaved_file_never_queues_audio_past_the_soft_cap() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_with("early-ordinary", |d| generate_early(d, 4, 0.3, 1024)) else {
+        return;
+    };
+    let base = crate::player::engine::aq_caps().1;
+    let probe = LaneProbe::start(p.run.audio_lane());
+    let until = Instant::now() + FIRST_AUDIO_DEADLINE;
+    while !p.run.finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (max_cap, queued) = probe.finish();
+
+    assert!(p.run.finished(), "the demuxer must reach the end of a four second file");
+    assert!(!SHARED.demux_failed.load(Ordering::Acquire), "the open must not fail");
+    assert!(crate::aq::aq_bytes(&mut *p.run.video) > 0, "the video was read");
+    assert_eq!(max_cap, base, "the audio lane's cap never moves");
+    assert!(
+        queued > 0 && queued < base,
+        "a file whose audio never fills the lane keeps it under its soft cap throughout: {queued} bytes"
+    );
+}
+
+/// How many audio AUs the stand-in pipeline accepts before it answers BufferFull. The device log
+/// shows ~568 KB queued behind `feed a#1`; 40 AUs of E-AC-3 are ~1.3 s of audio, deliberately fewer
+/// than the engine's prime needs of video-side time, so a rule that leans on audio pops fails.
+const AUDIO_ACCEPTED_AUS: usize = 40;
+
+// ---------------------------------------------------------------------------------------------
+// The constant-skew layout: audio stays ahead of the video for the WHOLE file (issue #600).
+// ---------------------------------------------------------------------------------------------
+//
+// A muxer that wrote its audio 48 s ahead keeps that skew: after the audio-only prefix, audio at
+// pts t is stored beside video at pts t-48. The audio lane then holds ~the whole skew for the whole
+// film (3.8 MB at 640 kbit/s), far over its 1 MiB base cap, and the demuxer must neither park on it
+// while the consumer is short of video (before Play: under the prime; during play: under the pump's
+// feed-ahead target) nor let the video fall behind mid-film.
+
+/// The audio lead of the skew fixture, seconds (issue #600's film: ~48 s).
+const SKEW_LEAD_S: f64 = 48.0;
+
+/// Seconds of video in the skew fixture, and how much of it the consumer must read.
+const SKEW_VIDEO_S: u32 = 65;
+const SKEW_READ_TO_S: i64 = 60;
+
+/// Write the constant-skew MKV: [`SKEW_VIDEO_S`] s of 1 Mbit/s H.264 noise and `SKEW_VIDEO_S +
+/// SKEW_LEAD_S` s of E-AC-3, every audio block re-stored beside the video `SKEW_LEAD_S` earlier.
+/// Proves the layout from the file in FILE order: the audio-only prefix is at least the lead's worth
+/// of bytes and, at the video block at pts 30 s, the most recently stored audio block is ~48 s ahead.
+fn generate_skew(dir: &Path) -> PathBuf {
+    let interleaved = dir.join("interleaved.mkv");
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", &format!("color=c=gray:s=640x360:r=25:d={SKEW_VIDEO_S},noise=alls=100:allf=t+u")])
+        .args(["-f", "lavfi", "-i", &format!("sine=frequency=440:sample_rate=48000:duration={}", SKEW_VIDEO_S as f64 + SKEW_LEAD_S)])
+        .args(["-map", "0:v", "-map", "1:a"])
+        // B-frames on (ultrafast turns them off): decode order differs from pts order, which is what
+        // `assert_video_order_kept` needs to see a fixture that re-sorts a track's blocks.
+        .args(["-c:v", "libx264", "-preset", "ultrafast", "-bf", "2", "-pix_fmt", "yuv420p", "-g", "25"])
+        .args(["-b:v", "1M", "-maxrate", "1M", "-bufsize", "1M"])
+        .args(["-c:a", "eac3", "-b:a", &format!("{}k", EARLY_AUDIO_BPS / 1000)])
+        .arg(&interleaved)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg could not write the interleaved skew fixture");
+    let out = dir.join("skew_audio.mkv");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/mkv_audio_lead.py");
+    let status = Command::new("python3")
+        .arg("-I")
+        .arg(&script)
+        .arg(&interleaved)
+        .arg(&out)
+        .arg(format!("{SKEW_LEAD_S}"))
+        .arg("skew")
+        .stdout(Stdio::null())
+        .status()
+        .expect("run python3");
+    assert!(status.success(), "tests/mkv_audio_lead.py could not skew the fixture");
+    assert_video_order_kept(&interleaved, &out);
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "packet=stream_index,codec_type,pts_time,size"])
+        .args(["-of", "csv=p=0"])
+        .arg(&out)
+        .output()
+        .expect("run ffprobe");
+    assert!(probe.status.success(), "ffprobe could not read the skew fixture");
+    let (mut prefix_bytes, mut seen_video, mut last_audio_pts, mut mid_skew) = (0u64, false, 0.0f64, None);
+    for line in String::from_utf8_lossy(&probe.stdout).lines() {
+        let f: Vec<&str> = line.trim().split(',').collect();
+        if f.len() < 4 {
+            continue;
+        }
+        let (Ok(pts), Ok(size)) = (f[2].parse::<f64>(), f[3].parse::<u64>()) else {
+            continue;
+        };
+        if f[0] == "audio" {
+            last_audio_pts = pts;
+            if !seen_video {
+                prefix_bytes += size;
+            }
+        } else {
+            seen_video = true;
+            if mid_skew.is_none() && pts >= 30.0 {
+                mid_skew = Some(last_audio_pts - pts);
+            }
+        }
+    }
+    let mid_skew = mid_skew.expect("the skew fixture has video past 30 s");
+    eprintln!("skew fixture: {prefix_bytes} audio bytes before the first video packet; audio is {mid_skew:.1} s ahead at video pts 30 s");
+    let audio_cap = crate::player::engine::aq_caps().1 as u64;
+    assert!(prefix_bytes > audio_cap, "fixture: the audio-only prefix must outrun the audio lane's base cap");
+    assert!(
+        (mid_skew - SKEW_LEAD_S).abs() < 2.0,
+        "fixture: the skew must persist after the first video block (audio {mid_skew:.1} s ahead mid-file)"
+    );
+    out
+}
+
+/// A stand-in consumer with the engine's contract, driven against the REAL lanes.
+///
+/// Before Play it pops video freely (the pipeline accepts video up to BufferFull, megabytes) and
+/// audio only up to [`AUDIO_ACCEPTED_AUS`] (BufferFull, because the clock cannot start); Play fires
+/// once the video it has popped spans `PRIME_VIDEO_MAX_NS`. After Play a virtual clock runs at
+/// `speed` x real time; video is fed up to `MAX_FEED_AHEAD_NS` past it and audio up to
+/// `MAX_FEED_AHEAD_NS + AUDIO_SLACK_NS` past it (the pump's own budgets), each holding the one AU that is too far ahead, as `feed_stream` does.
+/// Returns the pts (ns) of the last video AU popped. Panics, with the lane state, when the start
+/// never primes or when video stops arriving for `stall` while the clock is ahead of it.
+fn drive_consumer(run: &mut DemuxRun, read_to_ns: i64, speed: i64, stall: Duration) -> i64 {
+    use crate::player::engine::{AUDIO_SLACK_NS, MAX_FEED_AHEAD_NS, PRIME_VIDEO_MAX_NS};
+    let lanes = |run: &mut DemuxRun| {
+        format!(
+            "audio lane {} bytes, video lane {} bytes, demuxer finished={} failed={}",
+            crate::aq::aq_bytes(&mut *run.audio),
+            crate::aq::aq_bytes(&mut *run.video),
+            run.finished(),
+            SHARED.demux_failed.load(Ordering::Acquire)
+        )
+    };
+    let pop = |q: *mut AuQueue| -> Option<(*mut AuNode, i64)> {
+        let node = crate::aq::aq_pop(q, std::ptr::null_mut());
+        if node.is_null() {
+            return None;
+        }
+        Some((node, unsafe { crate::aq::au_fields(node) }.2))
+    };
+    let free = |n: *mut AuNode| unsafe { libc::free(n as *mut c_void) };
+
+    // Before Play.
+    let (mut first_v, mut max_v) = (None::<i64>, 0i64);
+    let mut audio_left = AUDIO_ACCEPTED_AUS;
+    let until = Instant::now() + FIRST_AUDIO_DEADLINE;
+    while first_v.is_none_or(|f| max_v - f < PRIME_VIDEO_MAX_NS) {
+        assert!(
+            Instant::now() < until,
+            "the start never primed: only {} ms of video reached the lane in {FIRST_AUDIO_DEADLINE:?} \
+             (Play needs {} ms) - the demuxer is parked behind the audio lane ({})",
+            first_v.map_or(0, |f| (max_v - f) / 1_000_000),
+            PRIME_VIDEO_MAX_NS / 1_000_000,
+            lanes(run)
+        );
+        while audio_left > 0 {
+            let Some((n, _)) = pop(&mut *run.audio) else { break };
+            free(n);
+            audio_left -= 1;
+        }
+        let mut any = false;
+        while let Some((n, pts)) = pop(&mut *run.video) {
+            free(n);
+            first_v.get_or_insert(pts);
+            max_v = max_v.max(pts);
+            any = true;
+        }
+        if !any {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // Play: a virtual clock at `speed` x.
+    let t0 = Instant::now();
+    let clock0 = first_v.unwrap_or(0);
+    let (mut held_v, mut held_a) = (None::<(*mut AuNode, i64)>, None::<(*mut AuNode, i64)>);
+    let mut last_progress = (Instant::now(), max_v);
+    let result = loop {
+        let clock = clock0 + t0.elapsed().as_nanos() as i64 * speed;
+        for (held, lane, ahead, is_video) in [
+            (&mut held_v, &mut *run.video as *mut AuQueue, MAX_FEED_AHEAD_NS, true),
+            (&mut held_a, &mut *run.audio as *mut AuQueue, MAX_FEED_AHEAD_NS + AUDIO_SLACK_NS, false),
+        ] {
+            loop {
+                let cur = match held.take() {
+                    Some(x) => x,
+                    None => match pop(lane) {
+                        Some(x) => x,
+                        None => break,
+                    },
+                };
+                if cur.1 > clock + ahead {
+                    *held = Some(cur);
+                    break;
+                }
+                free(cur.0);
+                if is_video {
+                    max_v = max_v.max(cur.1);
+                }
+            }
+        }
+        if max_v >= read_to_ns {
+            break max_v;
+        }
+        if max_v > last_progress.1 {
+            last_progress = (Instant::now(), max_v);
+        } else if last_progress.0.elapsed() > stall && clock > max_v + MAX_FEED_AHEAD_NS {
+            panic!(
+                "video stopped arriving at {} ms while the clock is at {} ms: the demuxer is parked ({})",
+                max_v / 1_000_000,
+                clock / 1_000_000,
+                lanes(run)
+            );
+        }
+        assert!(!SHARED.demux_failed.load(Ordering::Acquire), "the stream must not fail ({})", lanes(run));
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    for n in [held_v, held_a].into_iter().flatten() {
+        free(n.0);
+    }
+    result
+}
+
+/// **Constant skew (the likelier real layout).** Audio stays 48 s ahead for the whole file. The
+/// start must prime (>= `PRIME_VIDEO_MAX_NS` of video reaches the lane although the stand-in
+/// pipeline takes only a few audio AUs) and a steady consumer must read to 60 s of video without the
+/// demuxer ever parking: the audio lane has to hold the whole skew without starving the video lane.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI - see the module doc"]
+fn a_constant_audio_skew_neither_hangs_the_start_nor_starves_video_mid_film() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_with("skew", generate_skew) else {
+        return;
+    };
+    let reached = drive_consumer(&mut p.run, SKEW_READ_TO_S * 1_000_000_000, 20, Duration::from_secs(5));
+    assert!(reached >= SKEW_READ_TO_S * 1_000_000_000, "video read to {reached} ns");
+    assert!(!SHARED.demux_failed.load(Ordering::Acquire), "the stream must not fail");
+    let audio = i64::from(crate::aq::aq_bytes(&mut *p.run.audio));
+    assert!(
+        audio > crate::player::engine::aq_caps().1,
+        "the audio lane carries the skew over its base cap: {audio} bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A video stream that is not length-prefixed: MPEG-TS under a `.mp4` name (issue #1084).
+// ---------------------------------------------------------------------------------------------
+//
+// The route decides direct play from the part's file NAME (`part_is_streamable`), and libavformat
+// probes the CONTENT: a transport stream called `.mp4` reaches `ff::demux` as `mpegts`, whose H.264
+// has no avcC record and whose packets carry start codes. Walked as length-prefixed, every access
+// unit came out as `00 00 00 01 09` (the delimiter) and `key=false`, and the player sat on "Loading"
+// with `ff: param_sets=0 bytes` and `ff: AU#0 size=5` in the log.
+
+/// Write an MPEG-TS: 640x360 H.264 noise (a keyframe each second, the SPS/PPS in-band) and AAC.
+fn generate_ts(dir: &Path) -> PathBuf {
+    generate_ts_at(dir, 0)
+}
+
+/// [`generate_ts`] whose clock starts `clock_s` seconds in, as a broadcast capture's does (the
+/// report's first audio unit was at 45171.69 s); 0 leaves the muxer's own 1.4 s.
+fn generate_ts_at(dir: &Path, clock_s: u32) -> PathBuf {
+    let out = dir.join("capture.ts");
+    let offset = clock_s.to_string();
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "color=c=gray:s=640x360:r=25:d=6,noise=alls=60:allf=t+u"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6"])
+        .args(["-map", "0:v", "-map", "1:a"])
+        .args(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "25", "-bf", "0"])
+        .args(["-b:v", "2M", "-maxrate", "2M", "-bufsize", "2M"])
+        .args(["-c:a", "aac", "-b:a", "128k"])
+        .args(if clock_s > 0 { vec!["-output_ts_offset", offset.as_str()] } else { vec![] })
+        .args(["-f", "mpegts"])
+        .arg(&out)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg could not write the transport stream");
+    assert_eq!(ffprobe_format_name(&out), "mpegts", "fixture: not a transport stream");
+    out
+}
+
+fn ffprobe_format_name(path: &Path) -> String {
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=format_name", "-of", "default=nw=1:nk=1"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(probe.status.success(), "ffprobe could not read {}", path.display());
+    String::from_utf8_lossy(&probe.stdout).trim().to_string()
+}
+
+/// `(byte position, keyframe)` of every video packet, in file order.
+fn video_packet_positions(path: &Path) -> Vec<(u64, bool)> {
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v", "-show_entries", "packet=pos,flags", "-of", "compact"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(probe.status.success(), "ffprobe could not list the video packets");
+    String::from_utf8_lossy(&probe.stdout)
+        .lines()
+        .filter_map(|l| {
+            let field = |k: &str| l.split('|').find_map(|f| f.strip_prefix(k)).map(str::to_string);
+            Some((field("pos=")?.parse().ok()?, field("flags=")?.starts_with('K')))
+        })
+        .collect()
+}
+
+/// The transport stream starting at a video packet in the middle of its second GOP, on a 188-byte
+/// boundary: a capture that began mid-GOP, the first picture it holds a P-slice with no parameter
+/// sets before it (the report's `non-existing PPS 0 referenced` and `PES packet size mismatch`).
+fn generate_ts_cut_mid_gop(dir: &Path) -> PathBuf {
+    let whole = generate_ts(dir);
+    let packets = video_packet_positions(&whole);
+    let second_key = packets.iter().enumerate().filter(|(_, p)| p.1).nth(1).map(|(i, _)| i).expect("two GOPs");
+    let cut_at = packets[second_key + 7].0 as usize / 188 * 188;
+    let bytes = std::fs::read(&whole).expect("read the transport stream");
+    let out = dir.join("capture_mid_gop.ts");
+    std::fs::write(&out, &bytes[cut_at..]).expect("write the cut transport stream");
+    assert_eq!(ffprobe_format_name(&out), "mpegts", "fixture: the cut file is no transport stream");
+    assert!(
+        video_packet_positions(&out).first().is_some_and(|p| !p.1),
+        "fixture: the cut file must open on a non-keyframe"
+    );
+    out
+}
+
+/// The NAL unit types of an Annex-B access unit, in order.
+fn annexb_nal_types(au: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut from = 0;
+    while let Some((start, prefix)) = annexb_start(au, from) {
+        types.push(au[start + prefix] & 0x1f);
+        from = start + prefix;
+    }
+    types
+}
+
+/// **The regression (issue #1084).** The first video AU is the transport stream's own first
+/// keyframe, whole: a delimiter, SPS, PPS and the IDR slice, not the five bytes of the delimiter.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI - see the module doc"]
+fn an_annexb_transport_stream_reaches_the_video_lane_whole() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_with_audio("ts", "aac", generate_ts) else {
+        return;
+    };
+    let (pts, key, au) = first_video_au_bytes(&mut p.run, FIRST_AUDIO_DEADLINE)
+        .expect("no video AU reached the video lane");
+    let types = annexb_nal_types(&au);
+    assert!((0..1_000_000_000).contains(&pts), "the muxer's own 1.4 s start is rebased to 0, got {pts} ns");
+    assert!(au.len() > 5, "the AU is {} bytes: {au:02x?}", au.len());
+    assert!(au.starts_with(&[0, 0, 0, 1]) || au.starts_with(&[0, 0, 1]), "start-code framed: {:02x?}", &au[..au.len().min(8)]);
+    for nal in [7u8, 8, 5] {
+        assert!(types.contains(&nal), "NAL type {nal} is missing; the AU holds {types:?}");
+    }
+    assert_eq!(key, 1, "the first AU is a keyframe");
+    assert!(!SHARED.demux_failed.load(Ordering::Acquire), "the open must not fail");
+}
+
+/// **A capture that began mid-GOP.** The demuxer must not hand the pipeline pictures that need
+/// parameter sets it has not seen: the first AU on the lane is the first keyframe, whole.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI - see the module doc"]
+fn a_transport_stream_cut_mid_gop_starts_on_its_first_keyframe() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_with_audio("ts-mid-gop", "aac", generate_ts_cut_mid_gop) else {
+        return;
+    };
+    let (_pts, key, au) = first_video_au_bytes(&mut p.run, FIRST_AUDIO_DEADLINE)
+        .expect("no video AU reached the video lane");
+    let types = annexb_nal_types(&au);
+    assert_eq!(key, 1, "the first AU on the lane is a keyframe, not a P-slice ({types:?})");
+    for nal in [7u8, 8, 5] {
+        assert!(types.contains(&nal), "NAL type {nal} is missing; the AU holds {types:?}");
+    }
+    assert!(!SHARED.demux_failed.load(Ordering::Acquire), "the open must not fail");
+}
+
+/// An HEVC elementary stream in a transport stream has start codes too, and this demuxer has no
+/// in-place framing for it (the DV and HDR10+ rewrites walk NALs by length). It must be REFUSED, as
+/// a codec with no framing is, not fed as the five-byte units the length walk made of it: a failed
+/// open recovers (Auto Original falls back to HLS) where a misframed one is a spinner nobody can leave.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI - see the module doc"]
+fn an_annexb_hevc_transport_stream_is_refused_not_misframed() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_with_audio("ts-hevc", "aac", generate_hevc_ts) else {
+        return;
+    };
+    let until = Instant::now() + FIRST_AUDIO_DEADLINE;
+    while !p.run.finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        SHARED.demux_failed.load(Ordering::Acquire),
+        "the open must fail ({} bytes of video queued: {:02x?})",
+        crate::aq::aq_bytes(&mut *p.run.video),
+        first_video_au_bytes(&mut p.run, Duration::from_millis(50)).map(|(_, _, au)| au)
+    );
+    assert_eq!(crate::aq::aq_bytes(&mut *p.run.video), 0, "no misframed unit reaches the video lane");
+}
+
+/// [`generate_ts`] with HEVC.
+fn generate_hevc_ts(dir: &Path) -> PathBuf {
+    let out = dir.join("capture_hevc.ts");
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "color=c=gray:s=640x360:r=25:d=3,noise=alls=60:allf=t+u"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3"])
+        .args(["-map", "0:v", "-map", "1:a"])
+        .args(["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-x265-params", "keyint=25:log-level=error"])
+        .args(["-b:v", "2M"])
+        .args(["-c:a", "aac", "-b:a", "128k"])
+        .args(["-f", "mpegts"])
+        .arg(&out)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg could not write the HEVC transport stream");
+    assert_eq!(ffprobe_format_name(&out), "mpegts", "fixture: not a transport stream");
+    out
+}
+
+/// **A capture's clock starts nowhere near zero (issue #1084's report: first audio at 45171.69 s).**
+/// The engine takes a fresh play's first keyframe to be near 0, so the lanes must carry the stream
+/// from 0, not from the transmitter's clock.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI - see the module doc"]
+fn a_transport_stream_whose_clock_starts_at_12_hours_reaches_the_lanes_from_zero() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_with_audio("ts-clock", "aac", |d| generate_ts_at(d, 45_171)) else {
+        return;
+    };
+    assert!(p.first_audio_s > 45_000.0, "fixture: the clock must start at 12.5 h, got {} s", p.first_audio_s);
+    let (pts, key, _au) = first_video_au_bytes(&mut p.run, FIRST_AUDIO_DEADLINE)
+        .expect("no video AU reached the video lane");
+    assert_eq!(key, 1);
+    assert!((0..1_000_000_000).contains(&pts), "the first video AU is at {pts} ns, not 0-based");
+    let seen = p.run.observe(Duration::from_secs(5), 500_000_000);
+    let audio = seen.first_audio_pts_ns.expect("no audio AU reached the audio lane");
+    assert!((0..1_000_000_000).contains(&audio), "the first audio AU is at {audio} ns, not 0-based");
+}
+
+/// **A resume into it.** `seek_to_ns` is content time, and the demuxer seeks in the stream's own
+/// clock, so without the origin added back a resume at 3 s lands on the stream's first packet.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI - see the module doc"]
+fn a_resume_into_a_transport_stream_with_a_late_clock_lands_at_its_content_time() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_at("ts-clock-resume", "aac", 3_000_000_000, |d| generate_ts_at(d, 45_171)) else {
+        return;
+    };
+    let (pts, key, _au) = first_video_au_bytes(&mut p.run, FIRST_AUDIO_DEADLINE)
+        .expect("no video AU reached the video lane");
+    assert_eq!(key, 1, "a seek lands on a keyframe");
+    assert!(
+        (1_900_000_000..=3_100_000_000).contains(&pts),
+        "a resume at 3 s landed at {pts} ns (the stream's first packet is at ~45172 s)"
+    );
+}
+
+/// Wait until the audio lane holds an AU, then pop it: `(pts_ns, bytes)`. `None` at the deadline.
+fn first_audio_au_bytes(run: &mut DemuxRun, deadline: Duration) -> Option<(i64, Vec<u8>)> {
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        let node = crate::aq::aq_pop(&mut *run.audio, std::ptr::null_mut());
+        if !node.is_null() {
+            let (es, _key, pts, len, data) = unsafe { crate::aq::au_fields(node) };
+            let bytes = unsafe { std::slice::from_raw_parts(data, len.max(0) as usize) }.to_vec();
+            unsafe { libc::free(node as *mut c_void) };
+            assert_eq!(es, 2, "the audio lane carries es=2 AUs");
+            return Some((pts, bytes));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+/// **The audio of the same file.** A transport stream's AAC is ADTS-framed already, and the
+/// pipeline wants exactly one header on each unit: not the stream's own behind a second one.
+#[test]
+#[ignore = "needs the host build of the bundled FFmpeg and the ffmpeg CLI - see the module doc"]
+fn a_transport_streams_aac_gets_one_adts_header_not_two() {
+    let _g = plx_base::testlock::serial();
+    let Some(mut p) = prepare_with_audio("ts-aac", "aac", generate_ts) else {
+        return;
+    };
+    let (_pts, au) = first_audio_au_bytes(&mut p.run, FIRST_AUDIO_DEADLINE).expect("no audio AU reached the lane");
+    assert!(packet_has_adts(&au), "the unit is ADTS-framed: {:02x?}", &au[..au.len().min(16)]);
+    assert!(
+        !packet_has_adts(&au[7..]),
+        "a second ADTS header sits behind the first: {:02x?}",
+        &au[..au.len().min(16)]
+    );
+}
+

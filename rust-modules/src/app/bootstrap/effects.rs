@@ -13,6 +13,7 @@ fn content(arg: &plx_screens::registry::ContentArg) -> Value {
         ContentArg::Person { sid, key, guid, name, thumb } => json!({"person":[sid.raw(),key,guid,name,thumb]}),
         ContentArg::Filmography { sid, key } => json!({"filmography":[sid.raw(),key]}),
         ContentArg::Collection(id) => json!({"collection":[id.sid.raw(),id.rk,id.sec,id.tag,id.name]}),
+        ContentArg::Catalog { hex } => json!({"catalog":plx_data::watchlist::encode_hex(hex)}),
     }
 }
 fn argument(arg: &plx_screens::registry::AppArg) -> Result<Value, &'static str> {
@@ -28,7 +29,8 @@ fn home_command(command: &plx_screens::registry::HomeCmd) -> Value {
         HomeCmd::FocusGrid { row,col } => json!({"focus_grid":[row,col]}),
         HomeCmd::Hero => json!("hero"),
         HomeCmd::FocusStrip(tab) => json!({"focus_strip":match tab {
-            HomeTab::Home => "home", HomeTab::Movies => "movies", HomeTab::Shows => "shows", HomeTab::Search => "search" }}),
+            HomeTab::Home => "home", HomeTab::Movies => "movies", HomeTab::Shows => "shows", HomeTab::Search => "search",
+            HomeTab::Watchlist => "watchlist" }}),
         HomeCmd::Flip(delta) => json!({"flip":delta}),
         HomeCmd::SelectHero(index) => json!({"select_hero":index}),
         HomeCmd::PinHero(index) => json!({"pin_hero":index}),
@@ -81,7 +83,7 @@ fn page_memory(memory: &plx_screens::registry::PageMemory) -> Result<Value, &'st
             "header_marked":m.header_marked,"card_keys":card_keys(&m.cards)}}),
         PageMemory::Collection(m) => json!({"collection":{"next_elem":m.cards.next,
             "header_marked":m.header_marked,"card_keys":card_keys(&m.cards),
-            "total":m.total,"counts":m.counts,"focus_index":m.focus_index,"focus_elem":m.focus_elem}}),
+            "total":m.total,"counts":m.counts,"generation":m.generation,"focus_index":m.focus_index,"focus_elem":m.focus_elem}}),
         PageMemory::Filmography(m) => json!({"filmography":{"next_elem":m.next_elem,
             "department":m.department,"preview":m.preview,"keys":m.keys.iter()
                 .map(|k| json!([k.department,k.catalog_id,k.elem])).collect::<Vec<_>>()}}),
@@ -114,6 +116,7 @@ pub(crate) fn input(event: &plx_machine::machine::InputEvent<u32>) -> Result<Val
             json!({"kind":match event.kind { InputKind::Pointer {..} => "pointer", InputKind::Click {..} => "click", _ => "drag" },
                 "x_bits":x.to_bits(),"y_bits":y.to_bits(),"hit":hit}),
         InputKind::Wheel { dy } => json!({"wheel_bits":dy.to_bits()}),
+        InputKind::Pan { dx, x, y } => json!({"pan_bits":[dx.to_bits(),x.to_bits(),y.to_bits()]}),
         InputKind::PointerHidden => json!({"pointer_hidden":true}),
         InputKind::SystemKeyboard(up) => json!({"keyboard":up}),
         InputKind::Text(_) => return Err("unsupported Home text input"),
@@ -181,6 +184,7 @@ fn content_request(request: &plx_screens::registry::ContentReq) -> Result<Value,
         ContentReq::ItemMenu => json!("itemmenu"),
         ContentReq::Panel(panel) => json!({"panel":match panel {
             ContentPanel::AltSources { anchor } => json!({"alt_sources":anchor}),
+            ContentPanel::Versions { anchor } => json!({"versions":anchor}),
             ContentPanel::Tracks { page } => json!({"tracks":page}),
             ContentPanel::About => json!("about"),
             ContentPanel::Bio => json!("bio"),
@@ -195,6 +199,7 @@ pub(crate) fn app(effect: &AppFx) -> Result<Value, &'static str> {
     Ok(match effect {
         AppFx::Session(command) => json!({"session":wire(command)?}),
         AppFx::SessionEffect(effect) => json!({"session_effect":wire(effect)?}),
+        AppFx::PlaybackTrace(plx_platform::playback_trace::Command::Status) => json!({"playback_trace":"status"}),
         AppFx::Preferences(_) => return Err("unsupported controlled preferences effect"),
         AppFx::Store(id, command) => json!({"store":id.ord().0,"command":store(command)?}),
         AppFx::StoreWork(work) => json!({"work":work_value(work)?}),
@@ -224,6 +229,7 @@ fn store(command: &plx_data::stores::StoreCmd) -> Result<Value, &'static str> {
             json!({"hubs":{"cancel_page":[sid.raw(),id,key]}}),
         StoreCmd::Hubs(HubsCmd::Hold { lo, hi }) => json!({"hubs":{"hold":[lo,hi]}}),
         StoreCmd::Hubs(HubsCmd::Retry) => json!({"hubs":"retry"}),
+        StoreCmd::Hubs(HubsCmd::RefetchSourceQuiet { sid }) => json!({"hubs":{"refetch_source_quiet":sid.raw()}}),
         StoreCmd::Browse(BrowseCmd::Reset) => json!({"browse":"reset"}),
         StoreCmd::Browse(BrowseCmd::Discovery(result)) => plx_data::browse::record::encode(result),
         StoreCmd::Metadata(cmd) => {
@@ -251,10 +257,10 @@ fn store(command: &plx_data::stores::StoreCmd) -> Result<Value, &'static str> {
                 CollectionCmd::Open { target } => json!({"open":[target.id.sid.raw(),target.id.rk,target.id.sec,target.id.tag,target.id.name,target.want]}),
                 CollectionCmd::Window { wanted, focus, restore } =>
                     json!({"window":[wanted.start,wanted.end,focus,restore]}),
-                CollectionCmd::Restore { total, counts } => json!({"restore":[total,counts]}),
+                CollectionCmd::Restore { total, counts, generation } => json!({"restore":[total,counts,generation]}),
                 CollectionCmd::Close => json!("close"),
                 CollectionCmd::Reset => json!("reset"),
-                CollectionCmd::SetWatchedLocal { .. } => return Err("unsupported controlled collection command"),
+                CollectionCmd::ApplyView { .. } => return Err("unsupported controlled collection command"),
             }})
         }
         _ => return Err("unsupported Home store command"),
@@ -270,6 +276,7 @@ pub(crate) fn message(message: &AppMsg) -> Result<Value, &'static str> {
             SessionEvent::Pump => json!("pump"),
             _ => return Err("unsupported Home Session delivery"),
         },
+        AppMsg::PlaybackTrace(plx_platform::playback_trace::Status::Off) => json!({"playback_trace":"off"}),
         AppMsg::Store(command) => store(command)?,
         AppMsg::StoreWork(work) => work_value(work)?,
         AppMsg::HubsResult(result) => plx_data::pms::record::encode(result),
@@ -366,6 +373,16 @@ mod tests {
     use plx_machine::machine::{Fx, NavOp};
 
     #[test]
+    fn controlled_diagnostics_only_records_the_deterministic_off_query() {
+        use plx_platform::playback_trace::{Command, Status};
+        use plx_screens::registry::{AppFx, AppMsg};
+        assert_eq!(super::app(&AppFx::PlaybackTrace(Command::Status)), Ok(serde_json::json!({"playback_trace":"status"})));
+        assert_eq!(super::message(&AppMsg::PlaybackTrace(Status::Off)), Ok(serde_json::json!({"playback_trace":"off"})));
+        assert!(super::app(&AppFx::PlaybackTrace(Command::Start)).is_err());
+        assert!(super::message(&AppMsg::PlaybackTrace(Status::Recording)).is_err());
+    }
+
+    #[test]
     fn controlled_content_records_preview_and_panel_payloads() {
         use plx_screens::registry::{AppFx, ContentPanel, ContentReq};
         use serde_json::json;
@@ -396,6 +413,44 @@ mod tests {
             assert!(!encoded.contains(&actual), "distinct requests must stay distinct");
             encoded.push(actual);
         }
+    }
+
+    /// The quiet Home refetch a covered or resumed Home owes (`app/reread.rs`) is a named, replayable
+    /// effect: it encodes to its source and nothing else, distinct per source.
+    #[test]
+    fn the_quiet_home_refetch_encodes_its_source() {
+        use plx_screens::registry::AppFx;
+        use plx_data::stores::{hubs::HubsCmd, StoreCmd, StoreId};
+        use serde_json::json;
+        let quiet = |raw| encode(&Fx::App(AppFx::Store(StoreId::Hubs,
+            StoreCmd::Hubs(HubsCmd::RefetchSourceQuiet { sid: plx_plex::plex::ServerId::from_raw(raw) }))));
+        let (a, b) = (quiet(2).unwrap(), quiet(3).unwrap());
+        assert_eq!(a["command"], json!({"hubs":{"refetch_source_quiet":2}}));
+        assert_ne!(a, b, "one effect per source");
+    }
+
+    /// A profile publication that carries no account stamp (no account token, which is every
+    /// controlled bootstrap) encodes to the bytes the committed recordings hold:
+    /// `tests/fixtures/replay/*` pin `{"epoch":1,"profile":null,"scope":1}` for the boot
+    /// publication, and the replay grades a regenerated effect as complete canonical JSON. `stamp`
+    /// joined `ProfilePublication` after they were recorded, so an empty one must not appear on
+    /// the wire (it carried nothing, and writing `"stamp":""` made every fixture diverge by one
+    /// effect). A stamp that names an account still appears, and the old form still reads back.
+    #[test]
+    fn profile_publication_without_a_stamp_keeps_the_recorded_wire_form() {
+        use plx_screens::registry::AppFx;
+        use plx_session::auth::owner::{ProfilePublication, ProfileScope, SessionFx};
+        use serde_json::json;
+        let publish = |stamp: &str| encode(&Fx::App(AppFx::SessionEffect(SessionFx::PublishProfile(
+            ProfilePublication { epoch: 1, profile: None, scope: ProfileScope(1), stamp: stamp.into() }))))
+            .unwrap();
+        assert_eq!(publish(""), json!({"session_effect":{"PublishProfile":
+            {"epoch":1,"profile":null,"scope":1}}}));
+        assert_eq!(publish("0011223344556677"), json!({"session_effect":{"PublishProfile":
+            {"epoch":1,"profile":null,"scope":1,"stamp":"0011223344556677"}}}));
+        let old: ProfilePublication = serde_json::from_value(
+            json!({"epoch":1,"profile":null,"scope":1})).unwrap();
+        assert_eq!(old.stamp, "");
     }
 
     /// `NavOp::SelectTab` was carved out of the old combined `Root`/`SelectTab` arm (TV

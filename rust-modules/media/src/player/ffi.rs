@@ -5,7 +5,9 @@
 //! ABI). The library thread calls back into our sf_on_event / acb_on_event (defined in mod.rs).
 //! Signatures mirror `src/starfish.h` exactly; `long` is 32-bit on the arm target -> c_long.
 //!
-//! **Everything here but `load` takes a [`MainThread`]**, because the seam has no locking of
+//! **Everything here but `load` and `unload` takes a [`MainThread`]** (`unload` takes an
+//! `UnloadTicket`, which only a `&MainThread` can issue, so a real stop's Unload can run on the
+//! `sf-unload` worker — `engine::PendingRelease`), because the seam has no locking of
 //! its own: the ACB bind order is a bare call sequence, and `sf_feed` races the pump's own
 //! bookkeeping. The raw declarations live in a private `sys` module so the token is the only way
 //! to reach them — a `use super::ffi::sys` from elsewhere in `player/` does not compile, which is
@@ -36,11 +38,13 @@ mod sys {
         pub(super) fn sf_is_load_completed() -> c_int;
         pub(super) fn sf_play() -> c_int;
         pub(super) fn sf_pause() -> c_int;
+        pub(super) fn sf_set_volume(volume: c_int) -> c_int;
         pub(super) fn sf_flush() -> c_int;
         pub(super) fn sf_push_eos() -> c_int;
         pub(super) fn sf_set_time_to_decode(position_ns: i64) -> c_int;
         pub(super) fn sf_set_content_info(position_ns: i64) -> c_int;
         pub(super) fn sf_send_segment() -> c_int;
+        pub(super) fn sf_seek_ms(ms: i64) -> c_int;
         pub(super) fn sf_feed(p: *const u8, size: c_uint, pts: i64, es_data: c_int) -> c_char;
         pub(super) fn sf_feed_abi_is_cow() -> c_int;
         pub(super) fn sf_unload();
@@ -63,6 +67,18 @@ mod sys {
         pub(super) fn vp_destroy_window();
 
         pub(super) fn acb_create(app_id: *const c_char, player_type: c_int) -> c_long;
+        #[cfg(feature = "devtriggers")]
+        pub(super) fn acb_probe_initialized() -> c_int;
+        #[cfg(feature = "devtriggers")]
+        pub(super) fn acb_probe_dass_available() -> c_int;
+        #[cfg(feature = "devtriggers")]
+        pub(super) fn acb_probe_media_id(media_id: *const c_char) -> c_int;
+        #[cfg(feature = "devtriggers")]
+        pub(super) fn acb_probe_loaded() -> c_int;
+        #[cfg(feature = "devtriggers")]
+        pub(super) fn acb_probe_connect_dass() -> c_int;
+        #[cfg(feature = "devtriggers")]
+        pub(super) fn acb_probe_finish() -> c_int;
         pub(super) fn acb_bind(media_id: *const c_char);
         pub(super) fn acb_send_video_data(source_info: *const c_char) -> c_int;
         pub(super) fn acb_send_atmos(media_id: *const c_char) -> c_int;
@@ -78,8 +94,8 @@ mod sys {
 pub struct StarfishSink;
 
 impl plx_platform::tv::sink::VideoSink for StarfishSink {
-    /// **The one verb of this seam that is NOT main-thread, and the missing token is how you can
-    /// tell.** `Load` blocks for the pipeline construction and the library owns its own GMainContext
+    /// **One of the two verbs of this seam that is NOT main-thread (the other is `unload`, on its
+    /// `UnloadTicket`), and the missing token is how you can tell.** `Load` blocks for the pipeline construction and the library owns its own GMainContext
     /// behind it, so it runs on the media worker (`threads::load_thread`) by design — putting it on
     /// the main thread would stall the frame loop for the whole load. What keeps that safe is NOT
     /// `sf_ready()` — that reads true the moment the object is constructed, before the real Load call
@@ -108,6 +124,10 @@ impl plx_platform::tv::sink::VideoSink for StarfishSink {
         sys::sf_pause()
     }
     #[inline]
+    unsafe fn set_volume(&self, _: &MainThread, volume: c_int) -> c_int {
+        sys::sf_set_volume(volume)
+    }
+    #[inline]
     unsafe fn flush(&self, _: &MainThread) -> c_int {
         sys::sf_flush()
     }
@@ -128,6 +148,10 @@ impl plx_platform::tv::sink::VideoSink for StarfishSink {
         sys::sf_send_segment()
     }
     #[inline]
+    unsafe fn seek(&self, _: &MainThread, ms: i64) -> c_int {
+        sys::sf_seek_ms(ms)
+    }
+    #[inline]
     fn feed_abi_is_cow(&self) -> bool {
         // SAFETY: the C accessor takes no arguments and resolves under pthread_once.
         unsafe { sys::sf_feed_abi_is_cow() != 0 }
@@ -144,7 +168,7 @@ impl plx_platform::tv::sink::VideoSink for StarfishSink {
         sys::sf_feed(p, size, pts, es_data)
     }
     #[inline]
-    unsafe fn unload(&self, _: &MainThread) {
+    unsafe fn unload(&self, _: &plx_platform::tv::sink::UnloadTicket) {
         sys::sf_unload()
     }
     #[inline]
@@ -217,6 +241,18 @@ impl plx_platform::tv::sink::VideoSink for StarfishSink {
         sys::acb_create(app_id, player_type)
     }
     #[inline]
+    #[cfg(feature = "devtriggers")]
+    unsafe fn plane_probe_initialized(&self, _: &MainThread) -> bool { sys::acb_probe_initialized() != 0 }
+    #[cfg(feature = "devtriggers")]
+    unsafe fn plane_probe_dass_available(&self, _: &MainThread) -> bool { sys::acb_probe_dass_available() != 0 }
+    #[cfg(feature = "devtriggers")]
+    unsafe fn plane_probe_media_id(&self, _: &MainThread, media_id: *const c_char) -> c_int { sys::acb_probe_media_id(media_id) }
+    #[cfg(feature = "devtriggers")]
+    unsafe fn plane_probe_loaded(&self, _: &MainThread) -> c_int { sys::acb_probe_loaded() }
+    #[cfg(feature = "devtriggers")]
+    unsafe fn plane_probe_connect_dass(&self, _: &MainThread) -> c_int { sys::acb_probe_connect_dass() }
+    #[cfg(feature = "devtriggers")]
+    unsafe fn plane_probe_finish(&self, _: &MainThread) -> c_int { sys::acb_probe_finish() }
     unsafe fn plane_bind(&self, _: &MainThread, media_id: *const c_char) {
         sys::acb_bind(media_id)
     }

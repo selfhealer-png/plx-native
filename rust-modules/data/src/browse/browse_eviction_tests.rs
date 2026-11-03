@@ -133,10 +133,10 @@ fn an_edit_aimed_at_an_evicted_index_is_a_no_op() {
     let evicted = 5 * PAGE + 3;
     assert!(items.page_missing(5));
     let rk = format!("{}", evicted + 1);
-    assert!(!items.set_watched(super::ServerId::UNSET, &rk, true), "the row is not held");
+    assert!(!items.apply_view(&crate::viewstate::ViewAt::leaf(super::ServerId::UNSET, &rk), crate::viewstate::ViewEdit::Watched(true)).1, "the row is not held");
     assert!(items.page_missing(5), "an edit does not bring the page back");
     assert!(items.get(evicted).is_none());
-    assert!(items.set_watched(super::ServerId::UNSET, &format!("{}", 9 * PAGE + 1), true));
+    assert!(items.apply_view(&crate::viewstate::ViewAt::leaf(super::ServerId::UNSET, &format!("{}", 9 * PAGE + 1)), crate::viewstate::ViewEdit::Watched(true)).1);
 }
 
 #[test]
@@ -198,12 +198,12 @@ fn the_grids_focus_index_reaches_the_landing_keep_rule() {
         }
         state.want(0, 12, sent);
         let adapter = Arc::new(BrowseAdapter::default());
-        adapter.fetching.store(true, Ordering::SeqCst);
-        *adapter.page_result.lock().unwrap() = Some(PageResult {
+        adapter.page.claim(0);
+        adapter.page.post(PageResult {
             client, token_gen: client.token_gen(), gen: state.query_gen(), sec, start: far * PAGE,
             items: page_rows(far), total: TOTAL as i64, sorts: None, restored: None, genres: None, genre: None,
             resolved: Default::default(),
-        });
+        }, |_| true);
         assert!(state.pump_owned(&adapter).changed, "the page landed");
         let held = loaded(&state.states[sec].items);
         assert!(!held.is_empty() && held.len() <= MAX_LOADED, "the landing ran and evicted: {held:?}");

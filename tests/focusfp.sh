@@ -28,6 +28,8 @@
 #   tests/focusfp.sh --pms 10.0.0.5:32400   # against a real server (fingerprints then carry
 #                                            #   real ratingKeys: NOT committable)
 #
+# FOCUS_STEP / FOCUS_SETTLE / FOCUS_BOOT_SETTLE override the default timing when recording on
+# high-refresh hosts; the route/focus assertions still have to pass before importing a fixture.
 # Needs `make sim` (the binary) and nothing else. Every flow gets a fresh instance root.
 set -euo pipefail
 
@@ -43,8 +45,9 @@ REPLAY=""
 MODE=""
 MIN_LINES=2
 BOOT_WAIT=25     # seconds to wait for the boot marker before giving up on a flow
-STEP=0.9         # seconds between tokens — a human D-pad cadence, and past every settle spring
-SETTLE=3         # seconds after the last token before the run is read
+STEP="${FOCUS_STEP:-0.9}" # seconds between tokens; shorter recordings on high-refresh hosts
+SETTLE="${FOCUS_SETTLE:-3}" # seconds after the last token before the run is read
+BOOT_SETTLE="${FOCUS_BOOT_SETTLE:-2}" # posters and asynchronous initial landings
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -181,7 +184,7 @@ PY
       echo "  [FAIL] $n $name: $verdict"; return 1
     fi
   fi
-  sleep 2   # posters and the async landings the first keys must not race
+  sleep "$BOOT_SETTLE"
   if [ -n "$tokens" ]; then
     # `<>`: a FIFO opened write-only blocks in open(2) with no reader (ui-sim skill, trap 1).
     exec 3<> "$d/plxnative-remote"
@@ -253,7 +256,7 @@ record_flow 2 grid-detail-back "grid" "down ok sleep:2 back" 'hubs: landed'
 # 3 Home -> Library -> real grid card -> Detail -> BACK to the same Library card. The shot tokens
 # retain the Library grid before Detail and after the return; they do not alter navigation. The
 # second pre-detail shot is intentional: the first can catch the simulator's route transition.
-record_flow 3 home-library-detail-back "" "up right right ok sleep:3 down down down sleep:1 shot sleep:2 shot sleep:1 ok sleep:3 back sleep:3 shot" 'hubs: landed'
+record_flow 3 home-library-detail-back "" "up right ok sleep:3 down down down sleep:1 shot sleep:2 shot sleep:1 ok sleep:3 back sleep:3 shot" 'hubs: landed'
 # 4 Search with a seeded query -> shelf -> Detail -> BACK   (typing is the television's keyboard;
 #   the seed is the only way a headless run reaches a result shelf — docs/search.md)
 record_flow 4 search-shelf-detail-back "search=s0" "sleep:2 down down ok sleep:2 back" 'route=search'
@@ -263,7 +266,7 @@ record_flow 5 detail-person-detail "detail=$RK_MOVIE detailsec=1 detailok" "slee
 # The synthetic token boot has no signed-in account: Favourites is absent, so the root is Playback,
 # Language, Privacy, Legal, About and Privacy is row 2. Step down twice, visit it and toggle its
 # first choice, then return to row 2 and step down once to Legal.
-record_flow 6 settings-family "settings=root" "sleep:1 down down ok sleep:1 ok sleep:1 back sleep:1 down ok sleep:1 ok sleep:1 back back back" 'overlay=settings'
+record_flow 6 settings-family "settings=root" "sleep:1 down down ok sleep:1 ok sleep:0.3 back sleep:1 down ok sleep:1 ok sleep:0.3 back back sleep:1 back" 'overlay=settings'
 # 7 first-run consent -> onboard -> Home
 record_flow 7 firstrun-consent-onboard "firstrun" "sleep:1 ok sleep:1 ok sleep:1 down ok sleep:2" 'route='
 # 8 Detail -> hold on Related -> ItemMenu -> BACK. detailsec is a DOWN count, not a section id:
@@ -280,11 +283,14 @@ fi
 record_flow 11 pointer-stops "" "ck:960,92 sleep:1 ck:133,92 sleep:1 back sleep:1 ck:220,960 sleep:1 ck:1850,960 sleep:1 ck:960,540" 'hubs: landed'
 # 12 Phase-7 adoption: Filmography owns its own focus scope. A library-matched credit opens Detail, BACK
 # restores the Filmography entry and the next BACK dismisses it to its Person host. `nowan`: the
-# person page's F_PROFILE/F_CREDITS mailboxes still dial discover.provider.plex.tv for real (the
-# `personcredits` seed only stands in for a landing, it does not suppress the fetch `pump` already
-# sent before the seed runs), and against the injected token that call 401s — so this flow's
-# stability otherwise depends on the internet answering that 401 promptly. `nowan` makes the name
-# refuse locally and at once, the same offline reproduction `docs/agent-reference.md` documents.
+# graded modes (`--rec` / `--replay`) boot CONTROLLED, so `person.rs` lands `None` on a tape for the
+# person page's F_PROFILE/F_CREDITS mailboxes without calling the provider at all (and the `--rec`
+# boot has no `plxnative-token`); the `personcredits` seed only stands in for the credits landing.
+# Only the live smoke run (neither flag) reaches the app's own refusal of a dev-token boot's Discover
+# reads (`account::discover_read_allowed`; a decision, fail closed): the page settles empty with no
+# biography and no credits, one `discover: GET ... refused` line, and no request to
+# discover.provider.plex.tv. `nowan` is part of the typed initial these recordings carry (the
+# offline policy the replays were captured under).
 # Controlled recording instead captures that offline policy in the typed initial input and
 # produces the failed provider replies without a WAN call. Replay supplies every recorded reply
 # and admission with the mock off and resource execution denied.

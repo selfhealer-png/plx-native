@@ -364,10 +364,12 @@ impl ConsentPage {
 
     fn first_run_layout(title: &str, body: &str, has_crumb: bool, table: &TableView,
         labels: &[&std::ffi::CStr], measure: &dyn plx_machine::machine::Measure) -> RouteLayout {
-        let action_w = labels.iter().map(|label|
-            plx_ui::table_screen::pill_w(measure, label, theme::size::BODY)).sum::<f32>()
-            + plx_ui::widgets::CONTROL_GAP;
-        let action_w = action_w.ceil();
+        let pill = |label: &std::ffi::CStr| plx_ui::table_screen::pill_w(measure, label, theme::size::BODY);
+        // `labels` is always the two-action pair of a first-run consent (`Mode::FirstRun` above).
+        let &[lead, trail] = labels else {
+            unreachable!("a first-run consent has exactly two actions, got {}", labels.len())
+        };
+        let action_w = RouteLayout::action_pair_w(pill(lead), pill(trail)).ceil();
         let reader = DocumentReader::new().with_size(theme::size::BODY);
         RouteLayout::screen_for_reading(action_w, table.measured_width(measure), |layout| {
             let frame = layout.narrative_copy_frame(has_crumb, title, layout.action.y, measure);
@@ -1192,6 +1194,15 @@ pub fn preview_crash() -> String {
         .and_then(|v| serde_json::to_string_pretty(&v).ok())
         .unwrap_or_else(|| String::from_utf8_lossy(&handled).into_owned());
     out.push_str(&handled_text);
+    out.push_str(plx_platform::i18n::msg::settings_consent_preview_recovered());
+    let recovered = plx_telemetry::telemetry::playback::preview_refusal_recovered();
+    let recovered_text = serde_json::from_slice::<serde_json::Value>(&recovered)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| String::from_utf8_lossy(&recovered).into_owned());
+    out.push_str(&recovered_text);
+    out.push('\n');
+    out.push_str(&plx_telemetry::telemetry::playback::preview_recovered_domains());
     out.push_str(plx_platform::i18n::msg::settings_consent_preview_incident());
     let incident = plx_telemetry::telemetry::incident::preview_event();
     let incident_text = serde_json::from_slice::<serde_json::Value>(&incident)
@@ -1218,6 +1229,13 @@ pub fn preview_usage() -> String {
     for e in [
         DiagEvent::AppLaunch,
         DiagEvent::RouteEntered { screen: "home" },
+        DiagEvent::RouteLeft {
+            screen: "home",
+            slow_frames: "<1%",
+            frozen_frames: "0",
+            hang: "0",
+            dead_presses: "0",
+        },
         DiagEvent::SignInCompleted,
         DiagEvent::SignInStarted,
         DiagEvent::SignInFailed {
@@ -1247,7 +1265,11 @@ pub fn preview_usage() -> String {
         DiagEvent::PlaybackFailed {
             playback_id: 4815162342,
             mode: "transcode",
-            kind: "no_video_transcode_target",
+            kind: "tv_pipeline",
+            video: "h264",
+            audio: "dts",
+            pipeline_error: "601",
+            refusal: "async",
         },
         DiagEvent::PlaybackCancelled {
             playback_id: 4815162342,
@@ -1359,6 +1381,7 @@ fn placeholder(token: &str) -> Option<&'static str> {
         "internal thread label" => msg::settings_consent_placeholder_thread_label(),
         "library file name" => msg::settings_consent_placeholder_library(),
         "webOS release" => msg::settings_consent_placeholder_webos_release(),
+        "webOS firmware build" => msg::settings_consent_placeholder_webos_build(),
         "webOS release codename" => msg::settings_consent_placeholder_webos_codename(),
         "webOS API version" => msg::settings_consent_placeholder_webos_api(),
         "SoC/platform class" => msg::settings_consent_placeholder_soc_class(),

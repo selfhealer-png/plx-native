@@ -11,6 +11,8 @@
 #   tv-session.sh screen off|on  blank the PANEL while the app keeps running (see below)
 #   tv-session.sh sound off|on|status
 #                                mute/unmute the TELEVISION, independent of the panel (see below)
+#   tv-session.sh background [APPID]|foreground|fg
+#                                send the app to the background / bring it back (see below)
 #   tv-session.sh wan off [TTL]|on|status
 #                                cut the TELEVISION's route to the internet, LAN intact (see below)
 #   tv-session.sh down           hand the TV back: strip automation, close the app (no relaunch)
@@ -56,6 +58,19 @@
 #   --arm NAME[=VAL]  also arm trigger plxnative-NAME (repeatable), written with the screen's own
 #                     triggers BEFORE the launch, which is the only time a boot trigger is read.
 #                     For a scene's extras, e.g. `--arm menu=1 --arm submenuosc=900 --arm framedrop=25`
+#   --mock-plextv=PORT
+#                     sign the TV in through tests/mock_pms.py's own plex.tv (the mock must be
+#                     serving on THIS host at PORT, started with `--host 0.0.0.0 --advertise-ip
+#                     <this host's LAN IPv4> --authorize-after 2`, so its resources row names a
+#                     LAN address the set can reach). Debug install only. Arms
+#                     `plxnative-plextv=http://127.0.0.1:PORT` and opens the reverse ssh tunnel
+#                     that makes that loopback address real ON THE DEVICE (the trigger accepts only
+#                     loopback, deliberately). Implies --no-token; pair it with `--screen login`:
+#                     the QR sign-in authorizes itself on the 2nd poll and the mock's server arrives
+#                     OWNED, so the owned-only rules (server updates) run unmodified. Refuses
+#                     --guest/--owner, any screen but login, --server, --keep, and a mock whose
+#                     identity is not the synthetic one. The
+#                     tunnel lives in `.tv-plextv.pid`; `down` (and the next `up`) closes it.
 #   --keep            do not clear existing triggers first (rarely what you want)
 #
 # SCREEN OFF is a panel state, not an app state. `luna://com.webos.service.tvpower/power/
@@ -67,13 +82,20 @@
 # taken this way. `power/turnOnScreen` is the reverse; both are on this firmware's api-permissions
 # list, unlike the newer-webOS `power/turnOff` the wake-tv skill records as `Unknown method` here.
 #
-# USE IT FOR the measurement tiers — ABR, transaction cost, anything read out of the event log —
-# where it saves the panel over long runs and costs nothing. DO NOT use it for the fps scenes,
-# `shot`, or the capture stream: `plx_machine::idle` gates presents and the panel is the thing those
-# measure, so a dark screen makes them either meaningless or silently wrong.
-# The one exception is a scene on the PLAYER route: the bound video plane forces presents
-# (`plx_machine::idle`'s VIDEO_PLANE gate), so its frame times are real with the panel off
-# (docs/player-submenus.md, "Device frame-time check").
+# Screen off is only the backlight, and it is fine for every measurement tier — ABR, transaction
+# cost, anything read out of the event log, and the fps scenes too (`tests/run.py --fps --mock`
+# blanks it by default). Nothing in the app reads the panel state, so the app keeps presenting at full rate:
+# `plx_machine::idle` keys on the UI's own changes ("nothing on screen changed, so don't repaint
+# it"), not on the physical panel. Measured on the dev TV 2026-10-24 (Home `grid-pong`, release
+# build): panel off 73 frames/cycle at 59.9 fps with 9 missed refreshes in cycles 2-60; panel on
+# 73 frames/cycle at 59.6-59.9 fps with 8, 13 and 14. It saves the panel over long runs and costs
+# nothing.
+# `shot` (the DISPLAY compositor read) works with the panel off: docs/measurements/
+# tv-session-7-2026-09-10.md ran `screen off` first and got a 1920x1080 DISPLAY capture with real
+# pixel values (opener p95 246.9, row-mate 167.0), and docs/measurements/
+# library-all-types-and-fps-2026-09-26.md checked native captures of the final card rendering with
+# the panel off. NOT on record: the live capture stream (`/tmp/plxnative-capture`, the app's own
+# GLES frames) with the panel off; check the first frame instead of assuming either way.
 #
 # SOUND is the television's own mute, separate from the panel above and from playback: it silences
 # whatever the set would otherwise put out, panel on or off, app running or not.
@@ -97,8 +119,8 @@
 # would fight a human who muted the set on purpose before handing it to a lane.
 #
 # THE TV LOCK: every subcommand that DRIVES the set (up, key, click, shot, down) requires the
-# television's lock and refuses when another lane holds it; `status` and `log` are read-only and
-# only name the holder. Take one for a whole session rather than letting each command take its own
+# television's lock and refuses when another lane holds it; `status`, `log` and `fg` are read-only
+# and only name the holder. Take one for a whole session rather than letting each command take its own
 # 10-minute implicit lease — the gap between two of your own commands is exactly where another
 # job lands:  tools/tv-lock.sh acquire --why "…"  …  tools/tv-lock.sh release.
 #
@@ -186,6 +208,9 @@ STREAM_PID_FILE="$REPO/.tv-stream.pid"
 # for is the one failure mode here that is silent AND outward-facing.
 DPAD_PID_FILE="$REPO/.tv-dpad.pid"
 TUNNEL_PID_FILE="$REPO/.tv-tunnel.pid"
+# --mock-plextv's reverse ssh tunnel (device 127.0.0.1:PORT -> this host's mock). Not outward-facing,
+# but it is a long-lived process holding a port on the set, so `down` closes it like the rest.
+PLEXTV_PID_FILE="$REPO/.tv-plextv.pid"
 REMOTE_URL_FILE="$REPO/.tv-remote-url"
 DPAD_PASS_FILE="$REPO/.tv-dpad-pass"
 
@@ -197,7 +222,7 @@ DPAD_PASS_FILE="$REPO/.tv-dpad-pass"
 # `venc: N frm ...`), the TS goes to the dead socket, and the new streamer sees ZERO bytes while
 # every log line says the pipeline is healthy. So this runs BEFORE the relaunch, not after.
 stop_viewers() {
-  for f in "$TUNNEL_PID_FILE" "$DPAD_PID_FILE" "$STREAM_PID_FILE"; do
+  for f in "$PLEXTV_PID_FILE" "$TUNNEL_PID_FILE" "$DPAD_PID_FILE" "$STREAM_PID_FILE"; do
     [ -f "$f" ] && { kill "$(cat "$f")" 2>/dev/null; rm -f "$f"; }
   done
   pkill -f 'stream-screen.py --port' 2>/dev/null
@@ -234,7 +259,7 @@ app_pids() {
 # One television, no OS-level mutex: two jobs on it do not fail cleanly, they produce plausible
 # WRONG data (an fps number measured while somebody else's binary was deployed underneath, a
 # capture of a screen the other job navigated away from). Every subcommand here that DRIVES the
-# set goes through the lock; the two read-only ones only say who is on it. tools/tv-lock.sh is the
+# set goes through the lock; the three read-only ones (log, status, fg) only name the holder. tools/tv-lock.sh is the
 # mechanism and .agents/skills/tv-lock/SKILL.md is the workflow.
 LOCKTOOL="$REPO/tools/tv-lock.sh"
 require_lock() {  # $1 = what this session is for, for the holder read-out
@@ -662,10 +687,36 @@ await_direct_screen() {
   return 1
 }
 
+# `up --mock-plextv=PORT`: prove the host side is tests/mock_pms.py (its synthetic identity, the
+# same two answers tools/mock-guest.py demands) and then open the reverse tunnel that makes
+# 127.0.0.1:PORT on the DEVICE reach it. The host-side check is what refuses a real server on that
+# port; the device-side probe only proves the tunnel carries.
+open_mock_plextv() {
+  local port="$1" ident user
+  ident=$(curl -s -m 5 -H 'Accept: application/json' "http://127.0.0.1:$port/identity" 2>/dev/null)
+  user=$(curl -s -m 5 -H 'Accept: application/json' "http://127.0.0.1:$port/api/v2/user" 2>/dev/null)
+  case "$ident" in *1.41.0.0000-synthetic*) ;; *) bad "nothing synthetic answers on 127.0.0.1:$port — start tests/mock_pms.py first"; return 1 ;; esac
+  case "$user" in *'"demo-user"'*) ;; *) bad "127.0.0.1:$port is not the mock's plex.tv"; return 1 ;; esac
+  [ -f "$PLEXTV_PID_FILE" ] && { kill "$(cat "$PLEXTV_PID_FILE")" 2>/dev/null; rm -f "$PLEXTV_PID_FILE"; }
+  (nohup env PLX_TV_ADDR="$HOST" "$REPO/tools/tv-ssh" ssh -N -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=15 -R "$port:127.0.0.1:$port" tv \
+      > /dev/null 2>&1 </dev/null & echo $! > "$PLEXTV_PID_FILE") ; disown 2>/dev/null || true
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    if tv "curl -s -m 3 http://127.0.0.1:$port/identity" 2>/dev/null | grep -q 1.41.0.0000-synthetic; then
+      ok "mock plex.tv reachable on the device at 127.0.0.1:$port (reverse tunnel, pid file .tv-plextv.pid)"
+      return 0
+    fi
+  done
+  bad "the reverse tunnel did not come up (the device cannot reach the mock on 127.0.0.1:$port)"
+  return 1
+}
+
 # ------------------------------------------------------------ commands -------
 cmd_up() {
   local screen=home guest=0 mock=0 owner=0 dry_run=0 stream="" no_token=0 keep=0 remote="" server_slot="" server_set=0
-  local direct_kind="" direct_rk="" direct_marker="" extra_arm=()
+  local direct_kind="" direct_rk="" direct_marker="" extra_arm=() mock_plextv=""
   local identity_desc="" push_guest=0 push_owner=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -684,6 +735,7 @@ cmd_up() {
       --remote=*) remote="${1#*=}"; shift ;;
       --no-token) no_token=1; shift ;;
       --keep) keep=1; shift ;;
+      --mock-plextv=*) mock_plextv="${1#*=}"; shift ;;
       --arm) [ $# -ge 2 ] || { bad "--arm needs NAME[=VALUE]"; exit 2; }
              extra_arm+=("$2"); shift 2 ;;
       --arm=*) extra_arm+=("${1#*=}"); shift ;;
@@ -702,6 +754,22 @@ cmd_up() {
   if [ "$guest" = 1 ] && [ "$no_token" = 1 ]; then
     echo "--guest and --no-token are mutually exclusive: --no-token boots the stored session (or the who's-watching picker), which is a THIRD identity, distinct from both --guest and --owner" >&2
     exit 2
+  fi
+  if [ -n "$mock_plextv" ]; then
+    case "$mock_plextv" in ''|*[!0-9]*) bad "--mock-plextv=PORT needs a port number"; exit 2 ;; esac
+    if [ "$guest" = 1 ] || [ "$owner" = 1 ]; then
+      bad "--mock-plextv signs in through the mock's plex.tv; it cannot be combined with --guest or --owner"; exit 2
+    fi
+    if [ "$FLAVOR" != debug ]; then bad "--mock-plextv requires the debug install"; exit 2; fi
+    # The mock identity is pinned only by the QR sign-in on a boot with no stored session. Any
+    # other screen, --server (stored roster) or --keep (triggers left by an earlier boot) would
+    # reach the owner's stored session beside a mock plex.tv, so each is refused, not dropped.
+    if [ "$screen" != login ]; then bad "--mock-plextv requires --screen login (the mock sign-in is the only boot it pins)"; exit 2; fi
+    if [ "$server_set" = 1 ]; then bad "--mock-plextv cannot be combined with --server (that boots the stored roster)"; exit 2; fi
+    if [ "$keep" = 1 ]; then bad "--mock-plextv cannot be combined with --keep (leftover triggers could select another identity)"; exit 2; fi
+    no_token=1
+    extra_arm+=("plextv=http://127.0.0.1:$mock_plextv")
+    extra_arm+=("discover=http://127.0.0.1:$mock_plextv")
   fi
   configure_direct_screen || exit 2
   # --remote is --stream plus a front door: there is nothing to publish without a stream, so it
@@ -845,6 +913,8 @@ cmd_up() {
   elif [ "$push_owner" = 1 ]; then
     push_token || info "continuing without a token — expect the QR sign-in screen"
   fi
+
+  if [ -n "$mock_plextv" ]; then open_mock_plextv "$mock_plextv" || exit 1; fi
 
   PREV_PIDS=$(app_pids)
   relaunch
@@ -1141,8 +1211,8 @@ cmd_down() {
   echo "== TV is yours"
 }
 
-# Blank or restore the PANEL, leaving the app and playback untouched. See the header for why
-# this is safe for the measurement tiers and disqualifying for the visual ones.
+# Blank or restore the PANEL, leaving the app and playback untouched. See the header: it is only
+# the backlight, so the app presents the same either way (`shot` works with it dark; see the header).
 cmd_screen() {
   local want="${1:-}"
   case "$want" in
@@ -1163,14 +1233,79 @@ cmd_screen() {
   flat=$(printf '%s' "$reply" | tr -d '\r\n' | tr -s ' ')
   if printf '%s' "$flat" | grep -q '"returnValue": *true'; then
     ok "panel $want ($(printf '%s' "$flat" | sed -n 's/.*"state": *"\([^"]*\)".*/\1/p'))"
-  elif printf '%s' "$flat" | grep -q '"errorCode": *"-101"'; then
+  elif [ "$want" = off ] && printf '%s' "$flat" | grep -q '"errorCode": *"-101"'; then
     # -101 "The current state must be 'Active'" means the panel is ALREADY off. Asking for a state
     # the set is already in is a no-op, not a failure -- and reporting it as one makes every script
-    # that re-asserts screen-off after a relaunch look broken.
+    # that re-asserts screen-off after a relaunch look broken. Only for `off`: a -101 answering
+    # `on` would say "panel already on" about a panel the reply calls dark, and skip a real
+    # turn-on, so it falls through to the refusal below.
     ok "panel already $want"
+  elif [ "$want" = on ] && printf '%s' "$flat" | grep -q '"errorCode": *"-102"' \
+    && printf '%s' "$flat" | grep -q '"state": *"Active"'; then
+    # The mirror: -102 "The current state must be 'Screen Off'" with state Active means the panel is
+    # ALREADY lit (`tests/run.py --fps --panel on` asks for `screen on` and would refuse to run on a
+    # lit set). Any other state -- "Active Standby" -- is a set that is NOT lit, so it stays a refusal.
+    ok "panel already on"
   else
     bad "screen $want refused: $flat"; return 1
   fi
+}
+
+# Send the app to the BACKGROUND and bring it back: the lifecycle edges (SDL WILL/DID enter
+# background `0x103`/`0x104`, WILL/DID enter foreground `0x105`/`0x106`) as the OS delivers them.
+# On this webOS 4.5 set the LG launcher/Home/Settings are OVERLAYS and deliver NO edge (see the
+# skill), so `background` launches a real full-screen app through the application manager instead
+# (default `org.webosbrew.hbchannel`, override with an argument or PLX_BG_APP) and asserts it is now
+# the foreground app. `foreground` launches THIS flavour's own id again -- the same call `up` makes,
+# but with NO close-first, so the pid must be unchanged (a changed pid means the app died, which is
+# a finding, not a relaunch) -- and asserts the app is the foreground app again. No setting is
+# changed and nothing is injected; `fg` only reads the foreground app (read-only: advisory lock, no lease,
+# and an asleep set is never woken: it reports that nothing was read, which is not "idle").
+fg_app() {
+  tvq "script -qc \"luna-send -n 1 -f luna://com.webos.applicationManager/getForegroundAppInfo '{}'\" /dev/null" \
+    | tr -d '\r\n' | tr -s ' ' | sed -En 's/.*"appId": *"([^"]*)".*/\1/p'
+}
+launch_app() {  # $1 = app id. -i keeps the subscriber open for the launch to take (see relaunch).
+  tv "luna-send -i luna://com.webos.applicationManager/launch '{\"id\":\"$1\"}' >/dev/null 2>&1 & \
+      LP=\$!; sleep 5; kill \$LP 2>/dev/null" >/dev/null 2>&1
+}
+cmd_lifecycle() {
+  local what="${1:-}" target pid before after
+  case "$what" in
+    fg)
+      # The one lifecycle word that is a pure read, and tv-lock-guard.py lets it through with no
+      # lease for that reason: so it must stay one. `ensure_awake` would send Wake-on-LAN to a
+      # sleeping set (a mutation, and the exact thing a person in the next room notices); a set
+      # that does not answer is left alone and the line says so: nothing was read and no wake was
+      # sent (tv-lock.sh's idle_verdict calls an unread foreground UNKNOWN unless the panel reads Active
+      # Standby, and `fg` never reads the panel, so it says "nothing read", not "idle").
+      # advise_lock is `tv-lock.sh require --advisory`: it only names a holder (and renews a lease
+      # THIS lane already holds), takes nothing and wakes nothing.
+      tvq true || { info "TV unreachable or asleep (nothing read, no wake sent)"; return 0; }
+      advise_lock "tv-session fg"
+      ok "TV reachable"; info "foreground app: $(fg_app)"; return 0 ;;
+    background) target="${2:-${PLX_BG_APP:-org.webosbrew.hbchannel}}" ;;
+    foreground) target="$APPID" ;;
+    *) echo "usage: tv-session.sh background [APPID] | foreground | fg" >&2; exit 2 ;;
+  esac
+  require_lock "tv-session $what"
+  ensure_awake || exit 1
+  pid=$(app_pids)
+  [ -n "$pid" ] || { bad "$APPID is not running; nothing to $what"; return 1; }
+  before=$(fg_app)
+  if [ "$what" = background ] && [ "$before" != "$APPID" ]; then
+    bad "$APPID is not the foreground app ($before); refusing to launch over someone else's screen"; return 1
+  fi
+  info "foreground before: $before; launching $target (pid $pid)"
+  launch_app "$target"
+  after=$(fg_app)
+  if [ "$after" != "$target" ]; then
+    bad "foreground is '$after', not $target: the launch did not take"; return 1
+  fi
+  if [ "$(app_pids)" != "$pid" ]; then
+    bad "app pid changed ($pid -> $(app_pids)): the app died or restarted instead of $what"; return 1
+  fi
+  ok "$what: $target is the foreground app; $APPID still pid $pid"
 }
 
 # Mute/unmute the TELEVISION's own audio (see SOUND in the header), or just read the flag back.
@@ -1342,6 +1477,7 @@ case "${1:-}" in
   up)     shift; cmd_up "$@" ;;
   screen) shift; cmd_screen "$@" ;;
   sound)  shift; cmd_sound "$@" ;;
+  background|foreground|fg) cmd_lifecycle "$@" ;;
   status) shift; cmd_status ;;
   key)    shift; cmd_key "$@" ;;
   click)  shift; cmd_click "$@" ;;

@@ -51,6 +51,7 @@ pub fn play(d: &Detail, key: u32) -> Option<PlayIntent> {
         acodec: extra.acodec.clone(),
         title: extra.hud_title(d.title.as_str()).to_string(),
         context: extra_play_context(extra).into(),
+        version: None,
     })
 }
 
@@ -71,15 +72,13 @@ pub fn art(d: &Detail, i: usize) -> Art<'_> {
     })
 }
 
-/// Card `i`'s label block: its title (its caption when it has none) over its caption.
+/// Card `i`'s label block: its title over its caption, the one landscape block
+/// ([`crate::registry::captions::still_block`]). A line the extra has nothing for is absent, never
+/// drawn empty and never the other line twice (an extra with no title used to draw its caption on
+/// both lines).
 pub fn label(d: &Detail, i: usize) -> TileLabel {
     let e = &d.extras[i];
-    let title = if e.title.is_empty() {
-        e.caption()
-    } else {
-        e.title.as_str()
-    };
-    TileLabel::titled(title, e.caption())
+    crate::registry::captions::still_block(e.title.as_str(), e.caption())
 }
 
 /// The shelf's heading, `lift` being the row's live label lift (`Shelf::heading_lift`).
@@ -143,7 +142,7 @@ mod tests {
                 assert_eq!(part, "/p");
                 assert_eq!(context, plx_data::metadata::EXTRA_CONTEXT);
             }
-            PlayIntent::Movie(_) => panic!("an extra is not the parent movie"),
+            PlayIntent::Movie { .. } => panic!("an extra is not the parent movie"),
         }
         assert!(play(&d, elem(1).unwrap()).is_none());
     }

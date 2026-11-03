@@ -7,8 +7,8 @@
 //! each production `Bridge` owns a `stores::hubs::HubsStore`, whose `run`/`run_with_directory`
 //! forward each `HubsCmd` variant into `request_refetch_hubs`/`reset`/`edit_item`/`page`/
 //! `cancel_page` here against its own `PmsState`/`Arc<PmsAdapter>`, the same relationship the owned
-//! `BrowseStore::run` has to Browse commands against its explicit state. Controlled work captures
-//! each immutable request before the adapter launches it. **The cross-module entry points
+//! `BrowseStore::run` has to Browse commands against its explicit state. Every step captures
+//! its immutable request and emits it as a `StoreJob::Hubs` for the app's runner to launch or refuse. **The cross-module entry points
 //! (`run_with_directory`, `land_with_directory`, `tick*`) cannot be scoped narrower than `pub`, and
 //! that is a fact about Rust module topology, not an oversight**: `pms` and `stores` are both
 //! top-level children of the crate root, so neither is an ancestor of the other, and `pub(in path)`
@@ -24,7 +24,10 @@
 //! outside `pms`/`stores::hubs` spells the old direct-call form; this is the part that
 //! keyword-level `pub(super)` genuinely cannot add on top of that count.
 use crate::stores::{deck, paging};
-use plx_plex::plex::ServerId;
+use crate::viewstate::{ViewAt, ViewEdit};
+use plx_machine::job::{Job, Port};
+use plx_machine::machine::{Addr, MachineId, RequestId};
+use plx_plex::plex::{ClientKey, ClientKeys, ServerId};
 use std::os::raw::c_int;
 use std::panic::catch_unwind;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -33,16 +36,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 pub mod record;
 pub mod initial;
 
-/// Rows of Home (and of a Library section's Recommended page) that hold cards at once: the rows in view plus a margin. Every other row keeps its
-/// descriptor (identity, title, key, total, window offset, ledger, the count of cards it last
-/// showed) and publishes that many placeholder slots, so every row stays reachable and nothing is
-/// left off.
-///
-/// Bound on held cards: `HOLD_ROWS` x [`MAX_SHELF_ITEMS`] = 16 x 24 = 384, plus the merged
-/// Continue Watching row (one window of the deck, at most [`MAX_SHELF_ITEMS`]) and at most
-/// [`HERO_MAX`] retained heroes, however many rows the servers offer. Descriptors are a few hundred
-/// bytes each; they are the directory.
-pub(crate) const HOLD_ROWS: usize = 16;
+/// The rows a paged store keeps cards for, and the cut applied to what a screen asks: defined in
+/// `plx_base::hold`, because `ui::cards::HoldBand` applies the very same cut to know what the
+/// store kept (the store and `ui` cannot name each other).
+pub(crate) use plx_base::hold::{clamp_hold, HOLD_ROWS};
 
 /// Cards one shelf holds at once: the size of a WINDOW over the row's listing, which the grid can
 /// address (the owned Home's `MAX_ITEMS` is this constant). It is not a limit on the row: past it
@@ -55,6 +52,11 @@ pub(crate) const HOLD_ROWS: usize = 16;
 /// raw index names. Holding the window to this size keeps the two from ever disagreeing.
 pub const MAX_SHELF_ITEMS: usize = 24;
 
+/// `PmsMovie::kind` of a movie, a TV show, a season and an episode (a collection is 4).
+pub const KIND_MOVIE: c_int = 0;
+pub const KIND_SHOW: c_int = 1;
+pub const KIND_SEASON: c_int = 2;
+pub const KIND_EPISODE: c_int = 3;
 pub const KIND_COLLECTION: c_int = 4;
 
 pub fn listable(type_str: &str) -> bool {
@@ -65,10 +67,15 @@ pub fn listable(type_str: &str) -> bool {
 /// a shelf, never the number of shelves.
 pub(crate) const HUB_FETCH_COUNT: i64 = 12;
 
+/// `PmsMovie::season_index` of an EPISODE whose server sent no `parentIndex`. Distinct from `0`
+/// (Specials), so a `Scope::Season { index: 0 }` change does not reach a row whose season is merely
+/// unknown. Every reader that shows or opens by season already tests `> 0`.
+pub const SEASON_UNKNOWN: c_int = -1;
+
 /// A catalog row — owned strings (the old C-ABI fixed `[u8; N]` buffers are gone; no C
 /// consumer remains). Fields pub so the UI / route / player read them directly.
-#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, remote = "Self")]
 pub struct PmsMovie {
     /// WHICH SERVER this row came from. Every other identity on it — `rk`, `show_rk`, `part` — is a
     /// server-local key that a second server reuses from 1 (docs/shared-servers.md §2 measured the
@@ -84,6 +91,9 @@ pub struct PmsMovie {
     /// only thing that can keep an UNPINNED library's items off Home without a per-library fetch.
     pub sec: i64,
     pub title: String,
+    /// Edition identity, presented in the hero's metadata rather than appended to its title.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub edition: String,
     pub year: c_int,
     pub rating: String,
     pub dur_ns: i64,
@@ -103,7 +113,14 @@ pub struct PmsMovie {
     pub kind: c_int, // 0 = movie, 1 = show, 2 = season, 3 = episode, 4 = collection
     pub resume_ms: i64,  // viewOffset — drives the Continue Watching resume bar
     pub show_rk: String, // parent show rk (episode: grandparent; season: parent)
-    pub season_index: c_int, // season number (episode: parentIndex; season: index)
+    /// The title's catalog id, decoded once from `guid` (`plex://movie|show/<24 hex>`); `None` when
+    /// the listing carried none or it is not that form: the app then reads the item's own server
+    /// record for it (`plex::models::resolve_catalog_hex`, via `WatchlistStore::want_hex`) and the
+    /// next menu offers the row once the record named a portable id.
+    pub guid: Option<[u8; 12]>,
+    /// The parent show's catalog id, from `grandparentGuid` (episode); `None` as above.
+    pub show_guid: Option<[u8; 12]>,
+    pub season_index: c_int, // season number (episode: parentIndex, or [`SEASON_UNKNOWN`]; season: index)
     pub show_title: String, // episode: grandparentTitle; season: parentTitle
     pub ep_index: c_int, // episode only: episode number within the season
     /// Fully unwatched (movie/episode: no viewCount; show/season: zero viewed leaves).
@@ -130,9 +147,165 @@ pub struct PmsMovie {
     /// A collection's member count (`childCount`) — its tile's caption, "12 items". 0 on every
     /// other kind, where the listing's count fields mean leaves rather than members.
     pub child_count: i64,
+    // ---- CONTRACT FREEZE (library/collections redesign, P2 fills the parse in `parse_item`) ----
+    // The facts the "Under posters" caption reads (`plx_ui::caption_policy`) and the collection
+    // tile's caption. All default to "unknown"; `child_count` above is generalised by P2 to a
+    // show's season count as well (a season-count reader checks `kind`).
+    /// `subtype` verbatim (a collection's `movie` / `show` / `episode` …), or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<String>,
+    /// A SMART collection (`smart="1"`): a saved filter, not a hand-picked set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub smart: bool,
+    /// The first `Genre` tag, or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
+    /// The first media's `videoResolution` (`4k`, `1080`, `720`, `sd` …), or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_resolution: Option<String>,
+    /// The first video stream is HDR (HDR10 / HLG / Dolby Vision).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hdr: bool,
+    /// `audienceRating` (0..10), or `None` when the server sent none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience_rating: Option<f32>,
+    /// `leafCount` — a show/season's episode count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf_count: Option<u32>,
+    /// `viewedLeafCount` — episodes watched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewed_leaf_count: Option<u32>,
+    /// `addedAt`, seconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<i64>,
+    /// Every version of a leaf that has more than one (`Media[]`, in the server's order), for the
+    /// item menu's Play Version row; empty for a single-version item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<MediaVersion>,
+    /// Listing-only sort facts of a movie, show, season or episode row. No detail fetch is needed
+    /// to caption a library grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_info: Option<SortInfo>,
+}
+
+// Remote derive keeps the field rules in one place while allowing non-inlined trait entry
+// points. The retained stores and recording adapters otherwise inline separate copies of this
+// large row's typed codec into their generic visitors (tens of KB in the ARM release binary).
+impl serde::Serialize for PmsMovie {
+    #[inline(never)]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        PmsMovie::serialize(self, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PmsMovie {
+    #[inline(never)]
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        PmsMovie::deserialize(deserializer)
+    }
+}
+
+/// Facts lost by the compact poster projection before sort captions were introduced.
+/// Values and provider images always stay paired; missing values remain unknown.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SortInfo {
+    pub rating: Option<f64>,
+    pub rating_image: String,
+    pub audience_image: String,
+    pub user_rating: Option<f64>,
+    pub view_count: Option<i64>,
+    pub last_viewed_at: Option<i64>,
+    pub bitrate_kbps: Option<i64>,
+    pub width: i64,
+    pub height: i64,
+    pub media_count: usize,
+}
+
+impl SortInfo {
+    fn of(it: &plx_plex::plex::Metadata) -> Self {
+        let score = |n: f64| (n.is_finite() && n > 0.0 && n <= 10.0).then_some(n);
+        let media = it.media_version(None).map(|(_, media)| media);
+        Self {
+            rating: score(it.rating), rating_image: it.rating_image.clone(),
+            audience_image: it.audience_rating_image.clone(), user_rating: score(it.user_rating),
+            view_count: (it.view_count >= 0).then_some(it.view_count),
+            last_viewed_at: (it.last_viewed_at > 0).then_some(it.last_viewed_at),
+            bitrate_kbps: media.and_then(|m| (m.bitrate > 0).then_some(m.bitrate)),
+            width: media.map_or(0, |m| m.width), height: media.map_or(0, |m| m.height),
+            media_count: it.media.len(),
+        }
+    }
+}
+
+fn is_false(b: &bool) -> bool { !*b }
+
+/// **One version of an item, as the version picker describes it**: the facts a listing carries
+/// for each `Media[]` entry, keyed by the identity a play is asked for by
+/// ([`plx_plex::plex::MediaId`], never a position).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MediaVersion {
+    pub id: plx_plex::plex::MediaId,
+    /// Whole-file bitrate, kbps.
+    pub kbps: i64,
+    /// PMS's resolution class (`4k`, `1080`), with the frame size as its fallback.
+    pub resolution: String,
+    pub width: i64,
+    pub height: i64,
+    pub vcodec: String,
+    pub acodec: String,
+    pub channels: i64,
+    pub container: String,
+    /// The first part's size in bytes, 0 when unsent.
+    pub size: i64,
+    /// A video stream is HDR or Dolby Vision. Only a response that carries streams can say so (a
+    /// listing usually does not), so `false` is "not known to be".
+    pub hdr: bool,
+}
+
+/// The versions worth a picker: every `Media[]` entry with an id when there are at least two,
+/// else none.
+pub fn versions_of(it: &plx_plex::plex::Metadata) -> Vec<MediaVersion> {
+    if it.media.len() < 2 || it.media.iter().any(|m| m.id.0 == 0) {
+        return Vec::new();
+    }
+    it.media
+        .iter()
+        .map(|m| {
+            let part = m.part.first();
+            MediaVersion {
+                id: m.id,
+                kbps: m.bitrate,
+                resolution: clean(&m.video_resolution),
+                width: m.width,
+                height: m.height,
+                vcodec: clean(&m.video_codec),
+                acodec: clean(&m.audio_codec),
+                channels: m.audio_channels,
+                container: clean(part.map_or(&m.container, |p| if p.container.is_empty() { &m.container } else { &p.container })),
+                size: part.map_or(0, |p| p.size),
+                hdr: part.is_some_and(|p| p.stream.iter().any(|s| s.stream_type == 1 && s.is_hdr())),
+            }
+        })
+        .collect()
 }
 
 impl PmsMovie {
+    /// **The Watchlist title this row stands for**, as `(kind, catalog id, from_episode)`: a movie or
+    /// a show is itself, a season or an episode is its SHOW (`from_episode`, so the labels say
+    /// "Show"). The id is the one the row was decoded with, `None` when the server sent no
+    /// `plex://movie|show` guid; a collection (kind 4) stands for no title at all. THE rule for the
+    /// item menu's row and the Home hero's bookmark disc, so the two cannot name different titles.
+    pub fn watchlist_subject(&self) -> Option<(crate::watchlist::model::Kind, Option<[u8; 12]>, bool)> {
+        use crate::watchlist::model::Kind;
+        match self.kind {
+            0 => Some((Kind::Movie, self.guid, false)),
+            1 => Some((Kind::Show, self.guid, false)),
+            2 | 3 => Some((Kind::Show, self.show_guid, true)),
+            _ => None,
+        }
+    }
+
     /// Played fraction for the amber resume bar, or None when not in progress — THE one
     /// resume-bar rule, shared by the home shelves and the Library grid (it was copy-pasted
     /// into both screens before), and the definition of `PosterMark::InProgress`.
@@ -165,6 +338,8 @@ static EMPTY_HOME: LazyLock<Arc<HomeCatalog>> = LazyLock::new(|| Arc::new(HomeCa
 /// One Hubs owner's main-thread-only logical state (`docs/stores-as-machines.md`). Production
 /// gains one through `stores::hubs::HubsStore`; the worker-touched half is [`PmsAdapter`].
 pub struct PmsState {
+    /// The publish order of view-state edits; each source holds a clone (see `Src::ledger`).
+    pub(crate) ledger: crate::viewledger::ViewLedger,
     published: Option<Arc<HomeCatalog>>,
     /// The source table, in display order: our own servers first, then each shared one. Main
     /// thread only, so no lock is needed once this lives per-owner rather than behind a global.
@@ -188,6 +363,28 @@ pub struct PmsState {
     deck_ask: Option<DeckAsk>,
     /// The rows (catalog order, inclusive) the screen holds cards for; see [`HOLD_ROWS`].
     hold: (usize, usize),
+    /// Moves whenever a quiet read stages an answer, so a held verdict is keyed on what it judged.
+    staged_gen: u32,
+    /// The last [`HubsCmd::Publish`] verdict that was to WAIT, and what it was a verdict on: the
+    /// same question asked again next frame is answered from this, not by merging again.
+    publish_memo: Option<PublishKey>,
+    /// The fetches this owner's steps have asked for and nobody has started yet, in the order they
+    /// were asked ([`crate::stores::StoreJob::Hubs`]). A step only pushes here; the application's
+    /// runner takes them ([`crate::stores::hubs::HubsStore::take_jobs`]) and starts each, because
+    /// starting a worker is IO and a step does none. A `Reset` clears it: the sources the jobs were
+    /// asked for are gone with it.
+    pub(crate) jobs: Vec<crate::stores::StoreJob>,
+}
+
+/// Everything a [`publish_staged`] verdict depends on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PublishKey {
+    catalog_gen: u32,
+    staged_gen: u32,
+    hold: (usize, usize),
+    visible: bool,
+    focused_hub: Option<usize>,
+    press_live: bool,
 }
 
 /// The id of the merged Continue Watching row, which a page ask names instead of one server's hub.
@@ -197,12 +394,15 @@ const DECK_ID: &str = "home.continue";
 /// server it asked has landed or is retrying, so one failing server never holds the others.
 struct DeckAsk {
     before: bool,
+    /// How many pages the move is: more than one once a window of hidden copies was passed over.
+    pages: usize,
     waiting: Vec<ServerId>,
 }
 
 impl Default for PmsState {
     fn default() -> Self {
         Self {
+            ledger: Default::default(),
             published: None,
             srcs: Vec::new(),
             seen: u64::MAX,
@@ -213,14 +413,17 @@ impl Default for PmsState {
             fanout: Default::default(),
             deck_ask: None,
             hold: (0, HOLD_ROWS - 1),
+            staged_gen: 0,
+            publish_memo: None,
+            jobs: Vec::new(),
         }
     }
 }
 
 /// The `Arc`'d worker half of one Hubs owner: the landing mailbox and the request-id minter. A
-/// worker captures a clone of the owning `Bridge`'s `Arc<PmsAdapter>` before it spawns; rotating
-/// the store's live `Arc` (on `HubsCmd::Reset`) orphans that clone harmlessly — the old worker can
-/// still land, but only into a mailbox nothing reads any more.
+/// job's [`HubsPort`] holds a clone of the owning `Bridge`'s `Arc<PmsAdapter>` from the step that
+/// emitted it; rotating the store's live `Arc` (on `HubsCmd::Reset`) orphans that clone harmlessly
+/// — the old worker can still land, but only into a mailbox nothing reads any more.
 pub struct PmsAdapter {
     results: Mutex<Vec<Landing>>,
     /// Request-id allocation, shared across sources so an addressed Hubs result has a unique
@@ -228,15 +431,28 @@ pub struct PmsAdapter {
     /// process-wide) is enough: a still-running old worker captured the RETIRED adapter and can
     /// only ever mint (or land) into it, never into the one a reset rotated in.
     next_request: AtomicU32,
-    /// Workers spawned through [`spawn_fetch`] whose landing [`take_landings`] has not yet taken:
-    /// `+1` on the main thread before the worker exists, `-1` when the OS refuses the spawn, `-n`
-    /// when a take moves `n` landings out. It is the claim dump mode's `take_all_owed` waits on
-    /// ([`owed`]), and it has to live here rather than on [`Src::fetching`], which clears when a
-    /// landing is APPLIED, after the take that delivered it. Every admitted worker answers exactly
-    /// once (a panicking fetch posts a failure), so it reaches zero. A request handed to a
-    /// launcher that does not call [`spawn_fetch`] (a replay) is never counted. It lives on the
+    /// Fetches the runner has launched ([`launch_hubs_job`]) whose landing [`take_landings`] has not
+    /// yet taken: `+1` on the main thread before the worker exists ([`HubsPort::claim`]), `-1` when
+    /// the OS refuses the spawn, `-n` when a take moves `n` landings out. It is the claim dump
+    /// mode's `take_all_owed` reads ([`owed`]): the blocking dump waits on it, the paced one starves
+    /// the take and the frame dump holds the iteration. It has to live here rather than on
+    /// [`Src::fetching`], which clears when a landing is APPLIED, after the take that delivered it.
+    /// Every launched worker answers exactly once (a panicking fetch posts a failure), so it
+    /// reaches zero. It is raised at the LAUNCH, never at the emission of a job: a job the runner
+    /// never launches (a replay's recorded admission, a refusal, a client the registry no longer
+    /// holds) holds no claim, and `Port` has no drop guard that could lower one. It lives on the
     /// adapter, so a reset's rotation retires the old count with the old mailbox.
     owed: AtomicU32,
+    /// Fetches the runner REFUSED since the last Hubs step, by request id: the launch did not
+    /// happen (the OS would not start a thread, the registry no longer holds the client the step
+    /// decided on, or a replay's recorded admission was `false`). Nothing will ever fill the
+    /// mailbox for these, so the next step settles each as the failure it is ([`settle_refused`])
+    /// before it reads anything else. A request id is minted by this adapter alone, so it names one
+    /// request; the source that still has it in flight is the one it belongs to. It is NOT the
+    /// landing mailbox: only `results` becomes an `AppMsg::HubsResult`, which the recorder writes,
+    /// so a refusal reaches no recorded byte and replay settles it from its own recorded admission.
+    /// It lives on the adapter, so a reset's rotation retires it with the mailbox.
+    refused: Mutex<Vec<u32>>,
     /// Test only: how many times [`take_landings`] has finished, so a fake worker can post only
     /// AFTER a take has found its mailbox empty.
     #[cfg(any(test, feature = "test-support"))]
@@ -249,6 +465,7 @@ impl Default for PmsAdapter {
             results: Mutex::new(Vec::new()),
             next_request: AtomicU32::new(1),
             owed: AtomicU32::new(0),
+            refused: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             takes: AtomicU32::new(0),
         }
@@ -258,11 +475,33 @@ impl Default for PmsAdapter {
 #[cfg(any(test, feature = "test-support"))]
 pub fn owed_count_for_test(adapter: &PmsAdapter) -> u32 { adapter.owed.load(Ordering::SeqCst) }
 
-/// Is a worker spawned through [`spawn_fetch`] still owing this adapter a landing? Read by the
-/// landing gate's dump mode, which waits for the answer a request it issued owes
-/// (`plx_machine::landgate::Gate::take_all_owed`).
+/// Test hook: the request ids of the launches refused since the last step, in the order they were
+/// answered. The next step settles them ([`settle_refused`]) and empties the list.
+#[cfg(any(test, feature = "test-support"))]
+pub fn refused_for_test(adapter: &PmsAdapter) -> Vec<u32> {
+    adapter.refused.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Test hook: how many authoritative hub refetches this owner has started (`RefetchHubs` bumps it).
+#[cfg(any(test, feature = "test-support"))]
+pub fn hub_gen_for_test(state: &PmsState) -> u32 { state.hub_gen }
+
+/// Is a worker the runner launched ([`launch_hubs_job`]) still owing this adapter a landing? Read by the
+/// landing gate's dump mode, which delivers the answer a request it issued owes
+/// (`plx_machine::landgate::Gate::take_all_owed`): the blocking dump waits for it, the paced dump
+/// (the frame dump's) returns nothing and names the store until it is in.
 pub fn owed(adapter: &PmsAdapter) -> bool {
     adapter.owed.load(Ordering::SeqCst) > 0
+}
+
+/// Has the source `sid` nothing out and nothing waiting for room: its read has landed or failed
+/// (a refused launch fails at the next step, [`settle_refused`]), and the fan-out gate is not holding one back for it? True
+/// for a slot the roster does not hold, which has nothing to wait for. Unlike [`owed`] this is ONE
+/// source's answer, so a slow friend's server does not make everyone else's landing wait. A QUIET
+/// read in flight does not count: this asks whether a prompted read is out.
+pub fn source_settled(state: &PmsState, sid: ServerId) -> bool {
+    // a quiet read is nobody's wait: the return hold ends on the prompted read alone
+    state.srcs.iter().find(|s| s.sid == sid).is_none_or(|s| s.quiet || (!s.fetching && !s.deferred))
 }
 
 fn published_home(state: &PmsState) -> &Arc<HomeCatalog> {
@@ -310,6 +549,23 @@ pub(crate) fn clean(s: &str) -> String {
         .collect()
 }
 
+/// The facts the "Under posters" caption reads, lifted off the wire row: unknown stays `None` /
+/// `false` rather than a zero a reader could mistake for a value.
+fn fill_caption_facts(m: &mut PmsMovie, it: &plx_plex::plex::Metadata) {
+    let some = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+    m.subtype = some(&it.subtype);
+    m.smart = m.kind == KIND_COLLECTION && it.smart;
+    // The wire half is `Metadata::listing_facts`, the one rule the Watchlist's matched copies read too.
+    let facts = it.listing_facts();
+    m.genre = facts.genre;
+    m.video_resolution = facts.video_resolution;
+    m.hdr = facts.hdr;
+    m.audience_rating = facts.audience_rating;
+    m.leaf_count = facts.leaf_count;
+    m.viewed_leaf_count = facts.viewed_leaf_count;
+    m.added_at = (it.added_at > 0).then_some(it.added_at);
+}
+
 /// Parse one Plex `Metadata` item (from a section listing OR a hub) into a catalog row.
 /// pub: the Library browse store (`browse.rs`) and the person page (`person.rs`) map their
 /// listings with it too.
@@ -325,9 +581,12 @@ pub fn parse_item(it: &plx_plex::plex::Metadata, sid: ServerId) -> PmsMovie {
         sec: it.library_section_id,
         ..Default::default()
     };
+    m.edition = clean(&it.edition_title);
     m.aired = clean(&it.originally_available_at);
+    m.guid = it.guid_hex();
+    m.show_guid = it.show_guid_hex();
     m.kind = match it.kind.as_str() {
-        "show" => 1,
+        "show" => KIND_SHOW,
         "season" => 2,
         "episode" => 3,
         "collection" => KIND_COLLECTION,
@@ -337,7 +596,7 @@ pub fn parse_item(it: &plx_plex::plex::Metadata, sid: ServerId) -> PmsMovie {
         3 => {
             // episode: parent show = grandparent, season number = parentIndex
             m.show_rk = clean(&it.grandparent_rating_key);
-            m.season_index = it.parent_index as c_int;
+            m.season_index = it.parent_index.map_or(SEASON_UNKNOWN, |i| i as c_int);
             m.show_title = clean(&it.grandparent_title);
             m.ep_index = it.index as c_int;
         }
@@ -367,9 +626,16 @@ pub fn parse_item(it: &plx_plex::plex::Metadata, sid: ServerId) -> PmsMovie {
         KIND_COLLECTION => false,
         _ => it.view_count > 0,
     };
-    if m.kind == KIND_COLLECTION {
+    // `childCount` is a collection's member count and a show's season count; on a movie, episode
+    // or season it is not sent, so the other kinds stay 0.
+    if matches!(m.kind, 1 | KIND_COLLECTION) {
         m.child_count = it.child_count.max(0);
     }
+    fill_caption_facts(&mut m, it);
+    // A show's, a season's and an episode's listing row carries the same sort facts a movie's does
+    // (`lastViewedAt`, `viewCount`, the scores and their providers, an episode's media); a container's
+    // episode counts are `leaf_count` / `viewed_leaf_count` above. Only a collection keeps none.
+    if matches!(m.kind, 0 | KIND_SHOW | KIND_SEASON | KIND_EPISODE) { m.sort_info = Some(SortInfo::of(it)); }
     m.title = clean(&it.title);
     m.year = it.year as c_int;
     m.rating = clean(&it.content_rating);
@@ -409,13 +675,16 @@ pub fn parse_item(it: &plx_plex::plex::Metadata, sid: ServerId) -> PmsMovie {
     m.art = clean(&it.art);
     m.summary = clean(&it.summary);
     m.rk = clean(&it.rating_key);
-    // Media[0]: codecs + Part[0].key (movies/episodes; a show container has none)
-    if let Some(md) = it.media.first() {
+    // the default version: codecs + Part[0].key (movies/episodes; a show container has none)
+    if let Some((_, md)) = it.media_version(None) {
         m.vcodec = clean(&md.video_codec);
         m.acodec = clean(&md.audio_codec);
         if let Some(p0) = md.part.first() {
             m.part = clean(&p0.key);
         }
+    }
+    if m.kind == 0 || m.kind == 3 {
+        m.versions = versions_of(it);
     }
     // UltraBlurColors -> the ambient gradient. `UltraBlurColors::corners` owns the corner ORDER and
     // the all-black-envelope guard (shared with the detail store, which keys the same wash off the
@@ -517,10 +786,10 @@ impl HubsSnapshot {
 }
 
 /// Frame-borrowed Home data. Every reference is tied to the retained publication, not a static
-/// catalog that an effect could replace. The bridge owns the snapshot; screens only get this.
+/// catalog that an effect could replace. The bridge owns the snapshot; a screen reads this and keeps nothing of the publication past the frame (Home keeps the `Arc` of each card a landing removes, not the catalog).
 #[derive(Clone, Copy)]
 pub struct HubsView<'a> {
-    data: &'a HomeCatalog,
+    data: &'a Arc<HomeCatalog>,
     pub generation: u32,
     pub state: HubState,
 }
@@ -647,7 +916,7 @@ pub fn hub_item(state: &PmsState, hub: usize, col: usize) -> Option<&PmsMovie> {
 /// No reconcile call here, and none is owed anywhere: [`commit`] performs the re-selection and the
 /// repaint itself, at the only moment the catalog those surfaces index into actually moves.
 fn request_refetch_hubs_with_scope(state: &mut PmsState, adapter: &Arc<PmsAdapter>, scope: &BrowseScope,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::EndpointRefreshSet {
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
     // A test reaching this outside `plx_base::testlock::serial()` races some other module's test — see
     // `lib.rs::testlock`.
     #[cfg(any(test, feature = "test-support"))]
@@ -666,6 +935,9 @@ fn request_refetch_hubs_with_scope(state: &mut PmsState, adapter: &Arc<PmsAdapte
         s.abandoned.clear();
         s.adoptable = false;
         s.page = None;
+        s.staged = None; // a prompted read supersedes what a quiet one brought
+        s.quiet = false;
+        s.quiet_owed = false;
     }
     let mut turn = fanout_turn(&mut state.fanout, &srcs, |_| true);
     for s in srcs.iter_mut() {
@@ -675,19 +947,7 @@ fn request_refetch_hubs_with_scope(state: &mut PmsState, adapter: &Arc<PmsAdapte
     endpoints
 }
 
-/// A local, **optimistic** edit to what the shelves say about one item — applied before the write
-/// that justifies it has left the machine, so a press lands on the panel at once however far away
-/// the item's server is. See [`edit_item_with_scope`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LocalEdit {
-    /// The item is now watched (`true`) or unwatched (`false`), everywhere it appears.
-    Watched(bool),
-    /// The item has been hidden from Continue Watching (`removeFromContinueWatching`) — it leaves
-    /// the deck and NOTHING else about it changes, which is exactly what that endpoint does.
-    LeftTheDeck,
-}
-
-/// Apply `edit` to every shelf row naming `(sid, rk)` and re-commit Home under the retained Browse
+/// Apply `edit` ([`ViewEdit`]) to every shelf row `at` covers and re-commit Home under the retained Browse
 /// scope. Returns whether anything
 /// matched. **MAIN THREAD** — it rebuilds the catalog the UI holds `&'static` rows out of.
 ///
@@ -701,15 +961,14 @@ pub enum LocalEdit {
 /// This is one half of a pair and is useless alone: it is what the user SEES, and the refetch the
 /// write's landing kicks is what the server SAYS. Where they disagree the refetch wins, silently.
 #[cfg(test)]
-fn edit_item(state: &mut PmsState, sid: ServerId, rk: &str, edit: LocalEdit) -> bool {
-    edit_item_with_scope(state, sid, rk, edit, &BrowseScope::standalone())
+fn edit_item(state: &mut PmsState, at: &ViewAt, edit: ViewEdit) -> bool {
+    edit_item_with_scope(state, at, edit, &BrowseScope::standalone())
 }
 
 fn edit_item_with_scope(
     state: &mut PmsState,
-    sid: ServerId,
-    rk: &str,
-    edit: LocalEdit,
+    at: &ViewAt,
+    edit: ViewEdit,
     scope: &BrowseScope,
 ) -> bool {
     // Same test-only catalog guard as `request_refetch_hubs` — the catalog is `PmsState`, a
@@ -719,11 +978,15 @@ fn edit_item_with_scope(
     let mut hit = false;
     for s in state.srcs.iter_mut() {
         if let Some(b) = s.last.as_mut() {
-            let matched = apply_edit(b, sid, rk, edit);
-            // A read in flight will land from before this edit; keep it to be made again there.
-            if matched && s.fetching { s.edits.push((sid, rk.to_string(), edit)); }
-            hit |= matched;
+            hit |= apply_edit(b, at, edit);
         }
+        // what a quiet read brought is the server from before this edit; it must carry the edit
+        // when it lands, and it is not what the person sees, so it never decides `hit`
+        if let Some(b) = s.staged.as_mut() { apply_edit(b, at, edit); }
+        // a removed card leaves the facts with it, wherever it sorted in its lane (`Held::feed`
+        // drops only copies inside the span of the rows that remain)
+        if matches!(edit, ViewEdit::LeftDeck) { s.copies.forget(|m| at.is_item(m.sid, &m.rk)); }
+        s.feed_copies(); // a removed card, a marked one
     }
     if !hit {
         return false; // the item is on no shelf (a Library-grid or Related item): nothing to redraw
@@ -736,27 +999,31 @@ fn edit_item_with_scope(
 
 /// [`edit_item_with_scope`] on ONE source's projection. Pure — no statics, no I/O — so the rule is
 /// graded on the host rather than inferred from a screenshot.
-fn apply_edit(b: &mut SourceBuild, sid: ServerId, rk: &str, edit: LocalEdit) -> bool {
-    let mine = |m: &PmsMovie| plx_plex::plex::same_item((m.sid, &m.rk), (sid, rk));
+fn apply_edit(b: &mut SourceBuild, at: &ViewAt, edit: ViewEdit) -> bool {
+    // A deck removal is about the one row pressed; a watched change reaches what the scope names.
+    let mine = |m: &PmsMovie| match edit {
+        ViewEdit::Watched(_) | ViewEdit::Facts { .. } | ViewEdit::Offset { .. } => at.covers(m),
+        ViewEdit::LeftDeck => at.is_item(m.sid, &m.rk),
+    };
     match edit {
-        LocalEdit::Watched(on) => {
+        ViewEdit::Watched(_) | ViewEdit::Facts { .. } | ViewEdit::Offset { .. } => {
             let mut hit = false;
             for c in b.cw.iter_mut().chain(b.lane.rows.iter_mut()) {
-                if mine(&*c.m) {
-                    set_watched(Arc::make_mut(&mut c.m), on);
+                if mine(&*c.m) && edit.changes(&*c.m) {
+                    edit.apply(Arc::make_mut(&mut c.m));
                     hit = true;
                 }
             }
             for m in b.shelves.iter_mut().flat_map(|s| s.items.iter_mut()) {
                 // test the shared card first: `make_mut` clones only the card that matches
-                if mine(&**m) {
-                    set_watched(Arc::make_mut(m), on);
+                if mine(&**m) && edit.changes(&**m) {
+                    edit.apply(Arc::make_mut(m));
                     hit = true;
                 }
             }
             hit
         }
-        LocalEdit::LeftTheDeck => {
+        ViewEdit::LeftDeck => {
             let before = b.cw.len();
             b.cw.retain(|c| !mine(&*c.m));
             b.lane.remove(|row| mine(&*row.m)) || b.cw.len() != before
@@ -764,7 +1031,8 @@ fn apply_edit(b: &mut SourceBuild, sid: ServerId, rk: &str, edit: LocalEdit) -> 
     }
 }
 
-/// The three fields one row's watch state is spread over, moved together.
+/// The fields one row's watch state is spread over, moved together: `watched`, `unwatched` and
+/// `resume_ms`, and for a show or season `viewed_leaf_count` too.
 ///
 /// `resume_ms` goes with them, and it is the half that is easy to miss: [`PmsMovie::resume_frac`]
 /// takes PRECEDENCE over the watched flag at the mark (`ui::widgets::poster_mark` — a re-watch in
@@ -775,11 +1043,16 @@ fn apply_edit(b: &mut SourceBuild, sid: ServerId, rk: &str, edit: LocalEdit) -> 
 ///
 /// `pub` because the hub catalog stopped being the only store an optimistic edit reaches:
 /// `browse`, `search` and `person` each hold their own rows and each flips them the same way, and
-/// three copies of "which three fields" is three chances for one of them to leave the resume bar on.
+/// three copies of "which fields" is three chances for one of them to leave the resume bar on.
 pub fn set_watched(m: &mut PmsMovie, on: bool) {
     m.watched = on;
     m.unwatched = !on;
     m.resume_ms = 0;
+    // A container's episode counts follow its mark, or a show sorted by Unplayed would keep wearing
+    // "9 episodes" under a watched tick until the listing is read again.
+    if matches!(m.kind, KIND_SHOW | 2) {
+        if let Some(leaves) = m.leaf_count { m.viewed_leaf_count = Some(if on { leaves } else { 0 }); }
+    }
 }
 
 /// The catalog/hubs/pool triple the merge produces, before it is committed.
@@ -892,9 +1165,9 @@ fn find_shelf<'a>(shelves: &'a [Shelf], id: &str, key: &str) -> Option<&'a Shelf
 }
 
 fn request_page(state: &mut PmsState, adapter: &PmsAdapter, sid: ServerId,
-    id: &str, key: &str, before: bool, scope: &BrowseScope, launch: &mut dyn FnMut(HubRequest) -> bool) -> Option<crate::stores::EndpointRefresh> {
+    id: &str, key: &str, before: bool, scope: &BrowseScope, launch: &mut dyn FnMut(HubRequest)) -> Option<crate::stores::EndpointRefresh> {
     let Some(source) = state.srcs.iter_mut().find(|source| source.sid == sid) else { return None };
-    if refresh_src_lifecycle(source) { return None; }
+    if refresh_src_lifecycle(source, &scope.clients) { return None; }
     if source.adoptable && !source.fetching && source.page.is_none() && source.abandoned.last()
         .is_some_and(|a| a.page.id == id && a.page.key == key && a.page.before == before) {
         // The read the user walked away from is still out and is the one being asked for again.
@@ -939,7 +1212,7 @@ fn cancel_page(state: &mut PmsState, sid: ServerId, id: &str, key: &str) {
 
 /// The shared body of `Page` and `CancelPage`, for both command runners.
 fn run_page_cmd(state: &mut PmsState, adapter: &PmsAdapter, scope: &BrowseScope, cmd: crate::stores::hubs::HubsCmd,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::EndpointRefreshSet {
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
     use crate::stores::hubs::HubsCmd;
     let mut endpoints = crate::stores::EndpointRefreshSet::default();
     match cmd {
@@ -1042,6 +1315,7 @@ fn take_lanes(srcs: &mut [Src]) -> (Vec<usize>, Vec<deck::Lane>) {
 fn put_lanes(srcs: &mut [Src], idx: &[usize], lanes: Vec<deck::Lane>) {
     for (&i, lane) in idx.iter().zip(lanes) {
         if let Some(build) = srcs[i].last.as_mut() { build.lane = lane; }
+        srcs[i].feed_copies();
     }
 }
 
@@ -1057,53 +1331,113 @@ fn settle_deck(srcs: &mut [Src], refreshed: bool) {
     put_lanes(srcs, &idx, lanes);
 }
 
-/// Moves the deck one page in a direction; a lane that could not be read stays where it is.
-fn advance_deck(srcs: &mut [Src], before: bool) {
+/// Moves the deck `pages` pages in a direction; a lane that could not be read stays where it is.
+fn advance_deck(srcs: &mut [Src], before: bool, pages: usize) -> usize {
+    for s in srcs.iter_mut() { drop_staging(s); } // its lane would put the deck back
     let (idx, mut lanes) = take_lanes(srcs);
-    deck::advance(&mut lanes, !before, deck::PAGE);
+    let taken = deck::advance(&mut lanes, !before, pages * deck::PAGE);
     put_lanes(srcs, &idx, lanes);
+    taken
+}
+
+/// What a move of `pages` pages would leave on the deck, worked out on copies of the lanes.
+enum DeckMove {
+    /// A window with a card to show.
+    Visible,
+    /// A window of nothing but hidden copies, with the listing going on past it.
+    Hidden,
+    /// Nothing to show in the direction of travel, now or later: the deck stays where it is.
+    End,
+}
+
+fn deck_after(srcs: &[Src], scope: &BrowseScope, before: bool, pages: usize) -> DeckMove {
+    let live: Vec<&Src> = srcs.iter().filter(|s| s.last.is_some()).collect();
+    let mut lanes: Vec<deck::Lane> = live.iter().filter_map(|s| s.last.as_ref().map(|b| b.lane.clone())).collect();
+    deck::advance(&mut lanes, !before, pages * deck::PAGE);
+    let held: Vec<crate::stores::deck_group::Held> = live.iter().zip(&lanes).map(|(s, lane)| {
+        let mut held = s.copies.clone();
+        held.feed(lane, &[]);
+        held
+    }).collect();
+    let roster: Vec<crate::stores::deck_group::Source> = live.iter().zip(&held)
+        .map(|(s, held)| crate::stores::deck_group::Source { held, eligible: s.deck_eligible() }).collect();
+    let refs: Vec<&deck::Lane> = lanes.iter().collect();
+    let (cards, behind, ahead) = deck::merge_deck(&refs);
+    let cards = cards.into_iter().map(|(i, c)| (live[i].handle.as_str(), c))
+        .filter(|(_, c)| item_pinned(&scope.pins, &c.m)).collect();
+    if !crate::stores::deck_group::present(cards, &roster, &scope.pins).is_empty() { DeckMove::Visible }
+    else if if before { behind } else { ahead } { DeckMove::Hidden }
+    else { DeckMove::End }
 }
 
 /// A move of the Continue Watching deck. Every lane that holds too few rows to be sure of the next
 /// cards is read through the fan-out gate; when each of those has landed (or is retrying) the deck
 /// moves. With nothing to read, it moves at once.
 fn request_deck_page(state: &mut PmsState, adapter: &PmsAdapter, before: bool, scope: &BrowseScope,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::EndpointRefreshSet {
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
+    if state.deck_ask.is_some() { return Default::default(); }
+    ask_deck(state, adapter, before, 1, scope, launch)
+}
+
+/// The move of `pages` pages: reads what the lanes lack, then [`move_deck`]. A window that would
+/// show no card (every card in it is another server's copy of a show Home draws from the first
+/// server) is not stopped at: the same ask goes on a page further, which reads further, until a
+/// window has a card or the listing ends. Nothing is published in between, so the row never blanks.
+fn ask_deck(state: &mut PmsState, adapter: &PmsAdapter, before: bool, mut pages: usize, scope: &BrowseScope,
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
     let mut endpoints = crate::stores::EndpointRefreshSet::default();
-    if state.deck_ask.is_some() { return endpoints; }
     let gen = state.hub_gen;
     let mut srcs = std::mem::take(&mut state.srcs);
-    let (idx, lanes) = take_lanes(&mut srcs);
-    let short: Vec<usize> = deck::needs(&lanes, !before, deck::PAGE).into_iter().map(|k| idx[k]).collect();
-    put_lanes(&mut srcs, &idx, lanes);
-    if idx.is_empty() || srcs.iter().any(|s| s.last.as_ref().is_some_and(|b| !b.lane.placed)) {
+    loop {
+        let (idx, lanes) = take_lanes(&mut srcs);
+        let short: Vec<usize> = deck::needs(&lanes, !before, pages * deck::PAGE).into_iter().map(|k| idx[k]).collect();
+        put_lanes(&mut srcs, &idx, lanes);
+        if idx.is_empty() || srcs.iter().any(|s| s.last.as_ref().is_some_and(|b| !b.lane.placed)) {
+            state.srcs = srcs;
+            return endpoints;
+        }
+        let mut waiting = Vec::new();
+        for &i in &short {
+            let s = &mut srcs[i];
+            if refresh_src_lifecycle(s, &scope.clients) || s.fetching || s.page.is_some() || s.state != HubState::Ready
+                || s.abandoned.iter().any(|a| a.page.id == DECK_ID) { continue; }
+            s.retry_n = 0;
+            s.page = Some(PageQuery { id: DECK_ID.into(), key: String::new(), start: 0, before, hidden: Vec::new(), reload: false });
+            waiting.push(i);
+        }
+        if waiting.is_empty() {
+            // nothing more can be read now (a server that fails or is out): move on what is held
+            let moved = if pages == 1 || short.is_empty() { move_deck(&mut srcs, scope, before, pages) } else { Some(false) };
+            match moved {
+                Some(_) => {
+                    let mut build = merge_with_scope(&srcs, scope);
+                    state.srcs = srcs;
+                    preserve_heroes(state, &mut build);
+                    commit(state, build);
+                    return endpoints;
+                }
+                None => { pages += 1; continue; }
+            }
+        }
+        let mut turn = fanout_turn(&mut state.fanout, &srcs, source_waiting);
+        for &i in &waiting {
+            if let Some(request) = kick_gated(&mut turn, gen, adapter, &mut srcs[i], scope, &mut *launch) { endpoints.insert(request); }
+        }
+        state.deck_ask = Some(DeckAsk { before, pages, waiting: waiting.iter().map(|&i| srcs[i].sid).collect() });
         state.srcs = srcs;
         return endpoints;
     }
-    let mut waiting = Vec::new();
-    for &i in &short {
-        let s = &mut srcs[i];
-        if refresh_src_lifecycle(s) || s.fetching || s.page.is_some() || s.state != HubState::Ready
-            || s.abandoned.iter().any(|a| a.page.id == DECK_ID) { continue; }
-        s.retry_n = 0;
-        s.page = Some(PageQuery { id: DECK_ID.into(), key: String::new(), start: 0, before, hidden: Vec::new(), reload: false });
-        waiting.push(i);
+}
+
+/// Moves the deck `pages` pages if the window it lands on has a card to show. `None`: it has not,
+/// and the listing goes on, so the caller asks for a further page; `Some(false)`: it has not and
+/// nothing is left, so the deck stays; `Some(true)`: it moved.
+fn move_deck(srcs: &mut [Src], scope: &BrowseScope, before: bool, pages: usize) -> Option<bool> {
+    match deck_after(srcs, scope, before, pages) {
+        DeckMove::Visible => { advance_deck(srcs, before, pages); Some(true) }
+        DeckMove::Hidden => None,
+        DeckMove::End => Some(false),
     }
-    if waiting.is_empty() {
-        advance_deck(&mut srcs, before);
-        let mut build = merge_with_scope(&srcs, scope);
-        state.srcs = srcs;
-        preserve_heroes(state, &mut build);
-        commit(state, build);
-        return endpoints;
-    }
-    let mut turn = fanout_turn(&mut state.fanout, &srcs, source_waiting);
-    for &i in &waiting {
-        if let Some(request) = kick_gated(&mut turn, gen, adapter, &mut srcs[i], scope, &mut *launch) { endpoints.insert(request); }
-    }
-    state.deck_ask = Some(DeckAsk { before, waiting: waiting.iter().map(|&i| srcs[i].sid).collect() });
-    state.srcs = srcs;
-    endpoints
 }
 
 /// The deck's pending move has nothing left to wait for: every server it asked has landed, or
@@ -1113,13 +1447,20 @@ fn deck_ready(ask: &DeckAsk, srcs: &[Src]) -> bool {
         && s.page.as_ref().is_some_and(|page| page.id == DECK_ID)))
 }
 
-/// The read describes the server from when it was issued, so the edits made since are made again
-/// on what it brought: a removed card stays out and a marked one stays marked.
-fn land_lane(source: &mut Src, mut build: SourceBuild) -> bool {
+/// A deck page's landing: the lane the read brought replaces the one held. (The edits published
+/// since the read was issued are made again on every landing by [`replay_since_request`].)
+fn land_lane(source: &mut Src, build: SourceBuild) -> bool {
     let Some(last) = source.last.as_mut() else { return false };
-    for (sid, rk, edit) in std::mem::take(&mut source.edits) { apply_edit(&mut build, sid, &rk, edit); }
     last.lane = build.lane;
+    source.deck_read = DeckRead::Answered;
+    source.feed_copies();
     true
+}
+
+/// The read describes the server from when it was issued, so the edits published since are made
+/// again on what it brought: a removed card stays out and a marked one stays marked.
+fn replay_since_request(source: &Src, build: &mut SourceBuild) {
+    for (at, edit) in source.ledger.since(source.stamp) { apply_edit(build, &at, edit); }
 }
 
 fn land_page(source: &mut Src, page: &PageQuery, build: SourceBuild) -> bool {
@@ -1203,19 +1544,10 @@ fn carry_descriptors(old: &SourceBuild, new: &mut SourceBuild) {
     }
 }
 
-/// The held range as the store keeps it: at most [`HOLD_ROWS`] rows, centred on what the screen
-/// asked for when it asked for more.
-pub(crate) fn clamp_hold((lo, hi): (usize, usize)) -> (usize, usize) {
-    let hi = hi.max(lo);
-    if hi - lo < HOLD_ROWS { return (lo, hi); }
-    let lo = ((lo + hi) / 2).saturating_sub(HOLD_ROWS / 2);
-    (lo, lo + HOLD_ROWS - 1)
-}
-
 /// The shelves that publish a row, in catalog order after the deck: `(source, shelf)` indices.
 /// The single definition of that order, shared by the merge's output and the ring.
 fn published_order(srcs: &[Src], pins: &[(ServerId, i64, bool)]) -> Vec<(usize, usize)> {
-    let mut order = Vec::new();
+    let mut order = Vec::with_capacity(srcs.iter().filter_map(|source| source.last.as_ref()).map(|build| build.shelves.len()).sum());
     for (i, source) in srcs.iter().enumerate() {
         let Some(build) = &source.last else { continue };
         for (j, shelf) in build.shelves.iter().enumerate() {
@@ -1235,12 +1567,13 @@ fn give_up_cards(shelf: &mut Shelf) -> bool {
 }
 
 /// Gives the cards of every row outside the held range up to its descriptor. `hubs` is the merge
-/// that was just built from `srcs`; returns whether any row changed.
-fn settle_ring(srcs: &mut [Src], pins: &[(ServerId, i64, bool)], hubs: &[HubRow], hold: (usize, usize)) -> bool {
+/// that was just built from `srcs`; returns the rows that changed as `(row, source)`, `row` being
+/// the index into that merge's `hubs` and `source` the index into `srcs`.
+fn settle_ring(srcs: &mut [Src], pins: &[(ServerId, i64, bool)], hubs: &[HubRow], hold: (usize, usize)) -> Vec<(usize, usize)> {
     let order = published_order(srcs, pins);
     let deck = hubs.len().saturating_sub(order.len());
     let (lo, hi) = clamp_hold(hold);
-    let mut changed = false;
+    let mut released = Vec::new();
     for (k, &(i, j)) in order.iter().enumerate() {
         let row = k + deck;
         if (lo..=hi).contains(&row) { continue; }
@@ -1250,29 +1583,47 @@ fn settle_ring(srcs: &mut [Src], pins: &[(ServerId, i64, bool)], hubs: &[HubRow]
         shelf.shown = hubs[row].len;
         shelf.items = Vec::new();
         shelf.positions = Vec::new();
-        changed = true;
+        released.push((row, i));
     }
-    changed
+    released
 }
 
 /// [`merge_with_scope`] with the ring applied: rows outside the held range give their cards up and
-/// the catalog is built again from descriptors. The hero pool is the full merge's (it is built from
-/// the rows a refresh brought, before they were released); its cards are kept in the catalog.
+/// the catalog shows them as descriptors. The hero pool is the full merge's (it is built from the
+/// rows a refresh brought, before they were released); its cards are kept in the catalog.
+///
+/// A row that gives its cards up publishes as many placeholders as it showed (`Shelf::shown` is set
+/// to its length), so releasing it changes nothing about the catalog's shape: the same rows, the
+/// same starts and lengths, only the cards in its slice. The merge that was just built is therefore
+/// PATCHED for those rows, not built a second time from every source (every press of a Down key
+/// moves the band and used to pay for two whole merges here; `merge_held_equals_a_merge_of_the_settled_ring`
+/// pins that the patch is the merge it replaces).
 fn merge_held(srcs: &mut [Src], scope: &BrowseScope, hold: (usize, usize)) -> (HubBuild, bool) {
     let mut build = merge_with_scope(srcs, scope);
-    let changed = settle_ring(srcs, &scope.pins, &build.1, hold);
-    if changed {
-        let full = std::mem::replace(&mut build, merge_with_scope(srcs, scope));
-        keep_heroes(&full.0, &full.2, &mut build);
+    let released = settle_ring(srcs, &scope.pins, &build.1, hold);
+    if released.is_empty() { return (build, false); }
+    // the pool's cards, before the slices they sit in are overwritten
+    let pool: Vec<(Arc<PmsMovie>, String, usize)> = build.2.iter()
+        .map(|hero| (Arc::clone(&build.0[hero.idx]), hero.source.clone(), hero.idx)).collect();
+    let mut slots: Vec<Option<Arc<PmsMovie>>> = vec![None; srcs.len()];
+    for (row, i) in released {
+        let hub = &build.1[row];
+        let slot = slots[i].get_or_insert_with(|| placeholder_slot(srcs[i].sid));
+        for card in &mut build.0[hub.start..hub.start + hub.len] { *card = Arc::clone(slot); }
     }
-    (build, changed)
+    place_heroes(pool, &mut build);
+    (build, true)
 }
 
 /// The rows to read again: held, a descriptor, not stalled. Per source, in catalog order.
-fn wanted_reloads(srcs: &[Src], pins: &[(ServerId, i64, bool)], deck: usize, hold: (usize, usize)) -> Vec<Vec<(String, String)>> {
+/// `published_rows` is the published catalog's row count, which with the shelves' own order says how
+/// many deck rows lead it.
+fn wanted_reloads(srcs: &[Src], pins: &[(ServerId, i64, bool)], published_rows: usize, hold: (usize, usize)) -> Vec<Vec<(String, String)>> {
     let (lo, hi) = clamp_hold(hold);
+    let order = published_order(srcs, pins);
+    let deck = published_rows.saturating_sub(order.len());
     let mut wanted = vec![Vec::new(); srcs.len()];
-    for (k, (i, j)) in published_order(srcs, pins).into_iter().enumerate() {
+    for (k, (i, j)) in order.into_iter().enumerate() {
         if !(lo..=hi).contains(&(k + deck)) { continue; }
         let Some(shelf) = srcs[i].last.as_ref().and_then(|build| build.shelves.get(j)) else { continue };
         if shelf.released() && !srcs[i].stalled.iter().any(|(id, key)| shelf.is(id, key)) {
@@ -1287,10 +1638,9 @@ fn wanted_reloads(srcs: &[Src], pins: &[(ServerId, i64, bool)], deck: usize, hol
 /// its read started is dropped from the queue, so a key held through hundreds of rows asks for the
 /// rows it stopped on and never for the ones it passed.
 fn pump_reloads(state: &mut PmsState, adapter: &PmsAdapter, scope: &BrowseScope,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::EndpointRefreshSet {
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
     let mut endpoints = crate::stores::EndpointRefreshSet::default();
-    let deck = published_home(state).hubs.len().saturating_sub(published_order(&state.srcs, &scope.pins).len());
-    let wanted = wanted_reloads(&state.srcs, &scope.pins, deck, state.hold);
+    let wanted = wanted_reloads(&state.srcs, &scope.pins, published_home(state).hubs.len(), state.hold);
     let mut srcs = std::mem::take(&mut state.srcs);
     let mut ask = false;
     for (source, want) in srcs.iter_mut().zip(&wanted) {
@@ -1319,11 +1669,206 @@ fn pump_reloads(state: &mut PmsState, adapter: &PmsAdapter, scope: &BrowseScope,
     endpoints
 }
 
+/// The items in the rows the screen holds cards for (`state.hold`, as the store keeps it: at most
+/// [`HOLD_ROWS`] rows of the published catalog, the merged Continue Watching row first), as
+/// `(server, ratingKey)`. A released row's placeholders have no rating key and are skipped.
+pub fn held_keys(state: &PmsState) -> crate::stores::HeldKeys {
+    let home = published_home(state);
+    let (lo, hi) = clamp_hold(state.hold);
+    let mut keys = crate::stores::HeldKeys::new();
+    for row in home.hubs.iter().skip(lo).take(hi - lo + 1) {
+        for item in home.items.get(row.start..row.start.saturating_add(row.len)).unwrap_or(&[]) {
+            crate::stores::push_held(&mut keys, item.sid, &item.rk);
+        }
+    }
+    keys
+}
+
+/// The servers Home reads, in display order.
+pub fn source_ids(state: &PmsState) -> Vec<ServerId> { state.srcs.iter().map(|s| s.sid).collect() }
+
+/// Is a quiet read's answer waiting to land? Cheap enough to ask every frame, before anything is
+/// built to judge it.
+pub fn has_staged(state: &PmsState) -> bool { state.srcs.iter().any(|s| s.staged.is_some()) }
+
+/// Drops what a quiet read holds for `s`. A quiet read still out is superseded rather than left to
+/// land as an ordinary full read, which would publish at its own time.
+fn drop_staged(s: &mut Src) {
+    s.staged = None;
+    s.quiet_owed = false;
+    if std::mem::take(&mut s.quiet) {
+        s.fetching = false;
+        s.deferred = false;
+        s.seq = s.seq.wrapping_add(1);
+    }
+}
+
+/// Drops the answer a quiet read staged because something moved under it (a page or the deck), and
+/// owes the read again: the update it carried must not be lost.
+fn drop_staging(s: &mut Src) {
+    if s.staged.take().is_some() { s.quiet_owed = true; }
+}
+
+/// A quiet read that could not be started or answered: the source stays exactly as it was, with no
+/// failed state, and the next quiet read waits out a back-off. No rediscovery is asked.
+fn quiet_failed(s: &mut Src) {
+    s.quiet = false;
+    s.deferred = false;
+    s.quiet_fails = s.quiet_fails.saturating_add(1);
+    s.quiet_after = QUIET_SPACING_S.max(backoff_secs(s.quiet_fails));
+}
+
+/// `HubsCmd::RefetchSourceQuiet`: read ONE source's hubs again without publishing. Never bumps
+/// `hub_gen` and touches no other source. Not asked while the source is not Ready or a whole-source
+/// (prompted) read of any source is out: that one publishes what this would have staged. Not asked
+/// while this source has a page read out, nor inside the spacing after its last quiet read; those
+/// two are owed (`Src::quiet_owed`) and made by a later tick.
+fn refetch_source_quiet(state: &mut PmsState, adapter: &PmsAdapter, scope: &BrowseScope, sid: ServerId,
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
+    let mut endpoints = crate::stores::EndpointRefreshSet::default();
+    let mut srcs = std::mem::take(&mut state.srcs);
+    let prompted_out = srcs.iter().any(|s| (s.fetching || s.deferred) && !s.quiet && s.page.is_none());
+    if let Some(i) = srcs.iter().position(|s| s.sid == sid) {
+        let s = &mut srcs[i];
+        if s.page.is_some() {
+            s.quiet_owed = true;
+        } else if !prompted_out && !s.fetching && !s.deferred && s.state == HubState::Ready {
+            if s.quiet_after > 0.0 {
+                s.quiet_owed = true;
+            } else {
+                s.quiet_owed = false;
+                s.quiet = true;
+                s.quiet_after = QUIET_SPACING_S;
+                let gen = state.hub_gen;
+                let mut turn = fanout_turn(&mut state.fanout, &srcs, source_waiting);
+                if let Some(request) = kick_gated(&mut turn, gen, adapter, &mut srcs[i], scope, launch) { endpoints.insert(request); }
+            }
+        }
+    }
+    state.srcs = srcs;
+    endpoints
+}
+
+/// The quiet reads that were wanted and could not be made, made now that their source is idle.
+fn pump_owed_quiet(state: &mut PmsState, adapter: &PmsAdapter, scope: &BrowseScope,
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
+    let mut endpoints = crate::stores::EndpointRefreshSet::default();
+    let owed: Vec<ServerId> = state.srcs.iter()
+        .filter(|s| s.quiet_owed && s.page.is_none() && !s.fetching && !s.deferred && s.quiet_after <= 0.0)
+        .map(|s| s.sid).collect();
+    for sid in owed { endpoints.merge(refetch_source_quiet(state, adapter, scope, sid, &mut *launch)); }
+    endpoints
+}
+
+/// What the staged answers would change in the published catalog.
+enum Shift {
+    /// Nothing at all.
+    None,
+    /// Only what a row says about itself (its listing total, its window), not what it shows.
+    Meta,
+    /// A row added, removed or moved: the ground itself shifts.
+    Structural,
+    /// These rows hold different cards.
+    Rows(Vec<usize>),
+}
+
+fn shift(old: &HomeCatalog, new: &HubBuild) -> Shift {
+    if old.hubs.len() != new.1.len() { return Shift::Structural; }
+    let mut rows = Vec::new();
+    let mut meta = false;
+    for (k, (was, now)) in old.hubs.iter().zip(&new.1).enumerate() {
+        if (&was.hub_id, &was.key, &was.title, &was.source) != (&now.hub_id, &now.key, &now.title, &now.source) {
+            return Shift::Structural;
+        }
+        fn cards<'a>(items: &'a [Arc<PmsMovie>], row: &HubRow) -> Option<&'a [Arc<PmsMovie>]> {
+            items.get(row.start..row.start + row.len)
+        }
+        let same = match (cards(&old.items, was), cards(&new.0, now)) {
+            (Some(a), Some(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y) || **x == **y),
+            _ => false,
+        };
+        if !same { rows.push(k); }
+        meta |= (was.total, was.more, was.offset) != (now.total, now.more, now.offset);
+    }
+    if !rows.is_empty() { Shift::Rows(rows) } else if meta { Shift::Meta } else { Shift::None }
+}
+
+/// `HubsCmd::Publish`: lands what quiet reads staged when nothing the person is looking at moves.
+/// Home covered: everything lands at once. Home showing: a row added, removed or moved waits, so
+/// does a changed row inside the held range, and Continue Watching waits while the focus is on it or
+/// a press is live (`press_live` gates the deck rows only); a change only to rows off screen, to
+/// Continue Watching with the focus elsewhere, or to what a row says about itself, lands. The
+/// decision is made on the catalog the staged answers would build, so it is data here and not a
+/// rule each screen repeats. A verdict to wait is remembered against what it judged and not made
+/// again until one of those moves.
+fn publish_staged(state: &mut PmsState, scope: &BrowseScope, home_top_visible: bool,
+    focused_hub: Option<usize>, press_live: bool) {
+    if !has_staged(state) { return; }
+    let key = PublishKey { catalog_gen: state.catalog_gen, staged_gen: state.staged_gen, hold: state.hold,
+        visible: home_top_visible, focused_hub, press_live };
+    if state.publish_memo == Some(key) { return; }
+    let mut srcs = std::mem::take(&mut state.srcs);
+    // The trial refits the deck of every source (`settle_deck`); what waits must leave every lane as
+    // it was, the sources that staged nothing included.
+    let lanes: Vec<Option<deck::Lane>> = srcs.iter().map(|s| s.last.as_ref().map(|b| b.lane.clone())).collect();
+    let copies: Vec<_> = srcs.iter().map(|s| s.copies.clone()).collect();
+    // swap the staged answers in; `olds` is what goes back if the commit waits
+    let mut olds: Vec<(usize, Option<SourceBuild>)> = Vec::new();
+    for (i, s) in srcs.iter_mut().enumerate() {
+        let Some(mut new) = s.staged.take() else { continue };
+        if let Some(old) = s.last.as_ref() { carry_descriptors(old, &mut new); }
+        olds.push((i, s.last.replace(new)));
+        s.copies.clear(); // a fresh answer, as `landed_ok` takes one
+        s.deck_read = DeckRead::Answered;
+    }
+    settle_deck(&mut srcs, true);
+    let candidate = merge_with_scope(&srcs, scope);
+    let change = shift(published_home(state), &candidate);
+    let deck = candidate.1.len().saturating_sub(published_order(&srcs, &scope.pins).len());
+    let (lo, hi) = clamp_hold(state.hold);
+    let waits = home_top_visible && match &change {
+        Shift::None | Shift::Meta => false,
+        Shift::Structural => true,
+        Shift::Rows(rows) => rows.iter().any(|&k| if k < deck {
+            press_live || focused_hub.is_some_and(|f| f < deck)
+        } else {
+            (lo..=hi).contains(&k)
+        }),
+    };
+    if waits {
+        for (i, old) in olds {
+            srcs[i].staged = std::mem::replace(&mut srcs[i].last, old);
+        }
+        for (s, lane) in srcs.iter_mut().zip(lanes) {
+            if let (Some(build), Some(lane)) = (s.last.as_mut(), lane) { build.lane = lane; }
+        }
+        for (s, held) in srcs.iter_mut().zip(copies) { s.copies = held; }
+        state.srcs = srcs;
+        state.publish_memo = Some(key);
+        return;
+    }
+    state.publish_memo = None;
+    let build = (!matches!(change, Shift::None)).then(|| merge_held(&mut srcs, scope, state.hold).0);
+    state.srcs = srcs;
+    if let Some(mut build) = build {
+        if home_top_visible { preserve_heroes(state, &mut build); }
+        commit(state, build);
+    }
+}
+
 /// `HubsCmd::Hold`: the screen holds rows `lo..=hi`. Rows that left the range give their cards up;
 /// rows that entered it without cards are read at their windows.
 fn run_hold(state: &mut PmsState, adapter: &PmsAdapter, scope: &BrowseScope, lo: usize, hi: usize,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::EndpointRefreshSet {
-    if state.hold == (lo, hi) { return Default::default(); }
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
+    if !apply_hold(state, scope, lo, hi) { return Default::default(); }
+    pump_reloads(state, adapter, scope, launch)
+}
+
+/// The store's half of a hold that moved, before any read is asked for: the band is kept, rows
+/// outside it give their cards up and the catalog is published without them. False when the band
+/// is the one held already.
+fn apply_hold(state: &mut PmsState, scope: &BrowseScope, lo: usize, hi: usize) -> bool {
+    if state.hold == (lo, hi) { return false; }
     state.hold = (lo, hi);
     for source in &mut state.srcs { source.stalled.clear(); }
     let mut srcs = std::mem::take(&mut state.srcs);
@@ -1333,7 +1878,7 @@ fn run_hold(state: &mut PmsState, adapter: &PmsAdapter, scope: &BrowseScope, lo:
         preserve_heroes(state, &mut build);
         commit(state, build);
     }
-    pump_reloads(state, adapter, scope, launch)
+    true
 }
 
 // Scrolling an old Recently Added page must not change the banner's current selection.
@@ -1345,12 +1890,21 @@ fn preserve_heroes(state: &PmsState, build: &mut HubBuild) {
 /// Makes `heroes` (slots into `items`) the pool of `build`, adding to its catalog the cards it does
 /// not hold.
 fn keep_heroes(items: &[Arc<PmsMovie>], heroes: &[HeroSlot], build: &mut HubBuild) {
+    place_heroes(heroes.iter().map(|hero| (Arc::clone(&items[hero.idx]), hero.source.clone(), hero.idx)).collect(), build);
+}
+
+/// [`keep_heroes`] for a pool already lifted out of its catalog as `(card, source handle, the
+/// slot it held)`. A card still at the slot it held (the catalog's shape did not move, which is
+/// every call but a refresh that reordered rows) is found there without a scan; any other is looked
+/// for by identity, and appended when the catalog no longer holds it.
+fn place_heroes(pool: Vec<(Arc<PmsMovie>, String, usize)>, build: &mut HubBuild) {
     build.2.clear();
-    for hero in heroes {
-        let item = &items[hero.idx];
-        let idx = build.0.iter().position(|row| plx_plex::plex::same_item((row.sid, &row.rk), (item.sid, &item.rk)))
-            .unwrap_or_else(|| { build.0.push(Arc::clone(item)); build.0.len() - 1 });
-        build.2.push(HeroSlot { idx, source: hero.source.clone() });
+    for (item, source, held) in pool {
+        let same = |row: &Arc<PmsMovie>| plx_plex::plex::same_item((row.sid, &row.rk), (item.sid, &item.rk));
+        let idx = build.0.get(held).filter(|row| same(row)).map(|_| held)
+            .or_else(|| build.0.iter().position(|row| same(row)))
+            .unwrap_or_else(|| { build.0.push(Arc::clone(&item)); build.0.len() - 1 });
+        build.2.push(HeroSlot { idx, source });
     }
 }
 
@@ -1358,7 +1912,7 @@ fn keep_heroes(items: &[Arc<PmsMovie>], heroes: &[HeroSlot], build: &mut HubBuil
 /// parse), which is NOT the same as a server with nothing on it (`Some` with an empty build) —
 /// that distinction is the whole reason an empty library reads as Ready and not as an error.
 ///
-/// The client AND its `sid` are passed IN, captured at the spawn site: a worker must never ask
+/// The client AND its `sid` are passed IN, resolved by the runner at the launch: a worker must never ask
 /// which server is current (`browse.rs` states the rule, and a server switch mid-fetch would
 /// otherwise stamp these rows with the other machine's id — the one thing every `(sid, rk)`
 /// comparison downstream then trusts). A `&'static Client` also pins the exact address this fetch
@@ -1367,218 +1921,27 @@ fn keep_heroes(items: &[Arc<PmsMovie>], heroes: &[HeroSlot], build: &mut HubBuil
 /// The hub list is read in windows of hubs ([`paging::read_hub_list`]) and each window is projected
 /// as it arrives; `held` names the rows whose cards the source holds now, and the rest are
 /// descriptors from the moment they are parsed (see [`Projection`]).
-fn fetch_source(c: &'static plx_plex::plex::Client, sid: ServerId, held: &[(String, String)]) -> Option<SourceBuild> {
-    let mut build = project_hubs(sid, held, |req| match req {
-        Some(req) => c.home_hubs_page(HUB_FETCH_COUNT, req),
-        None => c.home_hubs(HUB_FETCH_COUNT),
-    })?;
+///
+/// The Continue Watching hub needs nothing from the hub list, so it is asked for beside it rather
+/// than after it (`plx_base::task::beside`). The read-ahead behind its preview is NOT: it starts
+/// once both answered, so a source whose hub list fails costs one extra request (the deck's), not
+/// the deck's and its look-ahead pages on every retry.
+fn fetch_source(c: &plx_plex::plex::Client, sid: ServerId, held: &[(String, String)]) -> Option<SourceBuild> {
+    let (build, cw) = std::thread::scope(|s| {
+        let cw = plx_base::task::beside(s, "hubs-deck", move || c.continue_watching(HUB_FETCH_COUNT));
+        let build = project_hubs(sid, held, |req| match req {
+            Some(req) => c.home_hubs_page(HUB_FETCH_COUNT, req),
+            None => c.home_hubs(HUB_FETCH_COUNT),
+        });
+        (build, cw.finish())
+    });
     // The Continue Watching shelf comes from the DEDICATED hub (see `project`). Its failure fails
     // THIS SOURCE (`?`) — nothing of it commits and it retries on its own backoff. Losing the most
     // important shelf to a transient error would be worse than briefly showing the previous one.
-    let cw = c.continue_watching(HUB_FETCH_COUNT)?;
+    let (mut build, cw) = (build?, cw?);
     project_deck(&mut build, &cw, sid);
     with_lookahead(&mut build, sid, |start, size| c.continue_watching_page(start as i64, size as i64));
-    // The Watchlist leads this source's shelves when the account has one and this server holds
-    // any of it. It is never waited for (see `watchlist_shelf`), and unlike Continue Watching its
-    // failure costs only the shelf, never the source.
-    if let Some(shelf) = watchlist_shelf(c, sid) {
-        build.shelves.insert(0, shelf);
-    }
     Some(build)
-}
-
-/// How long one Watchlist answer, and one server's matches against it, are reused. Home refetches
-/// after every playback; the Watchlist changes on a phone, rarely, and each match is a request.
-#[cfg(not(any(test, feature = "test-support")))]
-const WATCHLIST_TTL: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Lookups in flight at once per server. Measured on a 3.4.3 set's own PMS, one
-/// `/library/all?guid=` took about three seconds, so 24 in series held Home for 73 s.
-#[cfg(not(any(test, feature = "test-support")))]
-const WATCHLIST_LOOKUPS: usize = 4;
-
-/// The account's Watchlist as join guids, newest first, keyed on the token it was fetched with so a
-/// profile switch never reads the previous profile's list.
-#[cfg(not(any(test, feature = "test-support")))]
-static WATCHLIST: LazyLock<Mutex<Option<(String, std::time::Instant, Arc<Vec<String>>)>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-/// Each server's last Watchlist shelf: when it was matched, against which token, and the shelf.
-#[cfg(not(any(test, feature = "test-support")))]
-type WatchlistMatch = (std::time::Instant, String, Option<Shelf>);
-#[cfg(not(any(test, feature = "test-support")))]
-static WATCHLIST_SHELVES: LazyLock<Mutex<std::collections::HashMap<ServerId, WatchlistMatch>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-
-/// Servers whose matching is running now, so a burst of Home refreshes starts one worker each.
-#[cfg(not(any(test, feature = "test-support")))]
-static WATCHLIST_RUNNING: LazyLock<Mutex<std::collections::HashSet<ServerId>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-
-/// Raised by a matcher that changed a shelf; [`take_watchlist_ready`] hands it to the frame loop,
-/// which answers it with an ordinary Home refetch that then reads the new shelf.
-static WATCHLIST_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// FRAME THREAD: `true` once per finished Watchlist match whose shelf differs from the last one.
-pub fn take_watchlist_ready() -> bool {
-    WATCHLIST_READY.swap(false, Ordering::AcqRel)
-}
-
-/// The Watchlist setting changed: ask for the same Home refetch a finished match does, so the
-/// shelf appears or goes without waiting for the next ordinary refresh.
-pub fn watchlist_setting_changed() {
-    WATCHLIST_READY.store(true, Ordering::Release);
-}
-
-/// WORKER THREAD: the account's Watchlist, from the cache while it is fresh. `None` on a failed
-/// fetch.
-#[cfg(not(any(test, feature = "test-support")))]
-fn watchlist_guids(token: &str, client_id: &str) -> Option<Arc<Vec<String>>> {
-    let mut cache = WATCHLIST.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((tok, at, list)) = cache.as_ref() {
-        if tok == token && at.elapsed() < WATCHLIST_TTL {
-            return Some(Arc::clone(list));
-        }
-    }
-    let rows = plx_plex::plex::account::AccountClient::new(client_id, Some(token))
-        .watchlist(MAX_SHELF_ITEMS)?;
-    let list: Arc<Vec<String>> = Arc::new(
-        rows.iter().map(|r| r.join_guid()).filter(|g| !g.is_empty()).collect(),
-    );
-    *cache = Some((token.to_owned(), std::time::Instant::now(), Arc::clone(&list)));
-    Some(list)
-}
-
-/// HUB WORKER: this server's Watchlist shelf as last matched, **without waiting for anything**.
-/// When there is none yet, or it is older than [`WATCHLIST_TTL`], a background matcher is started
-/// and this fetch goes on with the shelf it has (stale, or none). The Watchlist used to be matched
-/// inline here, and Home's shelves then waited 28-73 s for it on a 3.4.3 set instead of 5-8 s.
-/// `None` without a plex.tv account token: a server-token boot has no Watchlist to read.
-#[cfg(not(any(test, feature = "test-support")))]
-fn watchlist_shelf(c: &'static plx_plex::plex::Client, sid: ServerId) -> Option<Shelf> {
-    let s = plx_plex::plex::session::peek();
-    // Settings > Libraries > Watchlist on Home. Off costs nothing: no plex.tv fetch, no lookups.
-    if s.account_token.is_empty() || !s.watchlist_shown() {
-        return None;
-    }
-    let (shelf, fresh) = {
-        let memo = WATCHLIST_SHELVES.lock().unwrap_or_else(|e| e.into_inner());
-        match memo.get(&sid) {
-            Some((at, tok, shelf)) if *tok == s.account_token => {
-                (shelf.clone(), at.elapsed() < WATCHLIST_TTL)
-            }
-            _ => (None, false),
-        }
-    };
-    if !fresh && WATCHLIST_RUNNING.lock().unwrap_or_else(|e| e.into_inner()).insert(sid) {
-        let (token, client_id) = (s.account_token.clone(), s.client_id.clone());
-        let spawned = plx_base::task::spawn_small("watchlist", move || {
-            let _ = catch_unwind(move || match_watchlist(c, sid, &token, &client_id));
-            WATCHLIST_RUNNING.lock().unwrap_or_else(|e| e.into_inner()).remove(&sid);
-        });
-        if !spawned {
-            WATCHLIST_RUNNING.lock().unwrap_or_else(|e| e.into_inner()).remove(&sid);
-        }
-    }
-    shelf
-}
-
-/// WATCHLIST WORKER: match every Watchlist guid on `sid`, [`WATCHLIST_LOOKUPS`] at a time, keep
-/// the hits in Watchlist order as ordinary library rows (so a card opens the local detail page and
-/// plays), memoise the shelf and, when it changed, ask the frame loop for a Home refetch. A pass in
-/// which every lookup failed says nothing about this server and is not memoised.
-#[cfg(not(any(test, feature = "test-support")))]
-fn match_watchlist(
-    c: &'static plx_plex::plex::Client,
-    sid: ServerId,
-    token: &str,
-    client_id: &str,
-) {
-    let Some(list) = watchlist_guids(token, client_id) else { return };
-    let mut found: Vec<Option<Arc<PmsMovie>>> = vec![None; list.len()];
-    let failed = std::sync::atomic::AtomicUsize::new(0);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..WATCHLIST_LOOKUPS.min(list.len()))
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut hits = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(guid) = list.get(i) else { break };
-                        let Some(mc) = c.find_by_guid(guid) else {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        };
-                        let hit = mc
-                            .metadata
-                            .iter()
-                            .filter(|it| listable(&it.kind))
-                            .map(|it| parse_item(it, sid))
-                            .find(|m| !m.title.is_empty() && !m.thumb.is_empty());
-                        if let Some(m) = hit {
-                            hits.push((i, Arc::new(m)));
-                        }
-                    }
-                    hits
-                })
-            })
-            .collect();
-        for w in workers {
-            for (i, m) in w.join().unwrap_or_default() {
-                found[i] = Some(m);
-            }
-        }
-    });
-    let failed = failed.into_inner();
-    let items: Vec<Arc<PmsMovie>> = found.into_iter().flatten().collect();
-    plx_base::eventlog::log(&format!(
-        "watchlist: source {sid:?} matched={} of {} failed={failed}",
-        items.len(),
-        list.len()
-    ));
-    if failed == list.len() && !list.is_empty() {
-        return;
-    }
-    // A whole row, not a window of a listing: nothing to page, so `more` is false and the row
-    // state is the default (Home asks no page of it).
-    let shelf = (!items.is_empty()).then(|| Shelf {
-        epoch: 0,
-        title: plx_platform::i18n::msg::browse_home_watchlist().to_string(),
-        hub_id: "home.watchlist".to_string(),
-        key: String::new(),
-        positions: (0..items.len()).collect(),
-        total: items.len(),
-        offset: 0,
-        end: items.len(),
-        more: false,
-        shown: 0,
-        row: Default::default(),
-        items,
-    });
-    let changed = {
-        let mut memo = WATCHLIST_SHELVES.lock().unwrap_or_else(|e| e.into_inner());
-        let before = memo.get(&sid).map(|(_, _, sh)| shelf_keys(sh));
-        let changed = before != Some(shelf_keys(&shelf));
-        memo.insert(sid, (std::time::Instant::now(), token.to_owned(), shelf));
-        changed
-    };
-    if changed {
-        WATCHLIST_READY.store(true, Ordering::Release);
-    }
-}
-
-/// What a Watchlist shelf shows, for "did this match change anything": its rows' keys in order.
-#[cfg(not(any(test, feature = "test-support")))]
-fn shelf_keys(shelf: &Option<Shelf>) -> Vec<String> {
-    shelf.iter().flat_map(|sh| sh.items.iter().map(|m| m.rk.clone())).collect()
-}
-
-/// HOST SUITE: the Watchlist reaches plex.tv over libcurl, which the host test binary cannot link
-/// (the same cut `person::fetch_profile` makes). Every Home test therefore sees no Watchlist shelf.
-#[cfg(any(test, feature = "test-support"))]
-fn watchlist_shelf(_c: &'static plx_plex::plex::Client, _sid: ServerId) -> Option<Shelf> {
-    None
 }
 
 /// The first window is the merge of the servers' previews, which is the deck's order only if no
@@ -1608,11 +1971,20 @@ fn project(
     out
 }
 
-/// A card a shelf can show: a type the product lists, with a title and a poster.
-fn shelf_card(it: &plx_plex::plex::Metadata, sid: ServerId) -> Option<PmsMovie> {
+/// **A card a hub row can show: a type the product lists, with a poster.** The ONE rule every place
+/// a hub row becomes a card reads (Home's shelves, the Library's Recommended shelves and the sliding
+/// window's two reads), so they cannot disagree about which item is a card.
+///
+/// **A title is not on the list.** A real PMS can send an empty `title` (a season 0 nobody named),
+/// and an item the server left unnamed is still an item a household can open: a caption names a
+/// tile by what it IS when the server gave it nothing else (`caption_policy::identity_line`: a
+/// season "Specials" or "Season N", an episode its address or "Episode", a movie "Movie"). Dropping
+/// the row for want of a title made an untitled season vanish from "Recently Added Seasons" and
+/// reappear the moment it was titled.
+pub(crate) fn shelf_card(it: &plx_plex::plex::Metadata, sid: ServerId) -> Option<PmsMovie> {
     if !listable(&it.kind) { return None; }
     let m = parse_item(it, sid);
-    (!m.title.is_empty() && !m.thumb.is_empty()).then_some(m)
+    (!m.thumb.is_empty()).then_some(m)
 }
 
 /// The Continue Watching deck of `out`, from the dedicated hub.
@@ -1852,50 +2224,53 @@ fn live_sources(srcs: &[Src]) -> Vec<(&str, &SourceBuild)> {
         .collect()
 }
 
-/// What each live source's shelves publish: every pinned card they hold, at most
-/// [`MAX_SHELF_ITEMS`] per shelf. A shelf that gave its cards up to the ring holds none and
-/// publishes placeholder slots instead (see [`Shelf::released`]).
-fn publishable_shelves<'a>(
-    live: &[(&str, &'a SourceBuild)],
-    pins: &[(ServerId, i64, bool)],
-) -> Vec<Vec<Vec<&'a Arc<PmsMovie>>>> {
-    live.iter()
-        .map(|(_, b)| {
-            b.shelves
-                .iter()
-                .map(|sh| {
-                    sh.items
-                        .iter()
-                        .filter(|m| item_pinned(pins, m))
-                        .take(MAX_SHELF_ITEMS)
-                        .collect()
-                })
-                .collect()
-        })
-        .collect()
+/// What a shelf publishes: every pinned card it holds, at most [`MAX_SHELF_ITEMS`]. A shelf that
+/// gave its cards up to the ring holds none and publishes placeholder slots instead (see
+/// [`Shelf::released`]).
+fn publishable<'a>(sh: &'a Shelf, pins: &'a [(ServerId, i64, bool)]) -> impl Iterator<Item = &'a Arc<PmsMovie>> {
+    sh.items.iter().filter(move |m| item_pinned(pins, m)).take(MAX_SHELF_ITEMS)
+}
+
+/// The card every released row of `sid`'s source publishes `shown` times: no rating key, and the
+/// server, so the row keeps its identity.
+fn placeholder_slot(sid: ServerId) -> Arc<PmsMovie> {
+    Arc::new(PmsMovie { sid, ..PmsMovie::default() })
 }
 
 /// Approximate resident bytes of a catalog: each card's struct plus the heap its strings own.
 /// Counted per catalog entry, so a card two shelves share is counted twice — a ceiling on what the
 /// catalog holds, which is the side a memory bound wants to err on.
 fn catalog_bytes(cat: &[Arc<PmsMovie>]) -> usize {
-    cat.iter()
-        .map(|m| {
-            std::mem::size_of::<PmsMovie>()
+    let mut total = 0;
+    let mut run = cat.iter().peekable();
+    // a released row is one placeholder Arc repeated `shown` times: size it once for the run
+    while let Some(m) = run.next() {
+        let mut copies = 1;
+        while run.next_if(|next| Arc::ptr_eq(next, m)).is_some() { copies += 1; }
+        total += copies
+            * (std::mem::size_of::<PmsMovie>()
                 + [
                     &m.title, &m.rating, &m.part, &m.thumb, &m.still, &m.art, &m.summary, &m.rk,
                     &m.vcodec, &m.acodec, &m.show_rk, &m.show_title, &m.aired,
                 ]
                 .iter()
                 .map(|s| s.capacity())
-                .sum::<usize>()
-        })
-        .sum()
+                .sum::<usize>());
+    }
+    total
+}
+
+/// The sources with whether each may win a show: `deck_group` makes one tile of a show two servers
+/// list (docs/shared-servers.md, "One tile per show in Continue Watching").
+fn deck_roster(srcs: &[Src]) -> Vec<crate::stores::deck_group::Source<'_>> {
+    srcs.iter().filter(|s| s.last.is_some())
+        .map(|s| crate::stores::deck_group::Source { held: &s.copies, eligible: s.deck_eligible() }).collect()
 }
 
 fn merge_with_scope(srcs: &[Src], scope: &BrowseScope) -> HubBuild {
     let pins = &scope.pins;
     let live = live_sources(srcs);
+    let roster = deck_roster(srcs);
 
     let mut new_cat: Vec<Arc<PmsMovie>> = Vec::new();
     let mut new_hubs: Vec<HubRow> = Vec::new();
@@ -1914,7 +2289,8 @@ fn merge_with_scope(srcs: &[Src], scope: &BrowseScope) -> HubBuild {
         if !lanes.is_empty() && lanes.iter().all(|lane| lane.placed) {
             let (cards, before, after) = deck::merge_deck(&lanes);
             let offset = if before { lanes.iter().map(|lane| lane.lo).sum::<usize>().max(1) } else { 0 };
-            (cards.into_iter().map(|(i, c)| (live[i].0, c)).filter(|(_, c)| item_pinned(pins, &c.m)).collect(), offset, after)
+            let cards = cards.into_iter().map(|(i, c)| (live[i].0, c)).filter(|(_, c)| item_pinned(pins, &c.m)).collect();
+            (crate::stores::deck_group::present(cards, &roster, pins), offset, after)
         } else {
             let mut cw: Vec<(&str, &CwItem)> = live
                 .iter()
@@ -1923,7 +2299,7 @@ fn merge_with_scope(srcs: &[Src], scope: &BrowseScope) -> HubBuild {
                 .collect();
             // stable: equal timestamps keep source order, so the owned server wins a tie
             cw.sort_by(|a, b| b.1.last_viewed_at.cmp(&a.1.last_viewed_at));
-            (cw, 0, false)
+            (crate::stores::deck_group::present(cw, &roster, pins), 0, false)
         };
     cw.truncate(MAX_SHELF_ITEMS);
     for (h, c) in &cw {
@@ -1950,23 +2326,31 @@ fn merge_with_scope(srcs: &[Src], scope: &BrowseScope) -> HubBuild {
     // cards publishes them (pin-filtered first, so an unpinned library's whole shelf disappears
     // rather than becoming an empty heading); a shelf that gave them up to the ring publishes as
     // many placeholder slots as it last showed, which carry its server so the row keeps its identity.
-    let publishable = publishable_shelves(&live, pins);
     let sids: Vec<ServerId> = srcs.iter().filter(|s| s.last.is_some()).map(|s| s.sid).collect();
+    // the catalog is built in one pass of known size: no regrowth of three tables of thousands
+    let (rows, cards) = live.iter().flat_map(|(_, b)| b.shelves.iter())
+        .fold((0, 0), |(rows, cards), sh| (rows + 1, cards + if sh.released() { sh.shown } else { sh.items.len().min(MAX_SHELF_ITEMS) }));
+    new_hubs.reserve(rows);
+    new_cat.reserve(cards);
+    row_handle.reserve(cards);
 
     for (i, (handle, b)) in live.iter().enumerate() {
-        for (sh, items) in b.shelves.iter().zip(&publishable[i]) {
+        // one placeholder, shared by every released row of the source
+        let mut slot: Option<Arc<PmsMovie>> = None;
+        for sh in &b.shelves {
             let start = new_cat.len();
             if sh.released() {
-                let slot = Arc::new(PmsMovie { sid: sids[i], ..PmsMovie::default() });
+                let slot = slot.get_or_insert_with(|| placeholder_slot(sids[i]));
                 for _ in 0..sh.shown {
-                    new_cat.push(Arc::clone(&slot));
+                    new_cat.push(Arc::clone(slot));
                     row_handle.push(handle);
                 }
             } else {
-                if items.is_empty() {
+                let mut cards = publishable(sh, pins);
+                let Some(first) = cards.next() else {
                     continue;
-                }
-                for m in items {
+                };
+                for m in std::iter::once(first).chain(cards) {
                     new_cat.push(Arc::clone(m));
                     row_handle.push(handle);
                 }
@@ -2062,10 +2446,10 @@ struct Src {
     /// The registry slot every fetch for this source is issued through — and the id stamped onto
     /// every row it parses.
     sid: ServerId,
-    /// Registry lifecycle currently represented by this slot. A slot id survives repoint, so the
-    /// pointer and credential generation are part of the source identity too.
-    client: Option<&'static plx_plex::plex::Client>,
-    token_gen: u32,
+    /// Registry lifecycle currently represented by this slot: the client the slot held and the
+    /// credential it held then. A slot id survives repoint, so both are part of the source
+    /// identity ([`ClientKey`]).
+    key: Option<ClientKey>,
     /// **The CREDIT** for this source — `plex::servers::owner_credit`'s answer, stamped onto every
     /// shelf and hero row this source contributes. `"friend"` for a borrowed server; **empty when
     /// there is nobody to credit**, which is our own server, the household's own server whichever
@@ -2077,8 +2461,8 @@ struct Src {
     /// the third before this field held a credit too (see `docs/shared-servers.md` §13).
     handle: String,
     state: HubState,
-    /// Single flight, PER SOURCE. Cleared only where a landing is taken, where the spawn was
-    /// refused, or where an authoritative fetch has invalidated everything in flight — drop one of
+    /// Single flight, PER SOURCE. Cleared only where a landing is taken, where the launch was
+    /// refused (settled by the next step), or where an authoritative fetch has invalidated everything in flight — drop one of
     /// those and this source never fetches again for the rest of the session.
     fetching: bool,
     /// Assigned by every [`kick`] from the store-wide request sequence. A landing whose seq is not
@@ -2101,33 +2485,78 @@ struct Src {
     /// so the tick asks again; nothing is dropped.
     deferred: bool,
     /// Rows `(hub id, key)` whose reload failed for good while held; asked again only after the
-    /// screen's hold moves.
+    /// screen's hold moves. A screen's `HoldBand` sends a band once per about three rows of
+    /// movement (its slack, `ui::cards::HOLD_SLACK`), not once per row, so a failed row is
+    /// retried about once per three rows the view travels. That is the cadence the retry has;
+    /// a failed row does not ask again on every press.
     stalled: Vec<(String, String)>,
-    /// The optimistic edits made while a read for this source was in flight, in order. That read's
-    /// landing describes the server from before them, so it is given them again (see
-    /// [`land_lane`]); the record ends with the read, and a read issued after an edit carries the
-    /// edit already.
-    edits: Vec<(ServerId, String, LocalEdit)>,
+    /// The publish order of view-state edits (`stores::Stores` shares one across the stores), and
+    /// where the read now in flight for this source was issued in it: its landing describes the
+    /// server from before every edit published since, so it is given them again
+    /// ([`replay_since_request`]). A read issued after an edit carries the edit already.
+    ledger: crate::viewledger::ViewLedger,
+    stamp: crate::viewledger::Stamp,
     /// The projection this source last ANSWERED with, kept across a failure. This is what makes a
     /// failure never blank a populated Home; `None` (never answered) is what makes a dead source
     /// contribute nothing at all — no heading, no empty shelf, no spinner row.
     last: Option<SourceBuild>,
+    /// What this process knows of the server's deck: see [`DeckRead`].
+    deck_read: DeckRead,
+    /// The show each deck row of this server belongs to, remembered past the lane's trim
+    /// (`stores::deck_group`). Facts only: the pick is made by the merge from these.
+    copies: crate::stores::deck_group::Held,
+    /// What a QUIET read ([`HubsCmd::RefetchSourceQuiet`](crate::stores::hubs::HubsCmd)) brought,
+    /// held back from `last` until [`HubsCmd::Publish`](crate::stores::hubs::HubsCmd) lets it land.
+    staged: Option<SourceBuild>,
+    /// The read this source has out, or is owed by the fan-out gate, is a quiet one: its landing is
+    /// staged, and a failure leaves the source exactly as it was. Kept here, not on the request or
+    /// the landing, so a quiet ask the gate deferred is still quiet when a tick launches it and so
+    /// the recorded landing format does not change.
+    quiet: bool,
+    /// A quiet read is wanted and could not be made yet: it was coalesced, refused because this
+    /// source had a page read out, or its staged answer was dropped by one. The tick asks again
+    /// once the source is idle.
+    quiet_owed: bool,
+    /// Seconds before this source may start another quiet read: the spacing after one, the
+    /// back-off after a failed one.
+    quiet_after: f32,
+    quiet_fails: u32,
 }
+
+/// What the process knows of one source's Continue Watching deck.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeckRead {
+    /// Only what was restored from earlier (or from before a profile switch): not yet confirmed.
+    Cached,
+    /// Answered in this process, and the latest deck read (a full refresh or a deck page) succeeded.
+    Answered,
+    /// The latest deck read failed.
+    Failed,
+}
+
+/// The least spacing between two quiet reads of one source; asks inside it coalesce into one.
+pub(crate) const QUIET_SPACING_S: f32 = 5.0;
 
 impl Src {
     /// The request-state transition, independent of thread creation and network I/O. Mint only
     /// after admission to this source's single flight; the adapter receives the captured value.
     fn begin_request(
         &mut self,
-        client: &'static plx_plex::plex::Client,
+        key: ClientKey,
         generation: u32,
         mint: impl FnOnce() -> u32,
     ) -> Option<HubRequest> {
         if self.fetching { return None; }
+        if self.page.is_some() && std::mem::take(&mut self.quiet) {
+            // A page ask took over a quiet one the gate had deferred: this read is the page's, and
+            // its one-shelf answer must never be staged as the source's whole. The quiet read is
+            // owed again.
+            self.staged = None;
+            self.quiet_owed = true;
+        }
         self.adoptable = false;
         let request = HubRequest {
-            gen: generation, seq: mint(), sid: self.sid,
-            client: LandingClient::live(client), token_gen: client.token_gen(),
+            gen: generation, seq: mint(), sid: self.sid, key,
             page: self.page.clone(),
             lane: self.last.as_ref().filter(|build| build.lane.placed).map(|build| (build.lane.clone(), Vec::new())),
             window: self.page.as_ref().and_then(|page| self.last.as_ref().and_then(|build|
@@ -2143,22 +2572,36 @@ impl Src {
                     && (shelf.offset > 0 || shelf.end > HUB_FETCH_COUNT as usize))
                 .map(|shelf| (PageQuery { id: shelf.hub_id.clone(), key: shelf.key.clone(), start: shelf.offset, before: false, hidden: Vec::new(), reload: false }, shelf.end, shelf.clone())).collect()),
         };
-        self.client = Some(client);
-        self.token_gen = request.token_gen;
+        self.key = Some(key);
         self.fetching = true;
-        self.edits.clear(); // the lane this request carries already has every edit made so far
-        if self.page.is_none() { self.state = HubState::Loading; }
+        self.stamp = self.ledger.stamp(); // this read already carries every edit published so far
+        if self.page.is_none() && !self.quiet { self.state = HubState::Loading; }
         self.retry_s = 0.0;
         self.seq = request.seq;
         Some(request)
     }
 
-    fn new(sid: ServerId, handle: String) -> Src {
-        let client = plx_plex::plex::client_for(sid);
+    /// Takes the deck rows the source holds into [`Src::copies`]. Called wherever rows enter a lane
+    /// or leave the deck (a landing, a settle, an edit), never from the merge.
+    fn feed_copies(&mut self) {
+        match self.last.as_ref() {
+            Some(build) => self.copies.feed(&build.lane, &build.cw),
+            None => self.copies.clear(),
+        }
+    }
+
+    /// Whether this source's copy may win a show: its deck answered in this process, its client is
+    /// present and its most recent DECK read did not fail. (Plex Web merges only the servers that
+    /// answered this load.) A refresh in flight does not count against it, and neither does another
+    /// shelf's failing page: the copies it holds are the facts of its last deck answer.
+    fn deck_eligible(&self) -> bool {
+        self.last.is_some() && self.deck_read == DeckRead::Answered && self.key.is_some()
+    }
+
+    fn new(sid: ServerId, handle: String, clients: &ClientKeys) -> Src {
         Src {
             sid,
-            client,
-            token_gen: client.map_or(0, |c| c.token_gen()),
+            key: clients.key(sid),
             handle,
             state: HubState::Loading,
             fetching: false,
@@ -2170,29 +2613,41 @@ impl Src {
             retry_n: 0,
             deferred: false,
             stalled: Vec::new(),
-            edits: Vec::new(),
+            ledger: Default::default(),
+            stamp: 0,
             last: None,
+            copies: Default::default(),
+            deck_read: DeckRead::Cached,
+            staged: None,
+            quiet: false,
+            quiet_owed: false,
+            quiet_after: 0.0,
+            quiet_fails: 0,
         }
     }
 }
 
-fn refresh_src_lifecycle(s: &mut Src) -> bool {
-    let client = plx_plex::plex::client_for(s.sid);
-    let token_gen = client.map_or(0, |c| c.token_gen());
-    let same = match (s.client, client) {
-        (Some(a), Some(b)) => std::ptr::eq(a, b) && s.token_gen == token_gen,
-        (None, None) => true,
-        _ => false,
-    };
-    if same {
+impl PmsState {
+    /// Join the owner's view-state publish order, sources included (`Src::ledger`).
+    pub(crate) fn share_ledger(&mut self, ledger: &crate::viewledger::ViewLedger) {
+        self.ledger = ledger.clone();
+        for s in &mut self.srcs { s.ledger = ledger.clone(); }
+    }
+}
+
+fn refresh_src_lifecycle(s: &mut Src, clients: &ClientKeys) -> bool {
+    let key = clients.key(s.sid);
+    if s.key == key {
         return false;
     }
-    s.client = client;
-    s.token_gen = token_gen;
+    s.key = key;
     s.fetching = false;
     s.abandoned.clear();
     s.adoptable = false;
     s.page = None;
+    s.staged = None;
+    s.quiet = false;
+    s.quiet_owed = false;
     // Retained cards may still paint during the new profile's fetch, but its request must
     // start at the preview rather than reuse the previous profile's listing positions.
     if let Some(build) = s.last.as_mut() {
@@ -2206,6 +2661,7 @@ fn refresh_src_lifecycle(s: &mut Src) -> bool {
         }
     }
     s.state = HubState::Loading;
+    s.deck_read = DeckRead::Cached; // retained cards belong to the previous client or profile
     s.retry_s = 0.0;
     s.retry_n = 0;
     s.seq = s.seq.wrapping_add(1);
@@ -2224,6 +2680,7 @@ struct LandingClient {
     resource: &'static plx_plex::plex::Client,
 }
 
+#[cfg(test)]
 impl LandingClient {
     fn live(resource: &'static plx_plex::plex::Client) -> Self {
         Self { instance: resource.instance_gen(), resource }
@@ -2236,8 +2693,10 @@ pub struct HubRequest {
     gen: u32,
     seq: u32,
     sid: ServerId,
-    client: LandingClient,
-    token_gen: u32,
+    /// The client (and credential) the step decided to ask through. The runner starts the request
+    /// only if the registry still holds that very client at the launch ([`HubRequest::server`]),
+    /// and hands it to [`HubRequest::fetch`].
+    key: ClientKey,
     page: Option<PageQuery>,
     /// Each row that has moved off its preview: where to reload it, how far it had read, and the row
     /// itself (a sample or ledger row cannot be re-read at an offset, so the refresh keeps it).
@@ -2253,13 +2712,28 @@ pub struct HubRequest {
 
 impl HubRequest {
     pub fn descriptor(&self) -> (u32, u32, u16, u32, u32) {
-        (self.gen, self.seq, self.sid.raw(), self.client.instance, self.token_gen)
+        (self.gen, self.seq, self.sid.raw(), self.key.instance, self.key.token)
     }
     pub fn page_descriptor(&self) -> Option<serde_json::Value> {
         self.page.as_ref().map(|page| serde_json::json!({"id":page.id,"key":page.key,"start":page.start,"before":page.before,"hidden":page.hidden}))
     }
-    fn fetch(&self) -> Option<SourceBuild> {
-        let client = self.client.resource;
+
+    /// The server to ask and the client the step decided to ask it through.
+    pub fn server(&self) -> (ServerId, ClientKey) { (self.sid, self.key) }
+
+    /// What a controlled run records for this request (`HomeIo::admit` adds `"admitted"`): a pure
+    /// function of the job, the shape a recording holds and a replay compares byte for byte.
+    pub fn admission(&self) -> serde_json::Value {
+        let (epoch, req, sid, client, token_gen) = self.descriptor();
+        let mut admission = serde_json::json!({"kind":"hubs", "epoch":epoch, "req":req, "sid":sid,
+            "client":client, "token_gen":token_gen});
+        if let Some(page) = self.page_descriptor() { admission["page"] = page; }
+        admission
+    }
+
+    /// The request's IO body: read the server through `client`, which is the registry's object for
+    /// [`HubRequest::server`]'s key. `None` is a failed read, never "the server returned nothing".
+    fn fetch(&self, client: &'static plx_plex::plex::Client) -> Option<SourceBuild> {
         match &self.page {
             Some(page) if page.id == DECK_ID => {
                 let (mut lane, hidden) = self.lane.clone()?;
@@ -2273,12 +2747,12 @@ impl HubRequest {
                 Some(SourceBuild { lane, ..SourceBuild::default() })
             }
             Some(page) if self.window.as_ref().is_some_and(|window| page.reload && !window.row.kept.is_empty()) =>
-                fetch_kept(self.sid, page, self.window.as_ref()?, &mut |keys| many_items(self.client.resource, keys)),
+                fetch_kept(self.sid, page, self.window.as_ref()?, &mut |keys| many_items(client, keys)),
             Some(page) => fetch_row(self.sid, page, self.window.as_ref(), 0,
-                |start, size| self.client.resource.hub_items_paged(&page.key, start as i64, size as i64),
-                |keys| many_items(self.client.resource, keys)),
+                |start, size| client.hub_items_paged(&page.key, start as i64, size as i64),
+                |keys| many_items(client, keys)),
             None => {
-                let mut build = fetch_source(self.client.resource, self.sid, &self.held)?;
+                let mut build = fetch_source(client, self.sid, &self.held)?;
                 if let Some((old, hidden)) = &self.lane {
                     // A deck that has moved stays where it is: the lane is read again at its own
                     // offsets, which also brings the progress of its cards up to date.
@@ -2297,7 +2771,7 @@ impl HubRequest {
                         continue;
                     }
                     // `/hubs` itself answered: a failed window reload keeps the first-page shelf.
-                    let Some(mut refreshed) = fetch_page(self.client.resource, self.sid, window, *end)
+                    let Some(mut refreshed) = fetch_page(client, self.sid, window, *end)
                         .and_then(|page| page.shelves.into_iter().next()) else { continue };
                     if !refreshed.items.is_empty() {
                         refreshed.title = shelf.title.clone();
@@ -2313,9 +2787,50 @@ impl HubRequest {
             },
         }
     }
-    fn complete(self, build: Option<SourceBuild>) -> Landing {
+
+    /// The request's answer. `client` is the object [`HubRequest::fetch`] read through; the landing
+    /// carries the logical identity the step decided on (`key`), which is what a recording writes.
+    fn complete(self, client: &'static plx_plex::plex::Client, build: Option<SourceBuild>) -> Landing {
         Landing { gen: self.gen, seq: self.seq, sid: self.sid,
-            client: Some(self.client), token_gen: self.token_gen, build }
+            client: Some(LandingClient { instance: self.key.instance, resource: client }),
+            token_gen: self.key.token, build }
+    }
+}
+
+/// Two requests are the same when they ask the same thing of the same source: a request id is
+/// minted by one adapter alone, so `(generation, id, server, client, page)` names it. (Its captured
+/// shelves are what the request was built from, not what it is.)
+impl PartialEq for HubRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor() == other.descriptor() && self.page_descriptor() == other.page_descriptor()
+    }
+}
+
+#[cfg(test)]
+impl HubRequest {
+    /// TEST ONLY: the client the registry holds for this request's server now. The runner hands the
+    /// worker the client its key resolved at the launch; a test that re-registers the slot after
+    /// the request was made passes the original to [`HubRequest::fetch`] / [`HubRequest::complete`]
+    /// itself.
+    fn client_for_test(&self) -> &'static plx_plex::plex::Client {
+        plx_plex::plex::client_for(self.sid).expect("the registry holds a client for this request's server")
+    }
+
+    /// TEST ONLY: [`HubRequest::fetch`] through that client.
+    fn fetch_for_test(&self) -> Option<SourceBuild> { self.fetch(self.client_for_test()) }
+
+    /// TEST ONLY: [`HubRequest::complete`] as the runner completes it, through that client.
+    fn complete_for_test(self, build: Option<SourceBuild>) -> Landing {
+        let client = self.client_for_test();
+        self.complete(client, build)
+    }
+}
+
+impl std::fmt::Debug for HubRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (gen, seq, sid, instance, token) = self.descriptor();
+        write!(f, "HubRequest {{ gen: {gen}, seq: {seq}, sid: {sid}, client: {instance}/{token}, page: {:?} }}",
+            self.page_descriptor())
     }
 }
 
@@ -2403,21 +2918,34 @@ fn feeds_home(sid: ServerId, pinned: &[ServerId], known: &[ServerId]) -> bool {
     pinned.is_empty() || pinned.contains(&sid) || !known.contains(&sid)
 }
 
-/// The only Browse facts Home consumes. Controlled execution snapshots these from the Bridge's
-/// retained directory. Standalone Home fixtures have no Browse owner and therefore no known pin
-/// table; the normal unknown-library policy remains in force for them.
-struct BrowseScope {
+/// What a Home step is handed from outside, taken by the host immediately before it runs: the
+/// Browse facts Home consumes (controlled execution snapshots them from the Bridge's retained
+/// directory) and the registry's answer for every server slot ([`ClientKeys`]), which is how a
+/// step knows which client a slot holds without reading the registry itself. Standalone Home
+/// fixtures have no Browse owner and therefore no known pin table; the normal unknown-library
+/// policy remains in force for them.
+struct BrowseScope<'a> {
     sections_gen: u32,
     pins: Vec<(ServerId, i64, bool)>,
+    /// Borrowed from the host's one buffer ([`BrowseScope::retained`]), so an idle per-frame step
+    /// allocates nothing for it; a standalone fixture owns the keys it read.
+    clients: std::borrow::Cow<'a, ClientKeys>,
 }
 
-impl BrowseScope {
+impl<'a> BrowseScope<'a> {
+    /// A fixture with no Browse owner. The keys are the registry's as of this call, read in test
+    /// code only: a production step is handed them ([`BrowseScope::retained`]).
+    #[cfg(any(test, feature = "test-support"))]
     fn standalone() -> Self {
-        Self { sections_gen: 0, pins: Vec::new() }
+        Self { sections_gen: 0, pins: Vec::new(), clients: std::borrow::Cow::Owned(registry_keys_for_test()) }
     }
 
-    fn retained(directory: crate::stores::browse::DirectoryView<'_>) -> Self {
-        Self { sections_gen: directory.sections_gen(), pins: directory.favorite_sections().to_vec() }
+    fn retained(directory: crate::stores::browse::DirectoryView<'_>, clients: &'a ClientKeys) -> Self {
+        Self {
+            sections_gen: directory.sections_gen(),
+            pins: directory.favorite_sections().to_vec(),
+            clients: std::borrow::Cow::Borrowed(clients),
+        }
     }
 
     /// Semantic pin-table identity. Browse generations are owner-local, so two independent stores
@@ -2445,6 +2973,15 @@ impl BrowseScope {
     }
 }
 
+/// The registry's answer for every active server slot as of now, for a test that drives a step: the
+/// production host fills the same value with `app::adapters::stores::refill_client_keys` before each
+/// call and hands it in. Test code only, so it is no read of the registry by a machine.
+#[cfg(any(test, feature = "test-support"))]
+pub fn registry_keys_for_test() -> ClientKeys {
+    ClientKeys::of(plx_plex::plex::server_ids()
+        .filter_map(|sid| plx_plex::plex::client_for(sid).map(|client| (sid, client))))
+}
+
 /// May this row appear on Home? **Per LIBRARY, which is the grain the switch offers.**
 ///
 /// `/hubs` is a whole-SERVER request and answers with rows from every library on that server, so
@@ -2455,7 +2992,7 @@ impl BrowseScope {
 /// library the section table has not enumerated yet, both pass. The pin is a decision about
 /// libraries we know about, and the alternative — hiding what we cannot classify — empties Home on
 /// the frame it boots, which is the same mistake [`feeds_home`] documents one level up.
-fn item_pinned(pins: &[(ServerId, i64, bool)], m: &PmsMovie) -> bool {
+pub(crate) fn item_pinned(pins: &[(ServerId, i64, bool)], m: &PmsMovie) -> bool {
     if m.sec == 0 {
         return true; // the server said nothing about this row's library
     }
@@ -2497,7 +3034,7 @@ fn roster_with_scope(scope: &BrowseScope) -> Vec<(ServerId, String)> {
     let mut own: Vec<(ServerId, String)> = Vec::new();
     let mut shared: Vec<(ServerId, String)> = Vec::new();
     for sid in plx_plex::plex::server_ids() {
-        if plx_plex::plex::client_for(sid).is_none() || !feeds_home(sid, &pinned, &known) {
+        if scope.clients.key(sid).is_none() || !feeds_home(sid, &pinned, &known) {
             continue;
         }
         let handle = plx_plex::plex::server_facts(sid)
@@ -2522,6 +3059,7 @@ fn roster_with_scope(scope: &BrowseScope) -> Vec<(ServerId, String)> {
 /// forever. A Browse generation was insufficient too: two independent owners legitimately start
 /// at the same local generation while naming different libraries. `BrowseScope` already owns the
 /// small pin snapshot this function folds, so the per-frame cache gate adds no table walk.
+#[cfg(any(test, feature = "test-support"))]
 #[allow(dead_code)] // Standalone Home fixtures have no retained Browse directory.
 fn roster_key() -> u64 {
     roster_key_with_scope(&BrowseScope::standalone())
@@ -2567,6 +3105,7 @@ fn facts_key() -> u32 {
 /// Bring the source table in line with the roster: a surviving source keeps everything it has
 /// (its state, its backoff, and the build it last answered with), a new one arrives Loading and is
 /// picked up by the next [`pump`], and one that has left takes its shelves with it.
+#[cfg(any(test, feature = "test-support"))]
 #[allow(dead_code)] // Standalone Home fixtures have no retained Browse directory.
 fn sync_roster(state: &mut PmsState) {
     sync_roster_with_scope(state, &BrowseScope::standalone());
@@ -2608,12 +3147,17 @@ fn sync_roster_with_scope(state: &mut PmsState, scope: &BrowseScope) {
                 let mut keep = srcs.remove(i);
                 restamped |= keep.handle != handle && keep.last.is_some();
                 keep.handle = handle;
+                drop_staged(&mut keep);
                 // Preserve the last good shelves while the replacement lifecycle fetches, but
                 // release and supersede the old single-flight so it cannot wedge this slot.
-                refresh_src_lifecycle(&mut keep);
+                refresh_src_lifecycle(&mut keep, &scope.clients);
                 out.push(keep);
             }
-            None => out.push(Src::new(sid, handle)),
+            None => {
+                let mut fresh = Src::new(sid, handle, &scope.clients);
+                fresh.ledger = state.ledger.clone();
+                out.push(fresh);
+            }
         }
     }
     // Whatever is left in `srcs` has left the roster — un-pinned, or a share plex.tv no longer
@@ -2659,8 +3203,9 @@ fn commit(state: &mut PmsState, build: HubBuild) -> c_int {
 fn landed_ok(s: &mut Src, b: SourceBuild) {
     // The success twin of `landed_fail`'s line. Without it a source that fetched and answered was
     // indistinguishable in the log from one still in flight — "hubs: source 1 fetching" with
-    // nothing after it says only that the worker started. The SLOT, never the handle (a plex.tv
-    // username is the friend's, and the event log is what users send us).
+    // nothing after it says only that the step emitted the request: the runner may still have
+    // parked it, or refused a quiet or page read, which logs no follow-up. The SLOT, never the
+    // handle (a plex.tv username is the friend's, and the event log is what users send us).
     plx_base::eventlog::log(&format!(
         "hubs: source {} ok — {} shelves, {} in CW",
         s.sid.raw(),
@@ -2670,6 +3215,11 @@ fn landed_ok(s: &mut Src, b: SourceBuild) {
     let mut b = b;
     if let Some(old) = s.last.as_ref() { carry_descriptors(old, &mut b); }
     s.last = Some(b);
+    s.copies.clear(); // a fresh answer: what was remembered deeper than its preview may be gone
+    s.feed_copies();
+    s.deck_read = DeckRead::Answered;
+    s.staged = None; // this answer is newer than anything a quiet read held
+    s.quiet_owed = false;
     s.state = HubState::Ready;
     s.retry_n = 0;
     s.retry_s = 0.0;
@@ -2677,6 +3227,8 @@ fn landed_ok(s: &mut Src, b: SourceBuild) {
 
 /// Record one source's failure: keep whatever it last answered with and arm ITS next attempt.
 fn landed_fail(s: &mut Src) -> crate::stores::EndpointRefresh {
+    // only a read that carries the deck can fail it: the whole-source read, or a deck page
+    if s.page.as_ref().is_none_or(|page| page.id == DECK_ID) { s.deck_read = DeckRead::Failed; }
     s.retry_n = s.retry_n.saturating_add(1);
     s.retry_s = backoff_secs(s.retry_n);
     if s.page.is_some() && s.retry_n >= 3 {
@@ -2711,100 +3263,171 @@ fn retry_due(s: &mut Src, dt: f32) -> bool {
     left <= 0.0
 }
 
-/// Spawn an off-thread fetch for ONE source (single flight); [`pump`] lands it. Every source takes
+/// Ask for an off-thread fetch of ONE source (single flight); [`pump`] lands it. Every source takes
 /// this path, including the primary during boot/profile activation: a blocking fetch on the SDL
 /// loop would draw no frames while the loading spinner is supposed to be visible.
-/// Keep request admission/state identical when another adapter holds the request instead of
-/// launching a worker. The returned admission decision still controls latch release/backoff.
-fn kick_with(gen: u32, adapter: &PmsAdapter, s: &mut Src, scope: &BrowseScope, launch: impl FnOnce(HubRequest) -> bool) -> Option<crate::stores::EndpointRefresh> {
-    refresh_src_lifecycle(s);
+///
+/// The request is handed to `launch`, which only collects it ([`emitting`]): the step starts no
+/// thread. The source is in flight from here, and stays so until a landing answers it or the
+/// runner's refusal is settled by the next step ([`settle_refused`]).
+fn kick_with(gen: u32, adapter: &PmsAdapter, s: &mut Src, scope: &BrowseScope, launch: impl FnOnce(HubRequest)) -> Option<crate::stores::EndpointRefresh> {
+    refresh_src_lifecycle(s, &scope.clients);
     if s.fetching {
         return None; // one in flight already — its spinner is the honest answer
     }
-    // CAPTURE AT THE SPAWN SITE. The worker is handed this server's own `&'static Client` and its
-    // slot id; it never asks which server is current, and a slot re-pointed mid-request cannot
-    // redirect a fetch that is already out (`plex::servers` leaks each client precisely so that
-    // reference stays live).
-    let Some(c) = plx_plex::plex::client_for(s.sid) else {
+    // CAPTURE AT THE STEP. The decision is the step's input (`scope.clients`): the request names
+    // this server's slot and the very client (and credential) it was decided on, and the runner
+    // starts it only if the registry still holds that client at the launch. A slot re-pointed
+    // mid-request cannot redirect a fetch already out (`plex::servers` leaks each client precisely
+    // so the reference stays live), and the fetch never asks which server is current.
+    let Some(key) = scope.clients.key(s.sid) else {
+        if s.quiet { quiet_failed(s); return None; }
         return Some(landed_fail(s));
     };
-    let Some(mut request) = s.begin_request(c, gen,
+    let Some(mut request) = s.begin_request(key, gen,
         || adapter.next_request.fetch_add(1, Ordering::Relaxed)) else { return None };
     for (window, _, _) in &mut request.windows { window.hidden = hidden_sections(scope, request.sid); }
     if let Some((_, hidden)) = &mut request.lane { *hidden = hidden_sections(scope, request.sid); }
-    let sid = request.sid;
-    let spawned = launch(request);
-    if !spawned {
-        // nothing will ever fill the mailbox (the thread limit refused us), so release the latch
-        // here and back off — `pump` will try again on the ladder.
+    plx_base::eventlog::log(&format!("hubs: source {} fetching (off-thread)", request.sid.raw()));
+    launch(request);
+    None
+}
+
+/// Where the fetch of request id `seq` is addressed: this store, and the request's own id (a
+/// landing's [`Landing::request_id`] is the same number).
+fn hubs_addr(seq: u32) -> Addr {
+    Addr { to: MachineId::Store(crate::stores::StoreId::Hubs.ord()), req: RequestId(seq) }
+}
+
+/// Run one step with a launcher that collects the requests the step makes, then put each on the
+/// owner's outbox as a job whose answer lands in `adapter`. A step starts nothing: the application
+/// takes the jobs ([`crate::stores::hubs::HubsStore::take_jobs`]) and starts them.
+fn emitting<R>(state: &mut PmsState, adapter: &Arc<PmsAdapter>,
+    step: impl FnOnce(&mut PmsState, &mut dyn FnMut(HubRequest)) -> R) -> R {
+    let mut requests = Vec::new();
+    let out = step(state, &mut |request| requests.push(request));
+    state.jobs.extend(requests.into_iter().map(|request| crate::stores::StoreJob::Hubs(
+        Job { addr: hubs_addr(request.seq), req: request },
+        HubsPort::of(adapter),
+    )));
+    out
+}
+
+/// Settle every launch refused since the last step, FIRST in that step. A refusal is the failure
+/// of the attempt it refused, found one step after the kick: for each request id still naming a
+/// source in flight, the latch is released and the source backs off by the same ladder a failed
+/// landing uses. A page ask does not spend one of its three attempts on it (the system refusing a
+/// thread says nothing about the server), and a quiet read just spaces its next try. An id no
+/// source has in flight any more was superseded (a refetch, a cancel, a reset) and is dropped.
+fn settle_refused(state: &mut PmsState, adapter: &PmsAdapter) -> crate::stores::EndpointRefreshSet {
+    let mut endpoints = crate::stores::EndpointRefreshSet::default();
+    let refused = std::mem::take(&mut *adapter.refused.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut settled = false;
+    for seq in refused {
+        let Some(s) = state.srcs.iter_mut().find(|s| s.fetching && s.seq == seq) else { continue };
+        let sid = s.sid;
+        settled = true;
         s.fetching = false;
+        if s.quiet { quiet_failed(s); continue; }
         if s.page.is_some() {
-            // The system refusing a thread says nothing about the server, so a page ask does not
-            // spend one of its three attempts on it; it backs off and asks again.
             s.retry_s = backoff_secs(s.retry_n.max(1));
-            return Some(crate::stores::EndpointRefresh { sid: s.sid });
+            endpoints.insert(crate::stores::EndpointRefresh { sid });
+            continue;
         }
-        Some(landed_fail(s))
-    } else {
-        plx_base::eventlog::log(&format!("hubs: source {} fetching (off-thread)", sid.raw()));
-        None
+        endpoints.insert(landed_fail(s));
+    }
+    if settled { plx_machine::idle::invalidate(); }
+    endpoints
+}
+
+/// Where a Home fetch's ONE answer goes: the owner's landing mailbox, captured with the job when it
+/// was emitted. An owner that has since been `Reset` holds a new adapter, and this port still lands
+/// into the one the request was made from, the retired one nobody pumps. Two ports are equal when
+/// they reach the same adapter.
+#[derive(Clone)]
+pub struct HubsPort(Arc<PmsAdapter>);
+
+impl HubsPort {
+    pub(crate) fn of(adapter: &Arc<PmsAdapter>) -> Self { Self(Arc::clone(adapter)) }
+
+    /// The runner is about to start a fetch for this owner: raise the claim [`owed`] reads. On the
+    /// calling (main) thread, before the worker exists; lowered by [`HubsPort::unclaim`] if no
+    /// worker is started, and by [`take_landings`] when the landing is taken.
+    pub fn claim(&self) { self.0.owed.fetch_add(1, Ordering::SeqCst); }
+
+    /// The worker the claim was raised for was never started.
+    pub fn unclaim(&self) {
+        // saturating, like the take that also lowers it: a landing taken first must not wrap the count
+        let _ = self.0.owed.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
     }
 }
 
-/// The live worker adapter. Replay must replace this operation, not skip `begin_request` and
-/// thereby leave its recorded result with no matching in-flight state.
-///
-/// The claim ([`owed`]) is raised here, on the calling (main) thread, before the worker exists, and
-/// dropped again if the OS refuses the spawn: a launcher that does not come through here never
-/// raises it.
-pub fn spawn_fetch(adapter: &Arc<PmsAdapter>, request: HubRequest) -> bool {
-    // A test's refusal stands in for the OS refusing the thread, so it is taken AFTER the claim is
-    // raised and must give it back, exactly as the real refusal does.
-    #[cfg(any(test, feature = "test-support"))]
-    let refused = REFUSE_FETCH_FOR_TEST.with(|flag| flag.get());
-    #[cfg(not(any(test, feature = "test-support")))]
-    let refused = false;
-    #[cfg(any(test, feature = "test-support"))]
-    let late = LATE_FETCH_FOR_TEST.with(|late| late.get())
-        .map(|(extra, items)| (extra, items, adapter.takes.load(Ordering::SeqCst)));
-    let worker_adapter = Arc::clone(adapter);
-    adapter.owed.fetch_add(1, Ordering::SeqCst);
-    let spawned = !refused && plx_base::task::spawn_small("hubs", move || {
-        #[cfg(any(test, feature = "test-support"))]
-        let build = match late {
-            Some((extra, items, takes_at_spawn)) =>
-                late_build_for_test(&worker_adapter, takes_at_spawn, extra, items),
-            None => catch_unwind(std::panic::AssertUnwindSafe(|| request.fetch())).ok().flatten(),
-        };
-        #[cfg(not(any(test, feature = "test-support")))]
-        let build = catch_unwind(std::panic::AssertUnwindSafe(|| request.fetch())).ok().flatten();
-        // Outside the panic guard: every admitted worker answers, including a panicking fetch.
-        worker_adapter.results.lock().unwrap_or_else(|e| e.into_inner()).push(request.complete(build));
-    });
-    if !spawned {
-        adapter.owed.fetch_sub(1, Ordering::SeqCst);
-    }
-    spawned
+impl PartialEq for HubsPort {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }
 
+impl std::fmt::Debug for HubsPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HubsPort({:p})", Arc::as_ptr(&self.0))
+    }
+}
+
+impl Port<Landing> for HubsPort {
+    /// The fetch's answer, a failed read included (`build: None`). It joins the mailbox, the one
+    /// path a landing takes to the store (the recorder writes it from there).
+    fn done(&self, _addr: Addr, landing: Landing) {
+        self.0.results.lock().unwrap_or_else(|e| e.into_inner()).push(landing);
+    }
+
+    /// The fetch was never started. Nothing will ever fill the mailbox for it and the source stays
+    /// in flight, so the refusal is queued on the adapter and the next step settles it
+    /// ([`settle_refused`]); no recorded byte is involved.
+    fn refused(&self, addr: Addr) {
+        self.0.refused.lock().unwrap_or_else(|e| e.into_inner()).push(addr.req.0);
+    }
+}
+
+/// The fetch's IO body and its completion: read the server through `client` (the registry's object
+/// for the job's key) and post the answer to `port`. A read that unwinds still answers (with a
+/// failure), so the claim is always released by the take of its answer.
+pub fn finish_hubs_job(job: Job<HubRequest>, client: &'static plx_plex::plex::Client, port: &HubsPort) {
+    let Job { addr, req } = job;
+    let build = catch_unwind(std::panic::AssertUnwindSafe(|| req.fetch(client))).ok().flatten();
+    // Outside the panic guard: every launched fetch answers, including a panicking one.
+    port.done(addr, req.complete(client, build));
+}
+
+/// Start `job`'s fetch through `spawn`, which stands for the runner's worker start and says whether
+/// anything was started. The claim ([`owed`]) is raised here, on the calling (main) thread, before
+/// the worker exists, and given back if `spawn` starts nothing. True when the worker was started;
+/// on false the caller owes the port its refusal ([`Port::refused`]), exactly one answer per job.
+pub fn launch_hubs_job(job: Job<HubRequest>, port: HubsPort, client: &'static plx_plex::plex::Client,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool) -> bool {
+    launch_with(job, port, spawn, move |job, port| finish_hubs_job(job, client, port))
+}
+
+fn launch_with(job: Job<HubRequest>, port: HubsPort, spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+    finish: impl FnOnce(Job<HubRequest>, &HubsPort) + Send + 'static) -> bool {
+    port.claim();
+    let work = { let port = port.clone(); move || finish(job, &port) };
+    if spawn(Box::new(work)) { return true; }
+    port.unclaim();
+    false
+}
+
+/// [`launch_hubs_job`] with only the network fetch replaced by a worker that answers with `items`
+/// movies LATE: it posts only after the adapter's mailbox has been taken at least once since the
+/// launch (so a take that does not wait finds it empty, every time), then yields `extra` more
+/// times so its post lands at a varying point of the poll loop of a take that does. Both waits are
+/// counts, never clocks, and bounded.
 #[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    static LATE_FETCH_FOR_TEST: std::cell::Cell<Option<(u32, usize)>> = const { std::cell::Cell::new(None) };
-}
-
-/// Replace only the network fetch of every [`spawn_fetch`] this test thread makes inside `f` with
-/// a worker that answers with `items` movies LATE: it posts only after the adapter's mailbox has
-/// been taken at least once since the spawn (so a take that does not wait finds it empty, every
-/// time), then yields `extra` more times so its post lands at a varying point of the poll loop of
-/// a take that does. Both waits are counts, never clocks, and bounded.
-#[cfg(any(test, feature = "test-support"))]
-pub fn with_late_fetches_for_test<R>(extra: u32, items: usize, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<(u32, usize)>);
-    impl Drop for Restore {
-        fn drop(&mut self) { LATE_FETCH_FOR_TEST.with(|late| late.set(self.0)); }
-    }
-    let _restore = Restore(LATE_FETCH_FOR_TEST.with(|late| late.replace(Some((extra, items)))));
-    f()
+pub fn launch_late_hubs_job_for_test(job: Job<HubRequest>, port: HubsPort, client: &'static plx_plex::plex::Client,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool, extra: u32, items: usize) -> bool {
+    let takes_at_launch = port.0.takes.load(Ordering::SeqCst);
+    launch_with(job, port, spawn, move |job, port| {
+        let build = late_build_for_test(&port.0, takes_at_launch, extra, items);
+        port.done(job.addr, job.req.complete(client, build));
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2815,22 +3438,6 @@ fn late_build_for_test(adapter: &PmsAdapter, takes_at_spawn: u32, extra: u32, it
     }
     for _ in 0..extra { std::thread::yield_now(); }
     Some(build_test(items))
-}
-
-#[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    static REFUSE_FETCH_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Replace only the OS spawn boundary on this test thread, including nested callers in stores.
-#[cfg(any(test, feature = "test-support"))]
-pub fn with_refused_fetches_for_test<R>(f: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) { REFUSE_FETCH_FOR_TEST.with(|flag| flag.set(self.0)); }
-    }
-    let _restore = Restore(REFUSE_FETCH_FOR_TEST.with(|flag| flag.replace(true)));
-    f()
 }
 
 /// Is this source waiting on a fetch the tick should start (its countdown aside)? Not Ready, a page
@@ -2853,7 +3460,7 @@ fn fanout_turn(fanout: &mut crate::stores::fanout::Fanout, srcs: &[Src],
 /// [`kick_with`] behind the fan-out gate. A source that is out already is not asking; one the gate
 /// has no room for is marked [`Src::deferred`] and kicked by a later tick.
 fn kick_gated(turn: &mut crate::stores::fanout::FanoutTurn, gen: u32, adapter: &PmsAdapter, s: &mut Src,
-    scope: &BrowseScope, launch: &mut dyn FnMut(HubRequest) -> bool) -> Option<crate::stores::EndpointRefresh> {
+    scope: &BrowseScope, launch: &mut dyn FnMut(HubRequest)) -> Option<crate::stores::EndpointRefresh> {
     if s.fetching {
         return None;
     }
@@ -2870,7 +3477,7 @@ fn kick_gated(turn: &mut crate::stores::fanout::FanoutTurn, gen: u32, adapter: &
 /// source whose fetch is already in flight; a pending page request is re-sent by the same kick.
 /// Behind the fan-out gate: the sources it has no room for are kicked by the following ticks.
 fn retry_now_gated(turn: &mut crate::stores::fanout::FanoutTurn, gen: u32, adapter: &PmsAdapter, s: &mut Src,
-    scope: &BrowseScope, launch: &mut dyn FnMut(HubRequest) -> bool) -> Option<crate::stores::EndpointRefresh> {
+    scope: &BrowseScope, launch: &mut dyn FnMut(HubRequest)) -> Option<crate::stores::EndpointRefresh> {
     s.retry_n = 0;
     s.retry_s = 0.0;
     kick_gated(turn, gen, adapter, s, scope, launch)
@@ -2896,7 +3503,7 @@ pub fn take_landings(adapter: &PmsAdapter) -> Vec<Landing> {
 /// then count each source down to its next automatic attempt. The supplier runs after roster
 /// reconciliation, exactly where the live mailbox used to be drained. Keeping it separate lets an
 /// adapter observe or substitute arrivals without a second state-application path. This is NOT an
-/// offline replay mode: retry scheduling and worker spawning remain live.
+/// offline replay mode: retry scheduling and job emission remain live.
 #[cfg(any(test, feature = "test-support"))]
 fn pump_with_landings(state: &mut PmsState, adapter: &Arc<PmsAdapter>, dt: f32,
     take: impl FnOnce() -> Vec<Landing>) -> crate::stores::EndpointRefreshSet {
@@ -2920,12 +3527,12 @@ pub fn tick_with_directory(
     adapter: &Arc<PmsAdapter>,
     dt: f32,
     directory: crate::stores::browse::DirectoryView<'_>,
+    clients: &ClientKeys,
 ) -> crate::stores::EndpointRefreshSet {
     #[cfg(any(test, feature = "test-support"))]
     plx_base::testlock::assert_held("the pms hub catalog (owned tick)");
-    let mut launch = |r| spawn_fetch(adapter, r);
-    step_landings_with_scope(state, adapter, Some(dt), Vec::new, &BrowseScope::retained(directory),
-        &mut launch)
+    emitting(state, adapter, |state, launch| step_landings_with_scope(state, adapter, Some(dt), Vec::new,
+        &BrowseScope::retained(directory, clients), launch))
 }
 
 /// An addressed arrival may update the catalog behind another page, but must not advance retry
@@ -2951,11 +3558,11 @@ pub fn land_with_directory(
     adapter: &Arc<PmsAdapter>,
     landing: &Landing,
     directory: crate::stores::browse::DirectoryView<'_>,
+    clients: &ClientKeys,
 ) -> crate::stores::StoreOutcome {
     let before = state.catalog_gen;
-    let mut launch = |r| spawn_fetch(adapter, r);
-    let endpoints = step_landings_with_scope(state, adapter, None, || vec![landing.clone()],
-        &BrowseScope::retained(directory), &mut launch);
+    let endpoints = emitting(state, adapter, |state, launch| step_landings_with_scope(state, adapter, None,
+        || vec![landing.clone()], &BrowseScope::retained(directory, clients), launch));
     crate::stores::StoreOutcome { changed: state.catalog_gen != before, endpoints }
 }
 
@@ -2972,110 +3579,129 @@ pub fn run_with_directory(
     adapter: &Arc<PmsAdapter>,
     cmd: crate::stores::hubs::HubsCmd,
     directory: crate::stores::browse::DirectoryView<'_>,
+    clients: &ClientKeys,
 ) -> crate::stores::StoreOutcome {
-    run_with_scope(state, adapter, cmd, &BrowseScope::retained(directory))
+    if matches!(cmd, crate::stores::hubs::HubsCmd::Publish { .. }) && !has_staged(state) {
+        return crate::stores::StoreOutcome::default(); // the per-frame question, before anything is built
+    }
+    run_with_scope(state, adapter, cmd, &BrowseScope::retained(directory, clients))
 }
 
+/// One addressed command. Launches refused since the last step are settled first
+/// ([`settle_refused`]), so the command reads the state they left, and their recovery joins the
+/// command's own. The fetches the command asks for are left on the owner's outbox.
 fn run_with_scope(
     state: &mut PmsState,
     adapter: &Arc<PmsAdapter>,
     cmd: crate::stores::hubs::HubsCmd,
     scope: &BrowseScope,
 ) -> crate::stores::StoreOutcome {
+    let mut endpoints = settle_refused(state, adapter);
+    let out = emitting(state, adapter, |state, launch| run_settled(state, adapter, cmd, scope, launch));
+    endpoints.merge(out.endpoints);
+    crate::stores::StoreOutcome { changed: out.changed, endpoints }
+}
+
+fn run_settled(
+    state: &mut PmsState,
+    adapter: &Arc<PmsAdapter>,
+    cmd: crate::stores::hubs::HubsCmd,
+    scope: &BrowseScope,
+    launch: &mut dyn FnMut(HubRequest),
+) -> crate::stores::StoreOutcome {
     use crate::stores::hubs::HubsCmd;
     match cmd {
         paging @ (HubsCmd::Page { .. } | HubsCmd::CancelPage { .. }) => {
-            let mut launch = |r| spawn_fetch(adapter, r);
             let before = state.catalog_gen;
-            let endpoints = run_page_cmd(state, adapter, scope, paging, &mut launch);
+            let endpoints = run_page_cmd(state, adapter, scope, paging, launch);
             crate::stores::StoreOutcome { changed: before != state.catalog_gen, endpoints }
         }
-        HubsCmd::RefetchHubs => {
-            let mut launch = |r| spawn_fetch(adapter, r);
-            crate::stores::StoreOutcome {
-                changed: true,
-                endpoints: request_refetch_hubs_with_scope(state, adapter, scope, &mut launch),
-            }
-        }
+        HubsCmd::RefetchHubs => crate::stores::StoreOutcome {
+            changed: true,
+            endpoints: request_refetch_hubs_with_scope(state, adapter, scope, launch),
+        },
         HubsCmd::Hold { lo, hi } => {
-            let mut launch = |r| spawn_fetch(adapter, r);
             let before = state.catalog_gen;
-            let endpoints = run_hold(state, adapter, scope, lo, hi, &mut launch);
+            let endpoints = run_hold(state, adapter, scope, lo, hi, launch);
             crate::stores::StoreOutcome { changed: before != state.catalog_gen, endpoints }
         }
         HubsCmd::Retry => {
-            let mut launch = |request| spawn_fetch(adapter, request);
-            controlled_work_with_scope(state, adapter, Some(cmd), 0.0, scope, &mut launch)
-        },
-        HubsCmd::EditItem { sid, rk, edit } => crate::stores::StoreOutcome::changed(
-            edit_item_with_scope(state, sid, &rk, edit, scope)),
-        HubsCmd::Reset => {
-            reset_with_scope(state, adapter, scope);
-            crate::stores::StoreOutcome::changed(true)
-        }
-    }
-}
-
-/// Test-only compatibility shape for bootstrap fixtures that do not retain a directory.
-#[cfg(any(test, feature = "test-support"))]
-pub fn controlled_work(state: &mut PmsState, adapter: &Arc<PmsAdapter>, cmd: Option<crate::stores::hubs::HubsCmd>, dt: f32,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::StoreOutcome {
-    controlled_work_with_scope(state, adapter, cmd, dt, &BrowseScope::standalone(), launch)
-}
-
-pub fn controlled_work_with_directory(state: &mut PmsState, adapter: &Arc<PmsAdapter>, cmd: Option<crate::stores::hubs::HubsCmd>, dt: f32,
-    directory: crate::stores::browse::DirectoryView<'_>,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::StoreOutcome {
-    controlled_work_with_scope(state, adapter, cmd, dt, &BrowseScope::retained(directory), launch)
-}
-
-fn controlled_work_with_scope(state: &mut PmsState, adapter: &Arc<PmsAdapter>, cmd: Option<crate::stores::hubs::HubsCmd>, dt: f32,
-    scope: &BrowseScope,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::StoreOutcome {
-    use crate::stores::hubs::HubsCmd;
-    let before = state.catalog_gen;
-    let command = cmd.as_ref().is_some_and(|cmd| !cmd.is_paging());
-    let endpoints = match cmd {
-        Some(paging) if paging.is_paging() => run_page_cmd(state, adapter, scope, paging, launch),
-        Some(HubsCmd::RefetchHubs) => request_refetch_hubs_with_scope(state, adapter, scope, launch),
-        Some(HubsCmd::Hold { lo, hi }) => run_hold(state, adapter, scope, lo, hi, launch),
-        Some(HubsCmd::Retry) => {
             let gen = state.hub_gen;
             let mut srcs = std::mem::take(&mut state.srcs);
             let mut endpoints = crate::stores::EndpointRefreshSet::default();
             let mut turn = fanout_turn(&mut state.fanout, &srcs, |_| true);
             for source in srcs.iter_mut() {
-                if let Some(request) = retry_now_gated(&mut turn, gen, adapter, source, scope, launch) { endpoints.insert(request); }
+                if let Some(request) = retry_now_gated(&mut turn, gen, adapter, source, scope, &mut *launch) { endpoints.insert(request); }
             }
             state.srcs = srcs;
-            endpoints
-        }
-        Some(HubsCmd::Reset) => {
+            crate::stores::StoreOutcome { changed: true, endpoints }
+        },
+        HubsCmd::ApplyView { at, edit } => crate::stores::StoreOutcome::changed(
+            edit_item_with_scope(state, &at, edit, scope)),
+        HubsCmd::Reset => {
             reset_with_scope(state, adapter, scope);
-            crate::stores::EndpointRefreshSet::default()
+            crate::stores::StoreOutcome::changed(true)
         }
-        Some(other) => return run_with_scope(state, adapter, other, scope),
-        None => step_landings_with_scope(state, adapter, Some(dt), Vec::new, scope, launch),
+        HubsCmd::RefetchSourceQuiet { sid } => crate::stores::StoreOutcome {
+            changed: false,
+            endpoints: refetch_source_quiet(state, adapter, scope, sid, launch),
+        },
+        HubsCmd::Publish { home_top_visible, focused_hub, press_live } => {
+            let before = state.catalog_gen;
+            publish_staged(state, scope, home_top_visible, focused_hub, press_live);
+            crate::stores::StoreOutcome::changed(state.catalog_gen != before)
+        }
+    }
+}
+
+/// TEST ONLY: one step, with each fetch it asks for handed to `launch` as the runner would
+/// start it. `launch` says whether anything was started; `false` is the refusal the runner
+/// answers (`Port::refused`), so the source stays in flight until the next step settles it. A
+/// data-layer test reads the requests a step made, and answers them, without a thread or a
+/// runner. `cmd: None` is the store's tick.
+#[cfg(any(test, feature = "test-support"))]
+pub fn controlled_work(state: &mut PmsState, adapter: &Arc<PmsAdapter>, cmd: Option<crate::stores::hubs::HubsCmd>, dt: f32,
+    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::StoreOutcome {
+    let out = match cmd {
+        Some(cmd) => run_with_scope(state, adapter, cmd, &BrowseScope::standalone()),
+        None => {
+            let before = state.catalog_gen;
+            let endpoints = pump_with_landings(state, adapter, dt, Vec::new);
+            crate::stores::StoreOutcome { changed: state.catalog_gen != before, endpoints }
+        }
     };
-    crate::stores::StoreOutcome { changed: command || before != state.catalog_gen, endpoints }
+    start_for_test(state, launch);
+    out
+}
+
+/// TEST ONLY: hand every job on the outbox to `launch` (see [`controlled_work`]).
+#[cfg(any(test, feature = "test-support"))]
+fn start_for_test(state: &mut PmsState, launch: &mut dyn FnMut(HubRequest) -> bool) {
+    for job in std::mem::take(&mut state.jobs) {
+        let crate::stores::StoreJob::Hubs(job, port) = job else { unreachable!("another store's job on the Hubs outbox") };
+        let addr = job.addr;
+        if !launch(job.req) { port.refused(addr); }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 fn step_landings(state: &mut PmsState, adapter: &Arc<PmsAdapter>, dt: Option<f32>, take: impl FnOnce() -> Vec<Landing>) -> crate::stores::EndpointRefreshSet {
-    let mut launch = |r| spawn_fetch(adapter, r);
-    step_landings_with(state, adapter, dt, take, &mut launch)
+    emitting(state, adapter, |state, launch| step_landings_with_scope(state, adapter, dt, take,
+        &BrowseScope::standalone(), launch))
 }
 
-#[cfg(any(test, feature = "test-support"))]
-fn step_landings_with(state: &mut PmsState, adapter: &Arc<PmsAdapter>, dt: Option<f32>, take: impl FnOnce() -> Vec<Landing>,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::EndpointRefreshSet {
+/// TEST ONLY: [`step_landings_with_scope`] on the standalone scope, the requests the step makes
+/// handed to `launch` as they are asked.
+#[cfg(test)]
+fn step_landings_with(state: &mut PmsState, adapter: &PmsAdapter, dt: Option<f32>, take: impl FnOnce() -> Vec<Landing>,
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
     step_landings_with_scope(state, adapter, dt, take, &BrowseScope::standalone(), launch)
 }
 
 fn step_landings_with_scope(state: &mut PmsState, adapter: &PmsAdapter, dt: Option<f32>, take: impl FnOnce() -> Vec<Landing>,
     scope: &BrowseScope,
-    launch: &mut dyn FnMut(HubRequest) -> bool) -> crate::stores::EndpointRefreshSet {
-    let mut endpoints = crate::stores::EndpointRefreshSet::default();
+    launch: &mut dyn FnMut(HubRequest)) -> crate::stores::EndpointRefreshSet {
+    let mut endpoints = settle_refused(state, adapter);
     sync_roster_with_scope(state, scope);
     let landed = take();
     let any_landed = !landed.is_empty();
@@ -3091,12 +3717,19 @@ fn step_landings_with_scope(state: &mut PmsState, adapter: &PmsAdapter, dt: Opti
         let Some(s) = srcs.iter_mut().find(|s| s.sid == l.sid) else {
             continue; // its source left the roster while it was out
         };
+        // The client OBJECT the request was made through is `resource.instance_gen()`, never the
+        // landing's `instance`: a replayed landing carries the recording's logical id there, and
+        // only the resource it was bound to is the registry's.
         let lifecycle_matches = l.client.is_none_or(|client| {
-            plx_plex::plex::client_for(l.sid)
-                .is_some_and(|now| std::ptr::eq(now, client.resource) && now.token_gen() == l.token_gen)
+            scope.clients.key(l.sid).is_some_and(|k| {
+                k.instance == client.resource.instance_gen() && k.token == l.token_gen
+            })
         });
         if l.gen != cur || l.seq != s.seq || !lifecycle_matches {
             if l.gen == cur && l.seq == s.seq && !lifecycle_matches {
+                s.staged = None;
+                s.quiet = false;
+                s.quiet_owed = false;
                 s.fetching = false;
                 s.abandoned.clear();
                 s.adoptable = false;
@@ -3110,9 +3743,27 @@ fn step_landings_with_scope(state: &mut PmsState, adapter: &PmsAdapter, dt: Opti
             continue;
         }
         s.fetching = false;
+        if std::mem::take(&mut s.quiet) {
+            // a quiet read stages its answer and publishes nothing; a failure is not a failed source
+            match l.build {
+                Some(mut b) => {
+                    replay_since_request(s, &mut b);
+                    if let Some(old) = s.last.as_ref() { carry_descriptors(old, &mut b); }
+                    s.staged = Some(b);
+                    s.quiet_fails = 0;
+                    state.staged_gen = state.staged_gen.wrapping_add(1);
+                }
+                // no rediscovery: it is for the person's own reads; this one backs off and the
+                // next ask (or the prompted retry) finds out
+                None => quiet_failed(s),
+            }
+            continue;
+        }
         match l.build {
-            Some(b) => {
+            Some(mut b) => {
+                replay_since_request(s, &mut b);
                 if let Some(page) = s.page.take() {
+                    drop_staging(s); // the window moved under it
                     dirty |= if page.id == DECK_ID { land_lane(s, b) } else if page.reload { land_reload(s, &page, b) } else { land_page(s, &page, b) };
                     paged = true;
                     s.retry_n = 0;
@@ -3127,7 +3778,14 @@ fn step_landings_with_scope(state: &mut PmsState, adapter: &PmsAdapter, dt: Opti
         }
     }
     if state.deck_ask.as_ref().is_some_and(|ask| deck_ready(ask, &srcs)) {
-        if let Some(ask) = state.deck_ask.take() { advance_deck(&mut srcs, ask.before); }
+        if let Some(ask) = state.deck_ask.take() {
+            // a window with no card to show asks on, by the same path, a page further
+            if move_deck(&mut srcs, scope, ask.before, ask.pages).is_none() {
+                state.srcs = srcs;
+                endpoints.merge(ask_deck(state, adapter, ask.before, ask.pages + 1, scope, &mut *launch));
+                srcs = std::mem::take(&mut state.srcs);
+            }
+        }
         dirty = true;
         paged = true;
     }
@@ -3135,6 +3793,7 @@ fn step_landings_with_scope(state: &mut PmsState, adapter: &PmsAdapter, dt: Opti
     // backoff owed) or a Loading whose worker landed stale and was dropped — the latter owes
     // nothing, so it re-kicks on the spot rather than wedging that source on a spinner forever.
     if let Some(dt) = dt {
+        for s in srcs.iter_mut() { s.quiet_after = (s.quiet_after - dt).max(0.0); }
         let mut turn = fanout_turn(&mut state.fanout, &srcs, |s| source_waiting(s) && s.retry_s - dt <= 0.0);
         for s in srcs.iter_mut() {
             if source_waiting(s) && retry_due(s, dt) {
@@ -3181,6 +3840,7 @@ fn step_landings_with_scope(state: &mut PmsState, adapter: &PmsAdapter, dt: Opti
             bytes / 1024
         ));
     }
+    if dt.is_some() { endpoints.merge(pump_owed_quiet(state, adapter, scope, &mut *launch)); }
     endpoints.merge(pump_reloads(state, adapter, scope, launch));
     endpoints
 }
@@ -3241,7 +3901,7 @@ pub fn seed_for_directory_test(
     plx_base::testlock::assert_held("the pms hub catalog (seed_for_directory_test)");
     assert!(directory.sections().iter().any(|section| section.sid == Some(sid)),
         "a directory-scoped Hubs fixture requires its server in the retained Browse directory");
-    seed_with_scope_for_test(state, adapter, sid, items, hub_state, &BrowseScope::retained(directory));
+    seed_with_scope_for_test(state, adapter, sid, items, hub_state, &BrowseScope::retained(directory, &registry_keys_for_test()));
 }
 
 /// Two-library Home fixture for the application-boundary watch-state regression. Both rows remain
@@ -3267,7 +3927,9 @@ pub fn seed_two_library_home_for_test(
         art: "/a.jpg".into(),
         ..Default::default()
     });
-    let mut source = Src::new(sid, String::new());
+    let keys = registry_keys_for_test();
+    let scope = BrowseScope::retained(directory, &keys);
+    let mut source = Src::new(sid, String::new(), &scope.clients);
     source.state = HubState::Ready;
     source.last = Some(SourceBuild {
         cw: Vec::new(),
@@ -3280,7 +3942,6 @@ pub fn seed_two_library_home_for_test(
             total: 0, offset: 0, end: 0, more: false, shown: 0, positions: Vec::new(), row: Default::default(),
         }],
     });
-    let scope = BrowseScope::retained(directory);
     let sources = vec![source];
     let build = merge_with_scope(&sources, &scope);
     state.srcs = sources;
@@ -3296,7 +3957,8 @@ fn seed_with_scope_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, sid
     let handle = plx_plex::plex::server_facts(sid)
         .map(|facts| facts.handle.clone())
         .unwrap_or_default();
-    let mut s = Src::new(sid, handle);
+    let mut s = Src::new(sid, handle, &scope.clients);
+    s.ledger = state.ledger.clone();
     s.state = hub_state;
     if items > 0 {
         let mut build = build_test(items);
@@ -3342,6 +4004,9 @@ fn reset_with_scope(state: &mut PmsState, adapter: &Arc<PmsAdapter>, scope: &Bro
     let _ = adapter; // every HubsStore command path rotates before applying `HubsCmd::Reset`
     state.hub_gen = state.hub_gen.wrapping_add(1); // a worker still running belongs to the old identity
     state.srcs = Vec::new();
+    // The sources those fetches were asked for are gone: a fetch not yet started would answer into
+    // a store that no longer waits for it.
+    state.jobs.clear();
     state.deck_ask = None;
     forget_roster(state);
     state.seen_facts = u32::MAX;
@@ -3436,6 +4101,53 @@ pub fn seed_ring_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, rows:
     commit(state, build);
 }
 
+/// Test hook: the store's half of `HubsCmd::Hold` (the band moves, the rows that left it give their
+/// cards up, the catalog is published), without the reads for the rows that entered it; land those
+/// with [`land_kept_rows_for_test`]. Returns whether the band moved.
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_for_test(state: &mut PmsState, lo: usize, hi: usize) -> bool {
+    plx_base::testlock::assert_held("the pms hub catalog (hold_for_test)");
+    apply_hold(state, &BrowseScope::standalone(), lo, hi)
+}
+
+/// Test hook: the answer a server would give every held descriptor of a [`seed_ring_for_test`]
+/// fixture (its rows page, so they come back from their listing, not through `RowState::kept`):
+/// `items` cards, keyed as the fixture keys them, landed as a reload lands. Returns whether a row
+/// landed.
+#[cfg(any(test, feature = "test-support"))]
+pub fn land_ring_rows_for_test(state: &mut PmsState, items: usize, salt: &dyn Fn(usize) -> usize) -> bool {
+    plx_base::testlock::assert_held("the pms hub catalog (land_ring_rows_for_test)");
+    let scope = BrowseScope::standalone();
+    let wanted = wanted_reloads(&state.srcs, &scope.pins, published_home(state).hubs.len(), state.hold);
+    let mut srcs = std::mem::take(&mut state.srcs);
+    let mut landed = false;
+    for (source, want) in srcs.iter_mut().zip(wanted) {
+        for (id, key) in want {
+            let Some(row) = key.rsplit('/').next().and_then(|row| row.parse::<usize>().ok()) else { continue };
+            let Some(shelf) = source.last.as_ref().and_then(|build| find_shelf(&build.shelves, &id, &key)).cloned() else { continue };
+            let cards = (0..items).map(|c| Arc::new(PmsMovie {
+                sid: source.sid,
+                rk: format!("{}-{row}-{c}", salt(row)),
+                art: format!("/art/{}", c + 1),
+                ..PmsMovie::default()
+            })).collect();
+            let page = PageQuery { id, key, start: shelf.offset, before: false, hidden: Vec::new(), reload: true };
+            let build = SourceBuild { cw: Vec::new(), lane: Default::default(), shelves: vec![Shelf {
+                items: cards, positions: (0..items).collect(), shown: 0, ..shelf }] };
+            landed |= land_reload(source, &page, build);
+        }
+    }
+    if landed {
+        let (mut build, _) = merge_held(&mut srcs, &scope, state.hold);
+        state.srcs = srcs;
+        preserve_heroes(state, &mut build);
+        commit(state, build);
+    } else {
+        state.srcs = srcs;
+    }
+    landed
+}
+
 /// Test hook: the answer a server would give every held row that waits for the cards it showed
 /// (`RowState::kept`), landed as a reload lands. A fixture seeded without a server has no one to
 /// answer those reads, so a row the ring released would stay placeholders for good; a real Home
@@ -3444,8 +4156,7 @@ pub fn seed_ring_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, rows:
 pub fn land_kept_rows_for_test(state: &mut PmsState) -> bool {
     plx_base::testlock::assert_held("the pms hub catalog (land_kept_rows_for_test)");
     let scope = BrowseScope::standalone();
-    let deck = published_home(state).hubs.len().saturating_sub(published_order(&state.srcs, &scope.pins).len());
-    let wanted = wanted_reloads(&state.srcs, &scope.pins, deck, state.hold);
+    let wanted = wanted_reloads(&state.srcs, &scope.pins, published_home(state).hubs.len(), state.hold);
     let mut srcs = std::mem::take(&mut state.srcs);
     let mut landed = false;
     for (source, want) in srcs.iter_mut().zip(wanted) {
@@ -3524,6 +4235,19 @@ pub fn blur_first_shelf_for_test(state: &mut PmsState, blur_of: impl Fn(usize) -
     commit(state, build);
 }
 
+/// Rewrite the first shelf's cards with `edit` and publish the result the way a REFRESHED landing
+/// does: a fresh merge, so the hero pool is rebuilt from the new rows rather than preserved (the
+/// post-playback refetch — a finished film leaving Continue Watching, the next episode replacing the
+/// one that was watched). Call after a `seed_*_for_test`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn edit_first_shelf_for_test(state: &mut PmsState, edit: impl FnOnce(&mut Vec<Arc<PmsMovie>>)) {
+    let shelf = &mut state.srcs[0].last.as_mut().unwrap().shelves[0];
+    edit(&mut shelf.items);
+    shelf.positions = (0..shelf.items.len()).collect();
+    let build = merge(&state.srcs);
+    commit(state, build);
+}
+
 /// A Home whose only row is a Continue Watching deck of `items` cards with `more` behind them.
 #[cfg(any(test, feature = "test-support"))]
 pub fn seed_continue_window_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, items: usize, more: bool) {
@@ -3535,7 +4259,7 @@ pub fn seed_continue_window_for_test(state: &mut PmsState, adapter: &Arc<PmsAdap
             ..Default::default() }),
         position: i,
     }).collect();
-    let mut source = Src::new(sid, String::new());
+    let mut source = Src::new(sid, String::new(), &registry_keys_for_test());
     source.state = HubState::Ready;
     let lane = deck::Lane::preview("0", &items.saturating_sub(1).to_string(), items, items + usize::from(more), !more);
     source.last = Some(SourceBuild { cw, lane, shelves: Vec::new() });
@@ -3596,6 +4320,127 @@ pub fn retag_test_item_as_collection(state: &mut PmsState, rk: &str) {
     commit(state, build);
 }
 
+/// Test hook: rewrite every shelf item `rk` in place (it may change its own rating key, kind, show
+/// or server) and republish: the server answering a finished episode with the show's next one.
+#[cfg(any(test, feature = "test-support"))]
+pub fn edit_test_item(state: &mut PmsState, rk: &str, edit: &dyn Fn(&mut PmsMovie)) {
+    plx_base::testlock::assert_held("the pms hub catalog (edit_test_item)");
+    for source in state.srcs.iter_mut() {
+        if let Some(build) = source.last.as_mut() {
+            for shelf in &mut build.shelves {
+                for item in shelf.items.iter_mut().filter(|item| item.rk == rk) {
+                    edit(Arc::make_mut(item));
+                }
+            }
+        }
+    }
+    let build = merge(&state.srcs);
+    commit(state, build);
+}
+
+/// Test hook: the Home a real library has: `items` Continue Watching EPISODES, each of its own show
+/// (`show<rk>`), as the source's preview with the deck PLACED (so Continue Watching is the deck row,
+/// row 0), above one Recently Added shelf (row 1). Settled and published.
+#[cfg(any(test, feature = "test-support"))]
+pub fn seed_deck_home_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, items: usize) {
+    plx_base::testlock::assert_held("the pms hub catalog (seed_deck_home_for_test)");
+    seed_with_scope_for_test(state, adapter, ServerId::UNSET, 0, HubState::Ready, &BrowseScope::standalone());
+    let card = |rk: String| Arc::new(PmsMovie {
+        art: format!("/art/{rk}"), thumb: format!("/t/{rk}"), title: rk.clone(), kind: 3,
+        show_rk: format!("show{rk}"), rk, ..PmsMovie::default()
+    });
+    let mut recent = build_test(3).shelves.remove(0);
+    recent.hub_id = "home.movies.recent".into();
+    recent.title = "Recently Added".into();
+    for (i, item) in recent.items.iter_mut().enumerate() { Arc::make_mut(item).rk = format!("r{}", i + 1); }
+    let mut source = Src::new(ServerId::UNSET, String::new(), &registry_keys_for_test());
+    source.state = HubState::Ready;
+    source.ledger = state.ledger.clone();
+    source.last = Some(SourceBuild {
+        cw: (1..=items).map(|i| CwItem { last_viewed_at: (1000 - i) as i64, m: card(i.to_string()), position: 0 }).collect(),
+        shelves: vec![recent],
+        lane: Default::default(),
+    });
+    let mut srcs = vec![source];
+    settle_deck(&mut srcs, true);
+    let build = merge_with_scope(&srcs, &BrowseScope::standalone());
+    state.srcs = srcs;
+    commit(state, build);
+}
+
+/// Test hook: Home as ONE server's `/hubs` answer makes it, projected the way the refresh projects it
+/// (`Projection`: `listable`, `shelf_card`, the hub order) and then committed, so a test sees what a
+/// household would, and not what a hand-built row would. `seed_deck_home_for_test` and the rest build
+/// their rows by hand and so can never observe a row the projection drops.
+#[cfg(any(test, feature = "test-support"))]
+pub fn seed_hubs_response_for_test(state: &mut PmsState, adapter: &Arc<PmsAdapter>, mc: &plx_plex::plex::MediaContainer) {
+    plx_base::testlock::assert_held("the pms hub catalog (seed_hubs_response_for_test)");
+    seed_with_scope_for_test(state, adapter, ServerId::UNSET, 0, HubState::Ready, &BrowseScope::standalone());
+    let mut projection = Projection::new(ServerId::UNSET, None);
+    projection.take(&mc.hub);
+    let mut source = Src::new(ServerId::UNSET, String::new(), &registry_keys_for_test());
+    source.state = HubState::Ready;
+    source.ledger = state.ledger.clone();
+    source.last = Some(projection.finish());
+    let srcs = vec![source];
+    let build = merge_with_scope(&srcs, &BrowseScope::standalone());
+    state.srcs = srcs;
+    commit(state, build);
+}
+
+/// Test hook: what a quiet read of the first source brought, without the read: its answer is its
+/// last one with every shelf item `rk` rewritten by `edit`, held in `staged` for
+/// [`HubsCmd::Publish`](crate::stores::hubs::HubsCmd) to land. Publishes nothing.
+#[cfg(any(test, feature = "test-support"))]
+pub fn stage_test_item(state: &mut PmsState, rk: &str, edit: &dyn Fn(&mut PmsMovie)) {
+    plx_base::testlock::assert_held("the pms hub catalog (stage_test_item)");
+    let source = state.srcs.first_mut().expect("a seeded source");
+    let mut staged = source.last.clone().expect("a source that has answered");
+    staged.lane = Default::default(); // a fresh answer has not had the deck placed on it
+    for shelf in &mut staged.shelves {
+        for item in shelf.items.iter_mut().filter(|item| item.rk == rk) { edit(Arc::make_mut(item)); }
+    }
+    for card in staged.cw.iter_mut().filter(|card| card.m.rk == rk) { edit(Arc::make_mut(&mut card.m)); }
+    source.staged = Some(staged);
+    state.staged_gen = state.staged_gen.wrapping_add(1);
+}
+
+/// Test hook: move the shelf item `rk` to the front of its shelf and republish: Continue Watching
+/// is ordered by last viewed, so the next episode of a show just watched arrives in column 0.
+#[cfg(any(test, feature = "test-support"))]
+pub fn promote_test_item(state: &mut PmsState, rk: &str) {
+    plx_base::testlock::assert_held("the pms hub catalog (promote_test_item)");
+    for source in state.srcs.iter_mut() {
+        if let Some(build) = source.last.as_mut() {
+            for shelf in &mut build.shelves {
+                if let Some(at) = shelf.items.iter().position(|item| item.rk == rk) {
+                    let item = shelf.items.remove(at);
+                    shelf.items.insert(0, item);
+                }
+            }
+        }
+    }
+    let build = merge(&state.srcs);
+    commit(state, build);
+}
+
+/// Test hook: the server offset every shelf's window now starts at (a window that slid under the
+/// cards it held), republished.
+#[cfg(any(test, feature = "test-support"))]
+pub fn slide_test_window(state: &mut PmsState, offset: usize) {
+    plx_base::testlock::assert_held("the pms hub catalog (slide_test_window)");
+    for source in state.srcs.iter_mut() {
+        if let Some(build) = source.last.as_mut() {
+            for shelf in &mut build.shelves {
+                shelf.end = offset + shelf.items.len();
+                shelf.offset = offset;
+            }
+        }
+    }
+    let build = merge(&state.srcs);
+    commit(state, build);
+}
+
 #[cfg(test)]
 #[path = "pms_test_support.rs"]
 mod test_support;
@@ -3627,6 +4472,14 @@ mod recent_paging_tests;
 #[cfg(test)]
 #[path = "pms_owed_tests.rs"]
 mod owed_tests;
+
+#[cfg(test)]
+#[path = "pms_staged_tests.rs"]
+mod staged_tests;
+
+#[cfg(test)]
+#[path = "pms_held_keys_tests.rs"]
+mod held_keys_tests;
 
 /// The library's tile abstraction (restructure spec §10) over a catalog row: the one place a
 /// `PmsMovie` becomes a `Tile`, so a widget that draws a tile asks the trait and never this type.
@@ -3663,3 +4516,180 @@ mod home_row_ring_tests;
 #[cfg(test)]
 #[path = "pms_home_hub_windows_tests.rs"]
 mod home_hub_windows_tests;
+
+#[cfg(test)]
+mod caption_fact_tests {
+    use super::*;
+
+    fn row(json: &str) -> PmsMovie {
+        let it: plx_plex::plex::Metadata = serde_json::from_str(json).expect("fixture parses");
+        parse_item(&it, ServerId::UNSET)
+    }
+
+    #[test]
+    fn a_movie_carries_genre_resolution_hdr_score_and_added_at() {
+        let m = row(r#"{"type":"movie","title":"M","editionTitle":"Director’s Cut","ratingKey":"1","audienceRating":7.8,"addedAt":1700000000,
+            "Genre":[{"tag":"Drama"},{"tag":"Crime"}],
+            "Media":[{"videoResolution":"4k","Part":[{"Stream":[
+                {"streamType":1,"colorTrc":"smpte2084"},{"streamType":2}]}]}]}"#);
+        assert_eq!(m.edition, "Director’s Cut");
+        assert_eq!(m.genre.as_deref(), Some("Drama"), "the FIRST genre");
+        assert_eq!(m.video_resolution.as_deref(), Some("4k"));
+        assert!(m.hdr);
+        assert_eq!(m.audience_rating, Some(7.8));
+        assert_eq!(m.added_at, Some(1_700_000_000));
+        assert!(!m.smart && m.leaf_count.is_none() && m.child_count == 0);
+    }
+
+    #[test]
+    fn an_sdr_movie_is_not_hdr_and_unknown_stays_unknown() {
+        let m = row(r#"{"type":"movie","title":"M","Media":[{"videoResolution":"1080",
+            "Part":[{"Stream":[{"streamType":1,"colorTrc":"bt709"}]}]}]}"#);
+        assert!(!m.hdr);
+        assert_eq!((m.genre, m.audience_rating, m.added_at, m.subtype), (None, None, None, None));
+    }
+
+    #[test]
+    fn dolby_vision_without_a_transfer_characteristic_is_hdr() {
+        let m = row(r#"{"type":"movie","title":"M","Media":[{"Part":[{"Stream":[
+            {"streamType":1,"DOVIPresent":true}]}]}]}"#);
+        assert!(m.hdr);
+    }
+
+    #[test]
+    fn a_show_carries_its_season_and_episode_counts() {
+        let m = row(r#"{"type":"show","title":"S","childCount":3,"leafCount":30,"viewedLeafCount":12}"#);
+        assert_eq!((m.child_count, m.leaf_count, m.viewed_leaf_count), (3, Some(30), Some(12)));
+    }
+
+    #[test]
+    fn a_season_has_no_member_count() {
+        let m = row(r#"{"type":"season","title":"S1","childCount":9,"leafCount":9}"#);
+        assert_eq!(m.child_count, 0);
+    }
+
+    #[test]
+    fn a_smart_collection_is_told_from_a_normal_one() {
+        let smart = row(r#"{"type":"collection","title":"C","subtype":"movie","smart":"1","childCount":14}"#);
+        assert!(smart.smart);
+        assert_eq!((smart.child_count, smart.subtype.as_deref()), (14, Some("movie")));
+        let smart_bool = row(r#"{"type":"collection","title":"C","smart":true}"#);
+        assert!(smart_bool.smart);
+        let normal = row(r#"{"type":"collection","title":"C","subtype":"movie","smart":"0","childCount":5}"#);
+        assert!(!normal.smart && normal.child_count == 5);
+        let absent = row(r#"{"type":"collection","title":"C"}"#);
+        assert!(!absent.smart);
+    }
+}
+
+#[cfg(test)]
+mod sort_info_tests {
+    use super::*;
+    #[test]
+    fn listing_keeps_distinct_scores_and_default_version_without_a_detail_request() {
+        let it: plx_plex::plex::Metadata = serde_json::from_value(serde_json::json!({
+            "type":"movie","ratingKey":"7","title":"Film","contentRating":"PG-13",
+            "rating":10.0,"ratingImage":"rottentomatoes://image.rating.ripe",
+            "audienceRating":8.5,"audienceRatingImage":"rottentomatoes://image.rating.spilled",
+            "userRating":6.0,"viewCount":3,"addedAt":1700000000,"lastViewedAt":1700000010,
+            "Media":[{"id":1,"videoResolution":"1080","width":1920,"height":802,"bitrate":8000},
+                     {"id":2,"videoResolution":"4k","width":3840,"height":2160,"bitrate":40000}]
+        })).unwrap();
+        let row = parse_item(&it, ServerId::UNSET);
+        let facts = row.sort_info.as_ref().unwrap();
+        assert_eq!(row.rating, "PG-13");
+        assert_eq!(facts.rating, Some(10.0));
+        assert_eq!(row.audience_rating, Some(8.5));
+        assert_eq!(facts.user_rating, Some(6.0));
+        assert_eq!((facts.view_count, facts.last_viewed_at), (Some(3), Some(1700000010)));
+        assert_eq!((facts.bitrate_kbps, facts.width, facts.height, facts.media_count), (Some(8000),1920,802,2));
+        assert_eq!(row.video_resolution.as_deref(), Some("1080"));
+        let roundtrip: PmsMovie = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert!(roundtrip == row);
+    }
+
+    /// A show's listing row (a PMS 1.43.5 `type=2` row, trimmed) carries the same sort facts a movie's
+    /// does, and its episode counts: a TV Shows grid is captioned from the listing, with no detail request.
+    #[test]
+    fn a_show_row_keeps_its_sort_facts_and_episode_counts() {
+        let it: plx_plex::plex::Metadata = serde_json::from_value(serde_json::json!({
+            "type":"show","ratingKey":"2175","title":"Series","year":2013,"viewCount":5,"lastViewedAt":1791619274,
+            "originallyAvailableAt":"2013-09-29","leafCount":37,"viewedLeafCount":28,"childCount":2,"addedAt":1788473416,
+            "updatedAt":1791694124,"audienceRating":8.3,"audienceRatingImage":"themoviedb://image.rating"
+        })).unwrap();
+        let row = parse_item(&it, ServerId::UNSET);
+        assert_eq!(row.kind, KIND_SHOW);
+        let facts = row.sort_info.as_ref().expect("a show row carries sort facts");
+        assert_eq!((facts.view_count, facts.last_viewed_at), (Some(5), Some(1791619274)));
+        assert_eq!(facts.audience_image, "themoviedb://image.rating");
+        assert_eq!((row.leaf_count, row.viewed_leaf_count, row.added_at, row.aired.as_str()), (Some(37), Some(28), Some(1788473416), "2013-09-29"));
+        // A collection keeps none: its grid words no sort value.
+        let other: plx_plex::plex::Metadata = serde_json::from_value(serde_json::json!({"type":"collection","ratingKey":"9","title":"x"})).unwrap();
+        assert!(parse_item(&other, ServerId::UNSET).sort_info.is_none());
+    }
+
+    /// An episode's listing row (a `type=4` row, trimmed) carries the facts its sorts read: the scores and
+    /// their providers, its own air date, the dates the library recorded, its play state and its media.
+    /// A season's row carries the dates and play state it has and its episode counts. Soft: a row that
+    /// sends none of them still parses, every fact unknown rather than a zero a reader could mistake
+    /// for a value.
+    #[test]
+    fn episode_and_season_rows_keep_their_sort_facts() {
+        let ep: plx_plex::plex::Metadata = serde_json::from_value(serde_json::json!({
+            "type":"episode","ratingKey":"31","title":"Pilot","grandparentTitle":"Series","parentIndex":1,"index":22,
+            "rating":7.5,"ratingImage":"rottentomatoes://image.rating.ripe",
+            "audienceRating":8.4,"audienceRatingImage":"themoviedb://image.rating","userRating":9.0,
+            "originallyAvailableAt":"2014-05-12","year":2014,"duration":1320000,"viewCount":2,
+            "addedAt":1700000000,"lastViewedAt":1700000010,"contentRating":"TV-14",
+            "Media":[{"id":1,"videoResolution":"1080","width":1920,"height":1080,"bitrate":6500}]
+        })).unwrap();
+        let row = parse_item(&ep, ServerId::UNSET);
+        assert_eq!(row.kind, KIND_EPISODE);
+        let facts = row.sort_info.as_ref().expect("an episode row carries sort facts");
+        assert_eq!((facts.rating, facts.user_rating), (Some(7.5), Some(9.0)));
+        assert_eq!((facts.rating_image.as_str(), facts.audience_image.as_str()), ("rottentomatoes://image.rating.ripe", "themoviedb://image.rating"));
+        assert_eq!((facts.view_count, facts.last_viewed_at), (Some(2), Some(1700000010)));
+        assert_eq!((facts.bitrate_kbps, facts.width, facts.height, facts.media_count), (Some(6500), 1920, 1080, 1));
+        assert_eq!((row.audience_rating, row.aired.as_str(), row.added_at, row.rating.as_str()), (Some(8.4), "2014-05-12", Some(1700000000), "TV-14"));
+        let season: plx_plex::plex::Metadata = serde_json::from_value(serde_json::json!({
+            "type":"season","ratingKey":"32","title":"Season 1","index":1,"leafCount":22,"viewedLeafCount":22,
+            "viewCount":9,"addedAt":1700000000,"lastViewedAt":1700000020
+        })).unwrap();
+        let row = parse_item(&season, ServerId::UNSET);
+        assert_eq!(row.kind, KIND_SEASON);
+        let facts = row.sort_info.as_ref().expect("a season row carries sort facts");
+        assert_eq!((facts.view_count, facts.last_viewed_at), (Some(9), Some(1700000020)));
+        assert_eq!((row.leaf_count, row.viewed_leaf_count, row.added_at), (Some(22), Some(22), Some(1700000000)));
+        // A row that sends none of it: nothing invented.
+        for kind in ["season", "episode"] {
+            let bare: plx_plex::plex::Metadata = serde_json::from_value(serde_json::json!({"type":kind,"ratingKey":"9","title":"x"})).unwrap();
+            let row = parse_item(&bare, ServerId::UNSET);
+            let facts = row.sort_info.as_ref().expect(kind);
+            assert_eq!((facts.rating, facts.user_rating, facts.last_viewed_at, facts.bitrate_kbps), (None, None, None, None), "{kind}");
+            assert_eq!((row.audience_rating, row.added_at), (None, None), "{kind}");
+        }
+        // An older recorded row, which has no `sort_info` key at all, still parses: the field is soft.
+        let mut old = serde_json::to_value(&parse_item(&ep, ServerId::UNSET)).unwrap();
+        old.as_object_mut().unwrap().remove("sort_info");
+        let old: PmsMovie = serde_json::from_value(old).unwrap();
+        assert!(old.sort_info.is_none());
+    }
+
+    /// Marking a show watched or unwatched moves its episode counts with the mark, so a grid sorted by
+    /// Unplayed does not keep wearing "9 episodes" under a watched tick until the listing is read again.
+    #[test]
+    fn marking_a_container_moves_its_episode_counts() {
+        let mut show = PmsMovie { kind: KIND_SHOW, leaf_count: Some(37), viewed_leaf_count: Some(28), ..Default::default() };
+        set_watched(&mut show, true);
+        assert_eq!((show.viewed_leaf_count, show.watched, show.unwatched), (Some(37), true, false));
+        set_watched(&mut show, false);
+        assert_eq!((show.viewed_leaf_count, show.watched, show.unwatched), (Some(0), false, true));
+        // No counts sent: nothing invented. A movie has none to move.
+        let mut bare = PmsMovie { kind: KIND_SHOW, ..Default::default() };
+        set_watched(&mut bare, true);
+        assert_eq!(bare.viewed_leaf_count, None);
+        let mut movie = PmsMovie { leaf_count: Some(1), viewed_leaf_count: Some(0), ..Default::default() };
+        set_watched(&mut movie, true);
+        assert_eq!(movie.viewed_leaf_count, Some(0));
+    }
+}

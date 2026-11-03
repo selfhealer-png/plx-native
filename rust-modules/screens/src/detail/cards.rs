@@ -51,6 +51,11 @@ pub(super) struct Cards<'a> {
 }
 
 impl<'a> Cards<'a> {
+    /// How many cards the shelf holds (`CardSource::len`, for a caller with no host type at hand).
+    pub(super) fn count(&self) -> usize {
+        self.len
+    }
+
     pub(super) fn new(
         which: Which,
         d: &'a Detail,
@@ -152,7 +157,11 @@ impl<H: Host<Elem = u32>> CardSource<H> for Cards<'_> {
 
     fn label(&self, i: usize) -> TileLabel {
         match self.which {
-            Which::Related | Which::Collection => TileLabel::title(&self.movies()[i].title),
+            // a poster: the one Under posters builder (a missing index is the nameless tile)
+            Which::Related | Which::Collection => match self.movies().get(i) {
+                Some(m) => crate::registry::captions::label(&crate::registry::captions::policy(), &tile_facts::caption_facts(m), None, false),
+                None => TileLabel::default(),
+            },
             Which::Extras => extras::label(self.d, i),
             // the names are drawn under every headshot (`overlay`), not as the focused block
             Which::Cast => TileLabel::default(),

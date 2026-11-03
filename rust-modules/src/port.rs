@@ -21,6 +21,7 @@ static PORT: plx_platform::tv::Port = plx_platform::tv::Port {
     open: plx_platform::keymanager::open,
     remove: plx_platform::keymanager::remove,
     system_locale: plx_platform::webos::system_locale,
+    sound_output: plx_platform::webos::sound_output,
     go_home: plx_platform::webos::go_home,
     poll_home: plx_platform::webos::poll_home,
     deliver_toast: plx_platform::webos::toast::deliver,
@@ -38,6 +39,8 @@ static PORT: plx_platform::tv::Port = plx_platform::tv::Port {
     frame_probe_acquired: crate::system::frame_probe_acquired,
     frame_probe_fields: crate::system::frame_probe_fields,
     sink: SINK,
+    #[cfg(feature = "devtriggers")]
+    uri_media: plx_platform::webos::URI_MEDIA,
 };
 
 /// The C shim's entry (`src/main.c`) and the simulator's (`src/bin/sim.rs`): install the port, then
@@ -48,4 +51,18 @@ pub extern "C" fn plex_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
     #[cfg(target_os = "linux")]
     let _ = plx_platform::storage::client::install_activator(plx_platform::webos::activate_storage_helper);
     crate::app::run_application(pms_host, pms_port)
+}
+
+/// `src/main.c` hands over SAM's launch payload (`argv[1]`) before `plex_run`. Kept raw in
+/// `tv::launch`; `app::deeplink` reads it once the app has a session to act in.
+///
+/// # Safety
+/// `json` is NULL or a NUL-terminated string that outlives the call.
+#[no_mangle]
+pub unsafe extern "C" fn plx_launch_args(json: *const c_char) {
+    if json.is_null() {
+        return;
+    }
+    let raw = unsafe { std::ffi::CStr::from_ptr(json) }.to_string_lossy();
+    plx_platform::tv::launch::offer(&raw);
 }

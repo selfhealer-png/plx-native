@@ -35,15 +35,27 @@ Scene fields (tests/manifest.json, `fps_scenes`):
   "mock": {"triggers": {"plxnative-search": "sb"}}
                                 trigger values that replace the scene's own under --mock (a query
                                 that the synthetic titles, all `s` + hex, can actually match)
+  "mock": {"extra_media": ["bug665/src.mkv"], "transcode_fixture": "bug665/clip.mkv", "rk": 990001}
+                                ... `--extra-media <file>` (one real, ffprobed file per movie, ratingKeys
+                                990001+ in the order given) and `--transcode-fixture <file>` (served for
+                                every `/video/:/transcode/universal/start*`, so a re-encode route has
+                                bytes). Paths are relative to the fixtures root (`$FIXTURES_OUT`, else
+                                `~/plxnative-fixtures`), never absolute and never inside the repo; a scene
+                                whose files are not built is SKIPPED with the reason, not failed
   "mock": {"only": true, ...}   runs ONLY under --mock (the scene is meaningless on a real library)
   "walk": {"key_gap_s": 0.33, "max_rows": 170, ...}
                                 after the Home shelves land, press Down once per landed row at
                                 that pace and then Up back, and grade the heartbeats of THAT window
-  "walk": {"landed": "library", "extra_rows": 6, "fingerprint_region": "grid", ...}
-                                the same walk over the Library: sized from the seated section's
+  "walk": {"landed": "library", "extra_rows": 0, "fingerprint_region": "shelf", ...}
+                                the same walk over the Library's Recommended page (the Library page
+                                mounts no shelves): sized from the seated section's
                                 `libhubs: section N landed M shelves` line, a second Down per
-                                linked shelf, `extra_rows` more to reach the grid, and a
-                                `focus route=... region=grid` fingerprint required in the window
+                                linked shelf, `extra_rows` more (0: the page seats its first shelf on
+                                arrival and has no toolbar to cross; the burst walks over the Library's
+                                grid use 2, to cross its header), and a
+                                `focus route=... region=<fingerprint_region>` fingerprint required in
+                                the window (a region the scene's page prints: tests/test_harness.py
+                                reads the words from the page's `probe_viewport`)
   "walk": {"row_down": 1, "cards": 96, "key_gap_s": 0.33, ...}
                                 a ROW walk (#567, `home-recent-paging`): after Home lands, press Down
                                 `row_down` times to reach a named row (the `plxnative-grid` trigger
@@ -67,6 +79,13 @@ Scene fields (tests/manifest.json, `fps_scenes`):
   "walk": {"min_landed": 150, ...}
                                 the scene FAILS when fewer shelves (rows) than that landed, so a
                                 cap that shortens the surface cannot pass on the shorter walk
+
+  "expect": {"decision": "transcode", "load_max": "1920x1080@60", ...}
+                                a scene's own log assertions, the SAME functions and keys as a
+                                playback case's `expect` (run.py `grade_scene_expect`): decision,
+                                codec + video_size, load_video / load_audio / load_max / sink_echo,
+                                min_timeline_climb_s; `no_error` is always checked. For a player
+                                scene whose point is what the app DECLARED, not how fast it drew
 
 A scene with no `mock` block is never run under --mock: it needs real library content, and guessing
 which scenes do not is how a synthetic library grades the wrong thing.
@@ -136,7 +155,47 @@ def mock_server_args(scene):
     for key in ("shows", "seasons", "episodes"):
         if block.get(key) is not None:
             args += [f"--{key}", str(int(block[key]))]
+    for path in mock_fixture_paths(scene):
+        args += ["--extra-media", path]
+    if block.get("transcode_fixture") is not None:
+        args += ["--transcode-fixture", fixture_path(scene, block["transcode_fixture"])]
     return args
+
+
+def fixtures_base():
+    """The directory a scene's `mock.extra_media` / `mock.transcode_fixture` names resolve against:
+    the one `make fixtures-pipeline` writes beside (`$FIXTURES_OUT`, else `~/plxnative-fixtures`),
+    i.e. the PARENT of the `pipeline/` pack. Outside the repo, like every generated medium."""
+    return os.environ.get("FIXTURES_OUT") or os.path.expanduser("~/plxnative-fixtures")
+
+
+def fixture_path(scene, rel):
+    """`rel` under [`fixtures_base`]. A tracked manifest holds only relative names: an absolute path
+    or a `..` would put one person's directory (or the repo) into a public file."""
+    parts = str(rel).replace("\\", "/").split("/")
+    if not rel or os.path.isabs(str(rel)) or ".." in parts:
+        raise ValueError(f"{scene.get('name')}: mock fixture {rel!r} must be a relative name "
+                         f"under the fixtures root, with no `..`")
+    return os.path.join(fixtures_base(), *parts)
+
+
+def mock_fixture_paths(scene):
+    """The scene's `mock.extra_media` files, resolved, in the order the mock numbers them."""
+    block = scene_mock(scene) or {}
+    return [fixture_path(scene, rel) for rel in block.get("extra_media") or []]
+
+
+def missing_mock_fixtures(scene):
+    """Why the scene cannot run here: the mock fixture files that are not built, or None."""
+    block = scene_mock(scene) or {}
+    rels = list(block.get("extra_media") or [])
+    if block.get("transcode_fixture") is not None:
+        rels.append(block["transcode_fixture"])
+    gone = [r for r in rels if not os.path.isfile(fixture_path(scene, r))]
+    if not gone:
+        return None
+    return (f"mock fixture(s) not built under {fixtures_base()}: {', '.join(gone)} "
+            f"(the scene's `comment` has the ffmpeg commands)")
 
 
 def mock_scene(scene):
@@ -170,6 +229,8 @@ def partition_mock(scenes, mock):
         elif mock and block is None:
             skipped.append((s["name"], "needs real library content (no `mock` block); "
                                        "not runnable against the synthetic mock"))
+        elif mock and block is not None and missing_mock_fixtures(s):
+            skipped.append((s["name"], missing_mock_fixtures(s)))
         elif not mock and block is not None and block.get("only"):
             skipped.append((s["name"], "mock-only scene: run with --mock"))
         else:
@@ -410,8 +471,13 @@ def walk_downs(scene, shelves):
     """The Down presses a walk of `scene` makes for `shelves` landed shelves (before the
     `max_rows` cap `walk_plan` applies). Home: one per row. Library (`walk.landed: "library"`):
     one per shelf, a SECOND for each linked shelf (its heading is a stop of its own, then its
-    row), and `extra_rows` more to cross the toolbar into the grid."""
+    row), and `extra_rows` more (the Library page's toolbar, to reach its grid; the Recommended
+    page seats its first shelf on arrival and needs none). A `walk.reach` surface (the
+    Library page, which mounts no shelves and logs no landing) has a fixed plan: its one "row"
+    plus `extra_rows` Downs from the page header into the grid."""
     w = scene["walk"]
+    if w.get("reach"):
+        return int(shelves) + int(w.get("extra_rows", 0))
     if w.get("landed") != "library":
         return int(shelves)
     return int(shelves) + linked_landed(scene, shelves) + int(w.get("extra_rows", 0))

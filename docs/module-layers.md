@@ -106,15 +106,15 @@ base
 
 | layer | members | prod lines | an edit there recompiles |
 |---|---|---:|---:|
-| base | `eventlog paths task cbuf sha256 b64 spki dynlib checkpoint storage_worker fontcov surface tile devtrig diag::{zlib,spans,heartbeat} testlock testnet testscratch` | 9k | everything |
+| base | `eventlog paths task cbuf sha256 b64 spki dynlib checkpoint storage_worker fontcov surface tile hold devtrig diag::{zlib,spans,heartbeat} testlock testnet testscratch testrace` | 9k | everything |
 | machine | `ui::{machine,present,idle,landgate,landing,motion}` | 4k | 97% |
 | platform | `webos storage keymanager devcaps imgcache i18n labcfg tv` | 11k | 96% |
-| gfx | `gfx egl text img svg gpu_timer hwcnt overdraw dump` | 15k | 68% |
+| gfx | `gfx egl text rtl img svg gpu_timer hwcnt overdraw dump` | 15k | 68% |
 | net | `net stream` | 6k | 74% |
 | plex | `plex http` | 26k | 72% |
 | telemetry | `telemetry diag` (the event schema) | 16k | 64% |
 | ui | `ui` (the library) | 51k | 47% |
-| data | `stores browse metadata person collection search viewstate pms` | 27k | 56% |
+| data | `stores browse metadata person collection search subsearch viewstate viewledger pms watchlist catalog hudpacks` | 27k | 56% |
 | session | `auth` | 11k | 35% |
 | media | `ff aq abr hls curlio player route` | 56k | 49% |
 | appkit | `appkit` (the player panels and the Sources row several screens draw) | 13k | 32% |
@@ -127,6 +127,19 @@ for build time here; they are not measured build times. Today every row would re
 the split has not happened. Of the last 33 commits that touched `rust-modules/src` at baseline, 26
 touched `screens/` or `ui/`, so a screens-only edit dropping from 100% to about 28% is where most
 of the payoff is. L10 took the player widgets out of `ui` (66k lines at baseline, 51k now).
+
+The Watchlist adds two data modules and no new edge. `watchlist` (rows, match table, `TileState`,
+intent ledger, comparator; with `stores::watchlist`) and `catalog` (the Discover-only item page; with
+`stores::catalog`) name only layers below data, chiefly `plx_plex`: `plex::watchlist`, `Client::find_by_guids`, `plex::session`
+for the plex.tv credential, and `plex::servers` for the roster, reachability and `facts_gen`
+epochs. Neither names `net` or `media`; the screens (`watchlist`, `catalog`) and the tab pulse sit
+above them, and the application alone routes between them (`docs/watchlist.md`).
+
+`hudpacks` (the player-HUD package store, `docs/hud-plugins.md`) adds a data module and no edge. It is a
+pure machine that names only `base` (`sha256`) and `machine` (`Handled`): the HUD format lives in
+`appkit`, above data, so the store never parses a package and asks its caller for the verdict
+(`HudEffect::Validate`), and its directories, which `paths::hud_candidates()` supplies in `base`, arrive
+on an event.
 
 Four choices that were not obvious:
 
@@ -205,15 +218,18 @@ integration test and belongs to the layer that owns all of its parts (step L13).
    `ci/module-layers.ini` and this document in the same diff and say why. If the change
    re-layers a module, or declares a port, that other code already names, record those
    references as a new step's entries in the same diff, raise the pin, and add the step to the
-   migration table. L15 was added this way.
+   migration table. L15 was added this way. `ci/check-ledger-ratchet.py` then fails the PR against
+   its base branch, so a design change that re-layers is merged by the owner past that check.
 
 Adding a line to `ci/allow/layers.txt` is not a fix. Lines are added only by a design change under
 item 5, and moved when a file that already has entries is **renamed or split**: entries are keyed by
 path, so the gate reports the old key as stale and the new path as unlisted. Move the entry to the
 new path in the same diff, and do not run `--prune` first (it would delete the old key and leave the
 new one failing). A split that keeps the upward name on both sides needs one line per new file, and
-raises the pin in `tests/test_harness.py` by the same number. Since L15 the list is empty (the pin
-is 0), so a new upward reference is always a fix, and there are no entries to carry.
+raises the pin in `tests/test_harness.py` by the same number; `ci/check-ledger-ratchet.py` then
+fails the PR against its base branch, so the owner merges that split past the check. Since L15 the
+list is empty (the pin is 0), so a new upward reference is always a fix, and there are no entries
+to carry.
 
 ## The migration
 
@@ -237,7 +253,7 @@ proves the references are gone and nothing more; L15b is open.
 | **L9** telemetry owns its wire schema — **done** | 5 / 69 | The `*Class`/`Trace*` vocabulary and a new `FailureClass` are `telemetry::classes` (`player::report` re-exports them and converts through `FailureKind::class()`), clearing the error trace is a hook (`player::report::install_trace_eraser`, run at boot by `app::enter_application`, not by the first attempt: a failed preview traces without one), an incident hands over a telemetry-owned `ReadoutGlyph` that `screens::login` maps to an icon, and the consent adapter's live half is `telemetry::transition`. |
 | **L10** player and Plex-aware widgets out of ui — **done** | 38 / 511 | Part a moved `ui/{player_hud,track_menu,more_menu,info_panel,up_next,chapters_panel,timing_capsule,source_list}.rs` and `screens/player/skip_pill.rs` to the new `appkit` layer rather than `screens/` (the third choice above); part b gave `widgets`, `card_row`, `hero_logo`, `collection_tile` and `fmt` plain values (`ui::tile::TileFacts`, a raw `u16` server id, `fmt::RatingScale`), with `screens::registry::tile_facts::of` the one `PmsMovie` converter. |
 | **L11** data owns its seams — **done** | 13 / 74 | `app::bootstrap::stores` is `stores::tape`, `metadata` takes a `Playhead` value and owns `track_names`, `ContentArg` is `stores::content_arg`, `search` sizes its row window from `pms::MAX_SHELF_ITEMS`, and the `Tile` trait is the base module `tile`. |
-| **L12** media owns its lifecycle seams — **done** | 7 / 28 | The foreground-resume reducer and the transport-pause contract are `player::lifecycle` (`app::lifecycle` re-exports them), the stats switch is `player::DIAG_READOUT_ON`, `Venc::open` takes the capture socket writer as an argument, and `route` takes the HUD context line as a parameter, with the up-next still prefetch a hook the app installs. |
+| **L12** media owns its lifecycle seams — **done** | 7 / 28 | The foreground-resume machine is `player::lifecycle`, its drivers `player::foreground` and the transport-pause contract `player::transport` (`app::lifecycle` re-exports them), the stats switch is `player::DIAG_READOUT_ON`, `Venc::open` takes the capture socket writer as an argument, and `route` takes the HUD context line as a parameter, with the up-next still prefetch a hook the app installs. |
 | **L13** tests move up to the layer that owns their parts — **done** | 41 / 96 | Part a moved the auth, plex, i18n, task and fontcov tests that named upper layers to `app/` (`session_*_tests.rs`), `screens/login_text_fit_tests.rs`, `plex`, `auth::owner` and `storage::client`, and moved `fontcov`'s `Measure` impl beside the trait, with `ui::machine`'s new `BareArg`/`BareMeasure` fixtures for the rest; part b moved the data, media and ui ones to `app/` (`dispatch_return_tests.rs`, `overscan_audit_tests.rs`) and `screens/` (`plaintext_question`, `library/labels_tests.rs`, `search/tests.rs`, `player`), and rewrote two against their own layer. |
 | **L14** session-layer presentation to screens — **done** | 2 / 4 | `auth::signed_in_reason` is a private fn of `screens::login`, its only caller, with its two tests; `auth` already handed over the plain account name. |
 | **L15** the webOS port — **gate-complete** | 44 / 205 | Everything outside `[port webos]` reaches the television through the `tv` interfaces in `platform` that the port fills at boot: `tv::{device, sandbox, secure, home, toast, window}`, `devcaps::dv`, and `tv::sink::VideoSink`, a Starfish-shaped verb trait that `player::ffi::StarfishSink` and `player::ffi_host::HostSink` implement. `plex_run` is `port::plex_run`. The allowlist is empty. Not "done": the sink is not OS-neutral and the simulator is not its own port (L15b). |
@@ -258,9 +274,10 @@ the port fills at boot. `tv::Port` is a table of function pointers, installed on
 statement of `port::plex_run`, before anything that reads it. With no port installed (host unit
 tests, where nothing calls `plex_run`) `tv::ABSENT` answers what the host arms answered before; a
 shipping build that reaches it logs `tv: port not installed - using the no-port defaults` once.
-Only `tv`'s own modules read the table. The one thing that leaves it is the sink, through
-`tv::sink::installed()`, and `ci/check-deps.sh` (rule `sink`) fails on that name or `VideoSink`
-outside `player/`, `tv/`, `tv.rs` and `port.rs`.
+Only `tv`'s own modules read the table. Two things leave it: the sink, through
+`tv::sink::installed()` (rule `sink` of `ci/check-deps.sh` fences it to `player/`, `tv/`, `tv.rs`
+and `port.rs`), and, in a `devtriggers` build only, the developer URI-mode probe's
+`tv::uri::installed()`, read by `player::uriprobe_drive`.
 Lazily computed facts (device identity, the sandbox verdict, the Dolby Vision capability) are
 published values rather than hooks: the webOS code writes them into `tv::device`, `tv::sandbox` and
 `devcaps::dv` at the same boot moment as before, so readers keep their `OnceLock` semantics.
@@ -274,6 +291,7 @@ published values rather than hooks: the webOS code writes them into `tv::device`
 | secure store | `tv::secure::{seal, open, remove, Sealed, Backend}` | `plex::session` |
 | storage backend | `storage::client::install_activator`, which the port calls with `webos::activate_storage_helper` | `port::plex_run` |
 | locale | `tv::system_locale` and `tv::LocaleReply`; `i18n` still owns the parse and the log lines | `i18n` |
+| sound output | `tv::sound::{output, parse_output, Reply}`, filled by `Port.sound_output` (`webos::sound_output`); a blocking read, so never on the frame thread, and asked only on a stack whose lead follows the output (`liblxa` and 2018's `audiosink_new`; `devcaps::audio_stack`; the `lgaudiosink` stack's lead does not depend on the output, and the others have none, so they never ask) | `player::threads` (through `player::engine`, which owns the lead table) |
 | window, surface, video plane, bus pump and frame probe | `tv::window` | `app::boot`, `app::run`, `app/mod.rs` |
 | home key | `tv::home::{go_home, poll, take_root_press, release_root_press}` | `app::input`, `app::run`, `app::adapters::session`, `app::lifecycle`'s tests |
 | system toast | `tv::toast::{toast, send, Identity, Outcome, Sent}` | `app::clock_notice`, `dev::scenarios::toast_probe` |
@@ -286,7 +304,8 @@ be a reference from the crate root into the port, which the gate refuses.
 
 The video sink landed as a verb-level cut. `tv::sink::VideoSink` has one method per verb of the
 Starfish seam, 29 of them, with the C return values and the `&MainThread` token on every method but
-`load`, `window_mode` and `window_id`. It is **Starfish-shaped**: a load payload, `feed`, and the
+`load`, `window_mode` and `window_id` (since 2026-10-15 `unload` takes an `UnloadTicket` instead, so
+a real stop's Unload can run on a worker; the trait's own doc is the current list). It is **Starfish-shaped**: a load payload, `feed`, and the
 ACB bind verbs that `pump` walks. Another TV OS cannot implement it as it stands. `player::ffi`
 keeps its `extern "C"` block unchanged and implements the trait as `StarfishSink`; `engine`, `pump`
 and `threads` call it through `player::sink()`. `player/ffi_host.rs` is no longer swapped in under
@@ -439,8 +458,7 @@ What the extraction taught, beyond what the recipe above predicted:
   `../src` (it would otherwise have stopped reading the application, silently, and still passed:
   every later layer must be added to its root list); `paths` and `fontcov` climb one more `..`.
 - **No orphan-rule hazard appeared**: no `impl` in the application has both its trait and its type
-  in `plx_base` (`ShippedMeasure`'s impl is `machine`'s trait on a `plx_base` type, which is
-  legal in the application crate and is legal in the `plx_machine` crate; Split 2 below).
+  in `plx_base` (`ShippedMeasure`'s and `WholePixelMeasure`'s impls are `machine`'s trait on a `plx_base` type, which only the trait's crate, `plx_machine`, may write, and does; Split 2 below).
 - **The tooling that knew the tree's shape**: `ci/module_graph.py` reads every sibling
   `rust-modules/<layer>/` package named `plx_*` as part of the same module tree (so the layer gate
   and `check-module-cycle` keep one graph and `base uses nothing` is still enforced; the cycle
@@ -491,12 +509,17 @@ is new. What it taught beyond the recipe:
   `idle::{take_local_damage, reset_for_test}`, `BareArg`, `BareMeasure`). The private
   `landgate::phase` wrapper and `Present::global` stay `cfg(test)`: only this crate's tests call
   them, and under `test-support` alone they would be dead code.
-- **The `Measure` impl for `fontcov::advances::ShippedMeasure` lives in `plx_machine`.** The trait
-  is the machine crate's and the type is `plx_base`'s, so the impl may sit in either crate; it
+- **The `Measure` impls for `fontcov::advances::ShippedMeasure` and `WholePixelMeasure` live in `plx_machine`.**
+  The trait is the machine crate's and the types are `plx_base`'s, so the impl sits in `plx_machine`, the trait's crate, the only crate that can write it; it
   cannot sit in a third (E0117), which is why it could not stay in `ui` for the layers above.
-  The machine crate is the lowest one that names both. It is `test-support` only, and
-  `plx_machine/test-support` enables `plx_base/test-support`, because `fontcov::advances` is
-  itself behind that feature. No other orphan-rule hazard appeared (the compiler is the checker:
+  The machine crate is the lowest one that names both. `ShippedMeasure`'s is `test-support` only, and
+  `plx_machine/test-support` enables `plx_base/test-support`, because `fontcov::advances::ShippedMeasure`
+  is itself behind that feature (it reads the repository's `pkg/`). `WholePixelMeasure`'s is not behind
+  anything: it is the HUD cost model (two `Face`s parsed from the bytes of `appfont.ttf` and `appfont-bold.ttf`,
+  no IO, no global), the one price every side puts on a HUD state, so the whole `fontcov::advances` module
+  except `shipped` and `ShippedMeasure` is built in every configuration and `plx_gfx::text::read_price_model` (the
+  one code that reads the two files; `hud_cli` and the player-HUD driver's storage-worker job both call it) builds the
+  model from it. No other orphan-rule hazard appeared (the compiler is the checker:
   an `impl` of a `plx_machine` trait for a `plx_base` type in the application would be the next
   one, and there is none).
 - **Moving a trait to another crate changes dead-code analysis.** `app/recorder.rs`'s
@@ -548,7 +571,7 @@ suite is 5603 tests before and after (157 + 66 + 218 + 5162). What it taught bey
 
 - **The generated code is the layer's, and so is the build script that generates it.**
   `platform/build.rs` runs the catalog generator (`platform/build_support/catalog.rs`, reading
-  `locales/`) and the install-identity generator (`rust-modules/build_support/install_identities.rs`,
+  `locales/` and the language registry `locales/languages.json`) and the install-identity generator (`rust-modules/build_support/install_identities.rs`,
   which stays where it is because the storage helper's build script calls it too). It reads no
   `PLX_*` variable and emits no `rustc-link-*`, so it is never dirty on a second run:
   `ci/test_build_not_always_dirty.py` now fails on `plx_platform` as well as on the application
@@ -593,8 +616,8 @@ suite is 5603 tests before and after (157 + 66 + 218 + 5162). What it taught bey
   (the only files with C declarations in the layer; there is no `#[link]` and no `dynlib!` in it)
   differ from their old text in `pub(crate)` alone, and the new build script links nothing, so
   `LIBS_REAL` and `ci/expected-dt-needed.txt` are untouched. The host never compiles the ARM arms:
-  `cargo check --target arm-unknown-linux-gnueabi --lib -p plxnative-modules` (`.cargo/config.toml`'s
-  `build-std`, no NDK, no link step) does, and passes with and without default features; use it for
+  `cargo +$(make -s print-rust-toolchain) check --target armv7-unknown-linux-gnueabi --lib -p plxnative-modules` (the target's
+  prebuilt std since the move to stable; it was `.cargo/config.toml`'s `build-std` on nightly; no NDK, no link step) does, and passes with and without default features; use it for
   any split that moves FFI when no NDK is at hand.
 - **Gates scoped by the path of a moved file stopped seeing it, and some by its spelling.**
   `ci/check-deps.sh` reads `SRC_PLATFORM` where it read `SRC_MACHINE`; the `frame` and `uistorage`
@@ -1236,7 +1259,7 @@ ready. What it taught beyond the recipe:
   attribute and body of `mod tests` / `mod *_tests` / `mod test_support` and the wholly-test files).
   No `cfg(not(test))` arm hid from it except the shipping arms it switches: `metadata`'s detail
   fetch (a test holds the fetch instead of spawning a thread), its two dev stand-ins, `person`'s two
-  plex.tv fetches (a test that reaches them fails to link) and `pms::run`'s `EditItem` arm. Then
+  plex.tv fetches (libcurl is bound at run time, so a test that reaches them links and then either finds no libcurl or sends a real request; cut for that reason) and `pms::run`'s `EditItem` arm (since replaced by the stores' `ApplyView` commands, which carry no cfg split). Then
   the exceptions the compiler found under `--features test-support`: what only the layer's own
   tests use stays `cfg(test)` (13 private items and two imports, because under `test-support`
   alone they are dead code; `split-data-revert.py` flips them).
@@ -1296,9 +1319,13 @@ ready. What it taught beyond the recipe:
   `with_refused_discovery_for_test`, `fixture_with_sources`, `queue_test_landing`,
   `reverse_test_hubs`, `remove_test_item`, `land_for_test`, `publish_shelves_for_test`,
   `hold_inflight_for_test`, `REFUSE_FETCH_FOR_TEST`, `REFUSE_DISCOVERY_FOR_TEST`,
-  `seed_items_for_owner_test`, `held_detail` or `seed_two_source_table_for_owner_test`; the
+  `seed_items_for_owner_test` or `seed_two_source_table_for_owner_test`; the
   `--features test-support` control build of the same crate finds every one (1 to 8 times each),
-  and `nm` matches the seam names in 4 symbols there against 0. The ARM shipping archive built the
+  and `nm` matches the seam names in 4 symbols there against 0. (The measured list also named
+  `held_detail`, the detail fetch's held lane. It no longer exists: the detail request emits a job
+  and the app's test runner parks it, `docs/sans-io.md`. `with_refused_fetches_for_test` and
+  `REFUSE_FETCH_FOR_TEST` are gone for the same reason: Home's Hubs read is a job too, and its
+  refusal is the runner's, `#[cfg(test)]` in the app.) The ARM shipping archive built the
   way the release is (`PLX_RELEASE=1 cargo rustc --release --target arm-unknown-linux-gnueabi --lib
   --crate-type staticlib --no-default-features`) has none of them either.
 - **FFI and the final link are untouched.** The layer has no `extern "C"`, `#[link]`, `dynlib!`,
@@ -1526,7 +1553,8 @@ root), and one intra-doc link to `screens` unbracketed. The module-cycle baselin
 modules on the cycle (`app dev textinput`), 10 outside". What it taught:
 
 - **FFI and the final link: proven in the artifact, not assumed.** The crate holds every
-  `dynlib!` table of FFmpeg (`ff.rs`, four), libass (`player/ass.rs`) and the second libcurl table
+  `dynlib!` table of FFmpeg (`ff.rs`, four), libass's subtitle surface (`player/ass.rs`; the UI text
+  surface's table is `plx_gfx::rtl`) and the second libcurl table
   (`curlio.rs`), `player::ffi`'s `extern "C"` block (the Starfish/ACB verbs, 29 undefined
   symbols the Makefile's link resolves), and the two `#[no_mangle] extern "C"` callbacks
   `src/starfish.c` calls, `sf_on_event` and `acb_on_event`. All of it moved byte for byte apart from
@@ -1644,7 +1672,7 @@ doc links that named `screens`, `app`, `lab` and `focusprobe` unbracketed. What 
 
 - **One orphan-rule hit, found by the compiler.** `impl Default for SubtitleBitmaps` sat in
   `screens/player/mod.rs`, a screen's impl of `std`'s trait for a type of the layer below; across a
-  crate boundary that is E0117. It lives beside the type in `player_hud.rs` now. The `Focusable`
+  crate boundary that is E0117. It lives beside the type in `player_hud/mod.rs` now. The `Focusable`
   and `Screen` impls of the application's own types are not affected (the traits are `plx_ui`'s and
   the types the application's). `appkit` defines no `#[macro_export]` macro and the crate has no
   `env!`, `option_env!`, `include_*!` or `CARGO_MANIFEST_DIR`.

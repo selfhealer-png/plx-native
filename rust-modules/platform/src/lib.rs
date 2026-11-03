@@ -7,7 +7,8 @@
 //! `base` and `machine` and nothing else. `webos` and `keymanager` are also the port's
 //! (`[port webos]`), and nothing outside the port names them.
 //!
-//! The crate owns its build script: it generates the `i18n::msg` catalog from `locales/` and the
+//! The crate owns its build script: it generates the `i18n::msg` catalog and the `Preference`/`Language` enums from `locales/` and
+//! `locales/languages.json`, and the
 //! install-identity `Flavor` enum `storage::state` includes (the storage helper includes the same
 //! file, through the same generator). The application's version string is NOT known here; the
 //! application hands it to `storage::diagnostics::start`.
@@ -23,6 +24,7 @@ pub mod devcaps; // what this SoC decodes — the TV's own codec table, read onc
 pub mod i18n;
 pub mod imgcache; // bounded persistent artwork cache shared by every image source
 pub mod keymanager; // public LS2 key stores: keymanager3, legacy Palm service, or unavailable
+pub mod playback_trace;
 pub mod labcfg; // `lab.json` (the Cloud Lab session config) and the two answers `ui/` and `screens/` ask of it: is this key the trigger, is the menu row on
 // Stage A foundation: owner adapters connect these APIs in the next integration stage.
 #[allow(dead_code)]

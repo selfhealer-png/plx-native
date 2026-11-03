@@ -10,7 +10,7 @@ table in §1, §8.3, §8.4, the goal's bullet 4 and the third decision bullet):
   over a title (`trailer::transport_title` — the FILM/SHOW title by default, so a trailer whose own
   PMS title is the boilerplate "Trailer" doesn't repeat the kicker word right under it; the extra's
   own title only when it says something the kicker doesn't), the playbar with elapsed/remaining,
-  and the play/pause state read-out, built from `ui::player_hud`'s own
+  and the play/pause state read-out, built from `appkit::player_hud::classic`'s own
   `draw_scrim`/`draw_title`/`draw_playbar`. There is still no quality, subtitle, audio or Info
   control and no track menu — that part of "there is no HUD" was never about the transport, it was
   about the panels that write session state a preview has none of.
@@ -292,7 +292,7 @@ already a confirmed problem worth a UI surface.
 This needs new geometry — `detail_layout::COMPACT_TITLE_BOT` and `LogoRung::Compact` already exist,
 but for a **different** treatment (the scroll-driven, horizontally **centered** pinned title at
 `mod.rs:1987-2016`, which answers "how far down have I scrolled", not "is a trailer playing"). Reusing
-its rung *sizing* (`COMPACT_AREA`/`COMPACT_H_MIN`/`COMPACT_H_MAX`, `theme.rs:249-263`) is right; reusing
+its rung *sizing* (`COMPACT_AREA`/`COMPACT_BAND_H`/`COMPACT_W_MAX`/`COMPACT_H_MAX` in `theme::logo`) is right; reusing
 its *position* is not — this is a new anchor, top-left, independent of scroll.
 
 **New geometry** (`detail_layout.rs`):

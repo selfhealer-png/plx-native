@@ -2,16 +2,6 @@
 //! bundle a generic library is compiled against, the newtypes, `Machine` + `Cx` + `Effects`, the
 //! effect vocabulary `Fx`, input events, navigation ops, addressing, and the `LogicalState` /
 //! `Canon` pair every hashed state implements.
-//!
-//! **Phase 2-i — the contract spike.** This module and its siblings (`screen`, `present`,
-//! `landing`, `tex`, `frame`, `dispatch`) are a COMPILING host-only skeleton; nothing in the
-//! product calls them until phase 2 replaces `app/run.rs`'s loop with `dispatch`. They exist so
-//! the boundaries are proven to COMPOSE against the layer rule (§2.1: this module names no
-//! application type, no widget, no engine, no screen — `stores/` will reach `ui::` through this
-//! module alone) before any real code moves. Every type here is what the spec names; where the
-//! spike narrows one (such as a `Timer` with no owner registry) the doc
-//! on it says so.
-#![allow(dead_code)] // phase 2-i: the contract has no consumer until phase 2 (spec §13)
 
 use std::ffi::CStr;
 use std::hash::Hash;
@@ -55,6 +45,18 @@ pub trait Host: 'static {
     /// focused identity, `focus` being the entry's saved focus key. The default keeps everything,
     /// which is right for a host whose memory is already small.
     fn shed_memory(_memory: &mut Self::Memory, _focus: Option<Self::Elem>) {}
+
+    /// **The views a page reads once the container has told them which page sits beneath it.**
+    /// The dispatcher owns the page stack and no screen may see it, yet a page that BACK returns
+    /// to a different place depending on its opener (the Collection screen, pushed from Home, a
+    /// library page, Search or an item's Detail) must name where BACK goes. It is the container's
+    /// one answer: for the page it is building a context for, the dispatcher passes the
+    /// [`ScreenId`] of the entry beneath it (`None` when it is the root, i.e. BACK leaves the
+    /// app's page stack) and the host folds that into its `Views`, which every screen already
+    /// reads. A `Copy` id rather than a reference, because the entry beneath lives in the same
+    /// `Vec` as the one being stepped. The default drops it: a host with no page that names its
+    /// parent pays nothing.
+    fn views_over<'a>(views: Self::Views<'a>, _beneath: Option<ScreenId>) -> Self::Views<'a> { views }
 }
 
 macro_rules! newtype {
@@ -196,6 +198,14 @@ pub trait Measure {
     /// replay and recording use the supplied metrics on every call, including missing-key checks.
     fn fit_line(&self, s: &str, budget: f32, sz: i32, bold: bool) -> std::rc::Rc<CStr> {
         fit_line_by(self, s, budget, sz, bold)
+    }
+
+    /// A fitted drawable and its advance. Native measurement caches both; replay keeps querying
+    /// its supplied metrics. Use when an inline mark must be centred together with the text.
+    fn fit_line_measured(&self, s: &str, budget: f32, sz: i32, bold: bool) -> (std::rc::Rc<CStr>, f32) {
+        let run = self.fit_line(s, budget, sz, bold);
+        let width = self.width(&run, sz, bold);
+        (run, width)
     }
 
     /// `width` for a borrowed `&str` (spec §4.3, phase 12 D4): builds the transient `CString` so
@@ -591,7 +601,11 @@ pub enum FocusTarget<K> {
     /// fresh Home/Search → TV Shows mint SNAPPED to the first tile while a Movies → TV Shows
     /// peer switch (which never leaves the strip's already-focused pill, and never re-enters
     /// through here at all) animated normally. `stack.rs`'s `SelectTab` "cover-and-mint" arm is
-    /// the one constructor; nothing else may produce this variant.
+    /// the one constructor of a MINT. The second sanctioned producer is a page seating its OWN
+    /// arrival through a self-delivered `Enter::Fresh`: the Watchlist's `follow_seat` moves its
+    /// first seat from the Sort & Filter pill to the first tile as the grid lands, and that seat
+    /// must read as a deliberate move for the opening animation to play
+    /// (`watchlist/opening_tests.rs`). Nothing else may produce this variant.
     FirstInGroupAnimated(GroupId),
 }
 
@@ -666,6 +680,7 @@ impl<K> InputEvent<K> {
             }
             InputKind::PointerHidden => { c.u32(6); }
             InputKind::SystemKeyboard(up) => { c.u32(7).bool(*up); }
+            InputKind::Pan { dx, x, y } => { c.u32(8).f32(*dx).f32(*x).f32(*y); }
         }
     }
 }
@@ -728,6 +743,14 @@ pub enum InputKind<K> {
     },
     Wheel {
         dy: f32,
+    },
+    /// **A sideways glide of the row under the pointer** (the application's pointer edge glide):
+    /// `dx` px (+ shows more on the right), for whatever scrolls sideways at screen `(x, y)`. A
+    /// page with nothing there ignores it.
+    Pan {
+        dx: f32,
+        x: f32,
+        y: f32,
     },
     Text(TextEdit),
     PointerHidden,
@@ -792,6 +815,8 @@ pub enum MachineId {
     Store(StoreOrd),
     Instance(InstanceId),
     Cache,
+    /// The player-HUD package store (`plx_data::hudpacks`), owned by the Bridge: the address its commands are delivered to.
+    Huds,
 }
 
 impl MachineId {
@@ -807,6 +832,7 @@ impl MachineId {
             Self::Store(id) => { c.u32(6).u32(id.0); }
             Self::Instance(id) => { c.u32(7).u32(id.0); }
             Self::Cache => { c.u32(8); }
+            Self::Huds => { c.u32(9); }
         }
     }
 }
@@ -1090,6 +1116,21 @@ impl Measure for BareMeasure {
     }
 }
 
+/// **The HUD cost model**: whole-pixel advances of the two shipped faces and a line height of
+/// `LINE_HEIGHT` x size ([`plx_base::fontcov::advances`]). The type is `fontcov`'s (base) and the trait is this
+/// module's, so the impl lives here, beside [`ShippedMeasure`]'s.
+impl Measure for plx_base::fontcov::advances::WholePixelMeasure {
+    fn width(&self, s: &CStr, sz: i32, bold: bool) -> f32 {
+        self.face(bold).width(&s.to_string_lossy(), sz)
+    }
+    fn cap_h(&self, sz: i32) -> f32 {
+        sz as f32 * plx_base::fontcov::advances::CAP_HEIGHT
+    }
+    fn line_h(&self, sz: i32) -> f32 {
+        sz as f32 * plx_base::fontcov::advances::LINE_HEIGHT
+    }
+}
+
 /// The host-test text measure over the shipped faces' real advances. The type is `fontcov`'s (base)
 /// and the trait is this module's, so the impl lives here: the lowest layer that names both, and
 /// the one place the orphan rule lets it sit once the layers are crates.
@@ -1099,9 +1140,9 @@ impl Measure for plx_base::fontcov::advances::ShippedMeasure {
         plx_base::fontcov::advances::shipped(bold).width(&s.to_string_lossy(), sz)
     }
     fn cap_h(&self, sz: i32) -> f32 {
-        sz as f32 * 0.73
+        sz as f32 * plx_base::fontcov::advances::CAP_HEIGHT
     }
     fn line_h(&self, sz: i32) -> f32 {
-        sz as f32 * 1.21
+        sz as f32 * plx_base::fontcov::advances::LINE_HEIGHT
     }
 }

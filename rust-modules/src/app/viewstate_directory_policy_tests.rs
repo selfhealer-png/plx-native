@@ -24,9 +24,9 @@ fn viewstate_optimistic_home_edit_keeps_the_frame_directory_policy() {
         sid,
         rk: "alpha".into(),
         write: plx_data::viewstate::Write::Watched,
-        detail: None,
+        scope: plx_data::viewstate::Scope::Leaf,
         guid: String::new(),
-    }));
+    }).changed);
 
     let snapshot = rig.stores.hubs.snapshot();
     let hub = snapshot.view().hub(0).expect("the pinned library's shelf");
@@ -48,7 +48,7 @@ fn separate_bridges_do_not_share_any_viewstate_owner_state_or_notice() {
 
     first.stores.viewstate.borrow_mut().seed_ownership_fixture_for_test();
     let before_reset = first.stores.viewstate.borrow().ownership_fixture_for_test();
-    second.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Reset);
+    let _ = second.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Reset);
     let after_reset = first.stores.viewstate.borrow().ownership_fixture_for_test();
 
     first.stores.viewstate.borrow_mut().seed_ownership_fixture_for_test();
@@ -74,7 +74,7 @@ fn reset_fences_a_late_old_viewstate_worker_from_the_post_reset_request() {
     let old_adapter = bridge.stores.viewstate.borrow().adapter_for_test();
     let finish_old_worker = bridge.stores.viewstate.borrow().late_completion_for_test();
 
-    bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Reset);
+    let _ = bridge.viewstate_run(plx_data::stores::viewstate::ViewStateCmd::Reset);
     bridge.stores.viewstate.borrow_mut().seed_post_reset_flight_for_test();
     let new_adapter = bridge.stores.viewstate.borrow().adapter_for_test();
     assert!(!std::sync::Arc::ptr_eq(&old_adapter, &new_adapter),
@@ -178,11 +178,12 @@ fn person_store_notifies_only_when_a_command_actually_changed_state() {
     let _ = bridge.stores.person.take_notice();
     let gen_before = bridge.stores.person.gen();
 
-    let changed = bridge.person_run(plx_data::stores::person::PersonCmd::SetWatchedLocal {
-        sid, rk: "no-such-item".into(), on: true,
+    let changed = bridge.person_run(plx_data::stores::person::PersonCmd::ApplyView {
+        at: plx_data::viewstate::ViewAt::leaf(sid, "no-such-item"),
+        edit: plx_data::viewstate::ViewEdit::Watched(true),
     });
 
-    assert!(!changed, "an unmatched SetWatchedLocal must report no change");
+    assert!(!changed, "an unmatched ApplyView must report no change");
     assert_eq!(bridge.stores.person.gen(), gen_before,
         "a no-op command must not bump the Person store's generation");
     assert_eq!(bridge.stores.person.take_notice(), None,
@@ -214,8 +215,9 @@ fn addressed_person_store_command_changes_and_notifies_only_its_bridge() {
     let _ = first.stores.take_notices();
     let _ = second.stores.take_notices();
 
-    deliver_person(&mut first, plx_data::stores::person::PersonCmd::SetWatchedLocal {
-        sid, rk: "movie".into(), on: true,
+    deliver_person(&mut first, plx_data::stores::person::PersonCmd::ApplyView {
+        at: plx_data::viewstate::ViewAt::leaf(sid, "movie"),
+        edit: plx_data::viewstate::ViewEdit::Watched(true),
     });
 
     assert!(first.person_view().current().unwrap().shelf(0)[0].watched,
@@ -260,9 +262,9 @@ fn viewstate_optimistic_edit_mutates_only_its_bridge_person_store() {
         sid,
         rk: "movie".into(),
         write: plx_data::viewstate::Write::Watched,
-        detail: None,
+        scope: plx_data::viewstate::Scope::Leaf,
         guid: String::new(),
-    }));
+    }).changed);
 
     assert!(first.person_view().current().unwrap().shelf(0)[0].watched);
     assert!(!second.person_view().current().unwrap().shelf(0)[0].watched,
@@ -290,25 +292,19 @@ fn detail_watch_activation_dispatches_the_addressed_store_effect_in_the_press_fr
             match &stamped.fx {
                 Fx::App(AppFx::Store(StoreId::ViewState,
                     StoreCmd::ViewState(plx_data::stores::viewstate::ViewStateCmd::Request {
-                        sid, rk, write, detail, guid,
+                        sid, rk, write, guid, ..
                     }))) => {
-                    assert_eq!((*sid, rk.as_str(), *write, detail.as_ref(), guid.as_str()),
-                        (self.sid, "movie", plx_data::viewstate::Write::Watched,
-                            Some(&plx_data::stores::viewstate::DetailRefresh {
-                                sid: self.sid, rk: "movie".into(), keep: None,
-                            }), "plex://movie"));
+                    assert_eq!((*sid, rk.as_str(), *write, guid.as_str()),
+                        (self.sid, "movie", plx_data::viewstate::Write::Watched, "plex://movie"));
                     self.app_effects += 1;
                 }
                 Fx::Deliver(MachineId::Store(ord), Delivery::Machine(AppMsg::Store(
                     StoreCmd::ViewState(plx_data::stores::viewstate::ViewStateCmd::Request {
-                        sid, rk, write, detail, guid,
+                        sid, rk, write, guid, ..
                     })))) => {
                     assert_eq!(*ord, StoreId::ViewState.ord());
-                    assert_eq!((*sid, rk.as_str(), *write, detail.as_ref(), guid.as_str()),
-                        (self.sid, "movie", plx_data::viewstate::Write::Watched,
-                            Some(&plx_data::stores::viewstate::DetailRefresh {
-                                sid: self.sid, rk: "movie".into(), keep: None,
-                            }), "plex://movie"));
+                    assert_eq!((*sid, rk.as_str(), *write, guid.as_str()),
+                        (self.sid, "movie", plx_data::viewstate::Write::Watched, "plex://movie"));
                     self.store_deliveries += 1;
                 }
                 _ => {}
@@ -337,9 +333,12 @@ fn detail_watch_activation_dispatches_the_addressed_store_effect_in_the_press_fr
     }));
     dispatcher.frame_with(&mut rig, tick(1), Vec::new(), Vec::new(), &mut NoTap, false);
     let play = dispatcher.focus().expect("Detail seats its Play control");
+    // The row is Play, the Watchlist disc, then the watch toggle: two RIGHTs reach the toggle.
     dispatcher.frame_with(&mut rig, tick(2), script_key(Key::Right, tick(2)), Vec::new(),
         &mut NoTap, false);
-    let watch = dispatcher.focus().expect("RIGHT reaches the watch control");
+    dispatcher.frame_with(&mut rig, tick(3), script_key(Key::Right, tick(3)), Vec::new(),
+        &mut NoTap, false);
+    let watch = dispatcher.focus().expect("RIGHT twice reaches the watch control");
     assert_ne!(watch.elem, play.elem);
 
     rig.stores.viewstate.borrow_mut().hold_inflight_for_test(sid, "held");
@@ -348,7 +347,7 @@ fn detail_watch_activation_dispatches_the_addressed_store_effect_in_the_press_fr
     dispatcher.emit(MachineId::Nav, Fx::Deliver(MachineId::Instance(instance),
         Delivery::Screen(ScreenEvent::Activate(watch.elem))));
     let mut tap = ViewStateDispatch { sid, app_effects: 0, store_deliveries: 0 };
-    dispatcher.frame_with(&mut rig, tick(3), Vec::new(), Vec::new(), &mut tap, false);
+    dispatcher.frame_with(&mut rig, tick(4), Vec::new(), Vec::new(), &mut tap, false);
 
     assert_eq!((tap.app_effects, tap.store_deliveries), (1, 1),
         "the Detail effect must cross the addressed Bridge store delivery exactly once");
@@ -371,9 +370,10 @@ fn hubs_land_and_tick_keep_the_frame_directory_policy() {
     rig.directory = directory_policy_fixture(own, hidden);
     let directory = rig.directory.clone();
 
-    plx_data::pms::with_refused_fetches_for_test(|| {
+    let keys = plx_data::pms::registry_keys_for_test();
+    crate::app::adapters::stores::with_refused_hubs_launches_for_test(|| {
         let _ = rig.stores.hubs.run_with_directory(
-            plx_data::stores::hubs::HubsCmd::Reset, directory.view());
+            plx_data::stores::hubs::HubsCmd::Reset, directory.view(), &keys);
         let parts = CxParts { tick: tick(0), press: Default::default(), focus: Default::default(),
             owner: InputOwner::Entry(EntryId(0)) };
         let mut present = Present::new();
@@ -382,6 +382,11 @@ fn hubs_land_and_tick_keep_the_frame_directory_policy() {
         assert_eq!(rig.deliver(MachineId::Store(StoreId::Hubs.ord()),
             &AppMsg::Store(StoreCmd::Hubs(plx_data::stores::hubs::HubsCmd::RefetchHubs)),
             &parts, &mut fx), Handled::Yes);
+        drop(fx);
+        assert!(effects.is_empty(), "a refused launch is settled by the next Hubs step");
+        let mut fx = Effects::new(&mut effects, MachineId::Store(StoreId::Hubs.ord()), &mut present);
+        assert_eq!(rig.deliver(MachineId::Store(StoreId::Hubs.ord()),
+            &AppMsg::StoreWork(plx_data::stores::StoreWork::Hubs), &parts, &mut fx), Handled::Yes);
         drop(fx);
         assert_eq!(effects.iter().map(|effect| match &effect.fx {
             Fx::App(AppFx::Session(plx_session::auth::SessionCmd::RequestEndpoint { sid })) => *sid,
@@ -403,15 +408,22 @@ fn hubs_land_and_tick_keep_the_frame_directory_policy() {
         assert_eq!(generation, generation_before_landing + 1);
         assert_eq!(rig.stores.take_notices(), [(StoreId::Hubs, generation)],
             "one changed landing owes exactly one Hubs notice");
-        let sources_after_land = rig.stores.hubs.run_with_directory(
-            plx_data::stores::hubs::HubsCmd::Retry, directory.view());
+        let retried = rig.stores.hubs.run_with_directory(
+            plx_data::stores::hubs::HubsCmd::Retry, directory.view(), &keys);
+        assert!(retried.endpoints.iter().next().is_none(), "its refusals are settled by the next step");
+        // The bare store starts nothing: the system's refusal of the retry's read is the answer.
+        rig.stores.hubs.refuse_jobs_for_test();
+        let sources_after_land = rig.stores.hubs.tick_with_directory(0.0, directory.view(), &keys);
         assert_eq!(sources_after_land.endpoints.iter().map(|request| request.sid).collect::<Vec<_>>(), [own],
             "landing must keep the retained frame directory");
 
         let _ = rig.stores.hubs.run_with_directory(
-            plx_data::stores::hubs::HubsCmd::Reset, directory.view());
+            plx_data::stores::hubs::HubsCmd::Reset, directory.view(), &keys);
         let _ = rig.stores.hubs.run_with_directory(
-            plx_data::stores::hubs::HubsCmd::RefetchHubs, directory.view());
+            plx_data::stores::hubs::HubsCmd::RefetchHubs, directory.view(), &keys);
+        rig.stores.hubs.refuse_jobs_for_test();
+        // the refusal that refetch left is settled here, so the tick below is graded on its own
+        let _ = rig.stores.hubs.tick_with_directory(0.0, directory.view(), &keys);
         let _ = rig.stores.take_notices();
         effects.clear();
         let mut fx = Effects::new(&mut effects, MachineId::Store(StoreId::Hubs.ord()), &mut present);
@@ -609,7 +621,7 @@ fn metadata_reset_rotates_the_adapter_and_fences_a_late_old_worker() {
     }))));
     assert!(bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::InstallPlaying(Some(plx_data::metadata::PlayingItem {
         sid, rk: "old-rk".into(), show_rk: String::new(), kind: String::new(), audio: Vec::new(), subs: Vec::new(), video_fps: 0.0,
-        width: 0, height: 0, bitrate: 0, dovi: Default::default(), markers: Vec::new(), chapters: Vec::new(), blur: None,
+        width: 0, height: 0, bitrate: 0, dovi: Default::default(), markers: Vec::new(), chapters: Vec::new(), hdr: false,
     }))));
     bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::AltInstall {
         sid, rk: "old-rk".into(),
@@ -655,7 +667,7 @@ fn metadata_reset_rotates_the_adapter_and_fences_a_late_old_worker() {
         "a completion from a worker started before reset must not land in the post-reset store");
 }
 
-/// The account-menu lift is a second PAINT of this bridge's captured chrome, not a second
+/// The account-menu lift (`Rig::lift_bar_member`) is a second PAINT of this bridge's captured chrome, not a second
 /// publication. Changing the process globals after A captured must not make A draw B's chip.
 #[test]
 fn two_bridges_keep_their_own_captured_profile_and_labels_for_a_scrim_lift() {
@@ -676,13 +688,12 @@ fn two_bridges_keep_their_own_captured_profile_and_labels_for_a_scrim_lift() {
         ..Default::default()
     }), 41);
 
-    let ar = <Bridge as plx_ui::dispatch::Rig<AppHost>>::scrim_chrome_read(&a)
-        .expect("a bar-wearing bridge publishes lift chrome");
-    let br = <Bridge as plx_ui::dispatch::Rig<AppHost>>::scrim_chrome_read(&b)
-        .expect("the second bridge publishes its own lift chrome");
+    // the lift (`Rig::lift_bar_member`) reads exactly this: the bridge's own captured chrome
+    let ar = a.chrome.read(0.0);
+    let br = b.chrome.read(0.0);
     assert_eq!(ar.profile.name.to_bytes(), b"Owner A");
     assert_eq!(ar.profile.initial.to_bytes(), b"A");
-    assert_eq!(ar.labels.labels, ["Home", "Movies", ""]);
+    assert_eq!(ar.labels.faces, [plx_ui::widgets::TabFace::Label("Home".into()), plx_ui::widgets::TabFace::Label("Movies".into()), plx_ui::widgets::TabFace::Icon(plx_ui::icons::Icon::Search)]);
     assert_eq!(br.profile.name.to_bytes(), b"Owner B");
-    assert_eq!(br.labels.labels, ["Home", "TV Shows", ""]);
+    assert_eq!(br.labels.faces, [plx_ui::widgets::TabFace::Label("Home".into()), plx_ui::widgets::TabFace::Label("TV Shows".into()), plx_ui::widgets::TabFace::Icon(plx_ui::icons::Icon::Search)]);
 }

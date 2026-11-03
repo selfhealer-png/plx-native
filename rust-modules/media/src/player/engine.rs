@@ -11,10 +11,14 @@
 //! or the ACB/Starfish seam, so the parameter carries information. `arm_seek` and `begin_resume`
 //! run on the main thread too and deliberately do not take one: they only publish to `SHARED`.
 use super::shared::{HlsPlayCompletion, HlsPrimeKind, Stage};
+use super::SeekMode;
 use super::{log, sink, threads, ACB_OK, PTYPE, SHARED, TX};
 use crate::aq::{AuNode, AuQueue};
 use plx_net::stream::HttpStream;
 use plx_base::task::MainThread;
+use plx_platform::devcaps::AudioStack;
+use plx_platform::tv::sink::UnloadTicket;
+use plx_telemetry::telemetry::classes::DemuxExitClass;
 use plx_telemetry::telemetry::window::Stage as WindowStage;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -102,6 +106,9 @@ pub fn fed_totals() -> (i64, i64) {
 /// taken only when a video push would park at this cap with no audio yet. The reachable-reserve
 /// model (`abr::plant::b_max_est_ms`) wants exactly this steady-state number: the headroom is a
 /// transient of the start of one kind of file, gone before the buffer-driven controller acts.
+/// The audio lane's base cap is soft in the other direction: a file that stores more audio than
+/// this ahead of its video (issue #600) runs the lane up to `ff::AUDIO_AHEAD_HEADROOM` (16 MiB)
+/// beyond it for as long as the video lane holds less than `MAX_FEED_AHEAD_NS` of media.
 pub const fn aq_caps() -> (i64, i64) {
     (AQ_VIDEO_BYTES as i64, AQ_AUDIO_BYTES as i64)
 }
@@ -176,6 +183,10 @@ pub struct Engine {
     pub native_epoch: u32,
     pub stage: Stage,
     pub video_info_sent: bool, // videoInfoSent
+    /// ACB route: `SHARED.frames` when the plane bind completed (`Stage::Streaming`), until a tick
+    /// beyond it is seen. A paused preroll re-pauses only after that tick: a picture presented
+    /// before the bind is not on the panel.
+    pub bound_at_frames: Option<i32>,
     /// webOS 5+ only: the source size the exported window was last placed with, so a corrective
     /// re-place happens exactly once if the demuxer publishes the real one later. 0 = never placed.
     pub placed_src: (c_int, c_int),
@@ -201,6 +212,16 @@ pub struct Engine {
     /// first since the open or seek (`SHARED.first_audio_pts`) — once Starfish accepted it.
     /// `None` until then; reset with `max_fed_audio_pts`. See [`audio_lead_in`].
     pub audio_start_fp: Option<i64>,
+    /// Added to the sink pts of every audio AU of THIS Load ([`audio_sink_pts`]): the active sound
+    /// output's lead on a `liblxa` or 2018 stack, the one lead of the `lgaudiosink` stack
+    /// ([`pcm_output_lead`]), or the dev override, when the Load declared `"audio":"PCM"`, 0 for a
+    /// compressed Load and for a stack with no lead. Chosen once per Load, from the plan
+    /// [`load_audio`] made with the declared audio ([`PcmLead`]); an in-place seek keeps it.
+    pub pcm_sink_lead_ns: i64,
+    /// The lead follows the sound output, which only the Load thread may read (the frame thread
+    /// may not wait on the bus): `pcm_sink_lead_ns` is not final until [`settle_pcm_lead`] has
+    /// taken it from the Load's return, and no audio is fed before.
+    pub pcm_lead_pending: bool,
     /// The feed-ahead throttle's reference position, run on between the pipeline's 5 Hz
     /// position reports (see [`FeedPace`]).
     pub feed_pace: FeedPace,
@@ -232,11 +253,37 @@ pub struct Engine {
     pub report_stop: Option<std::sync::Arc<threads::ReportStop>>, // ITS stop signal, not SHARED's
     /// Preview Load that must land unbound. The media join waits until the thread has returned.
     pub preview_abandon: bool,
+    /// The foreground lifecycle follows this Engine's Load attempt ([`foreground_follows_load`]).
+    /// It then owns the Load call's own synchronous result (`route_start_status` `Failed`, the
+    /// refusal #1018 retries), so the pump's failed-open ladder leaves that one alone
+    /// ([`super::pump`]'s `settled_by_foreground`).
+    pub foreground_follows_load: bool,
+    /// Whether this session's era-chosen sink counter has shown up ([`super::era_callbacks`]).
+    pub(super) era_watch: super::era_callbacks::Watch,
 }
 
 impl Engine {
     pub fn uses_stream_queues(&self) -> bool {
         matches!(self.source, Source::Stream)
+    }
+}
+
+/// Test builds only: how many Engines have dropped (the exit's leak is observed by it staying put).
+#[cfg(test)]
+static ENGINES_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Test builds only: an Engine dropped while it still holds its demuxer's handle was never torn
+/// down, so that thread may still be writing into `aq_video`/`aq_audio`, which this drop frees.
+/// `teardown` always takes the handle and joins it first. The hostsim rigs used to drop a
+/// reloaded Engine straight out of their `PlayerAdapter`: the demuxer's `aq_set_eof` then landed
+/// in freed memory, a heap corruption that surfaced later as a crash in some unrelated free.
+#[cfg(test)]
+impl Drop for Engine {
+    fn drop(&mut self) {
+        ENGINES_DROPPED.fetch_add(1, Ordering::SeqCst);
+        if self.stream_th.is_some() && !std::thread::panicking() {
+            panic!("an Engine was dropped with its demuxer still owned: stop it with teardown first");
+        }
     }
 }
 
@@ -368,10 +415,332 @@ pub fn reap_abandoned_load(pa: &mut super::adapter::PlayerAdapter) -> bool {
     true
 }
 
+/// **A real stop's native object, handed to an off-frame `Unload`.** `StarfishMediaAPIs::Unload`
+/// blocks for 110-150 ms on the dev set (webOS 4.5, release build, measured 2026-10-15 with
+/// `teardown spans:`; the kernel sched trace of the same returns shows the main thread ~31-36 ms in
+/// D state inside a driver `ioctl` and then ~72-74 ms in a futex until the pipeline thread woke it),
+/// and on the main thread that was the whole of the frame that handled BACK: 140-170 ms on 8 of 8
+/// returns. So a real stop issues it on a worker and keeps everything else where it was: the
+/// callback gate, the epoch retirement, the ACB `setState(UNLOADED)`, D1 and the exported window
+/// still run on the main thread, in the same order, once `Unload` has returned
+/// ([`poll_release`], polled once a frame by `app::run`; the adapter hands out the token at once and
+/// `player::sink()` fences the object meanwhile). A reload, an app-switch suspend and the decoder-revoked park keep the
+/// synchronous release: each starts the next Load at once, so there is no frame to save.
+///
+/// While the worker owns the object its epoch is [`Shared::begin_native_release`]'s `Releasing`
+/// phase, which admits only UNLOADCOMPLETED (the main thread has already reset the state any other
+/// callback would write into), and no new native session may begin.
+pub struct PendingRelease {
+    epoch: u32,
+    /// Taken by the join ([`join_finished_release`]); `None` afterwards.
+    unload_th: Option<std::thread::JoinHandle<()>>,
+    handed_off_at: std::time::Instant,
+    /// The Engine the object belonged to. It used to drop at the end of `teardown`, after the
+    /// release; it still drops after it (the Load payload in particular outlives the Unload).
+    _engine: Engine,
+}
+
+impl PendingRelease {
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    pub(crate) fn handed_off_at(&self) -> std::time::Instant {
+        self.handed_off_at
+    }
+
+    /// The `Unload` has returned, so joining its worker cannot block.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.unload_th.as_ref().is_none_or(|t| t.is_finished())
+    }
+}
+
+/// Test seam: make [`release_off_frame`] see the OS refuse the `sf-unload` thread.
+#[cfg(test)]
+static FAIL_UNLOAD_SPAWN_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Start the off-frame release of `epoch`'s object, or release it here when it cannot be handed
+/// off (no dispatchable object, an epoch that no longer owns `Active`, or the OS refusing the
+/// thread). `Some` = the worker is running and the caller must park it with the Engine.
+fn release_off_frame(mt: &MainThread, epoch: u32, sp: &mut TeardownSpans) -> Option<std::thread::JoinHandle<()>> {
+    if unsafe { super::raw_sink().ready(mt) } == 0 || !SHARED.begin_native_release(epoch) {
+        release_native_object_timed(mt, epoch, sp);
+        return None;
+    }
+    let ticket = UnloadTicket::issue(mt);
+    #[cfg(test)]
+    let refused = FAIL_UNLOAD_SPAWN_FOR_TEST.load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    let refused = false;
+    let th = if refused {
+        None
+    } else {
+        #[cfg(all(test, feature = "hostsim"))]
+        let worker = super::ffi_host::UnloadWorker::enter();
+        plx_base::task::spawn("sf-unload", move || {
+            #[cfg(all(test, feature = "hostsim"))]
+            let _worker = worker;
+            unsafe { super::raw_sink().unload(&ticket) }
+        })
+    };
+    sp.mark("unload_handoff");
+    if th.is_none() {
+        log("native lifecycle: no thread for the off-frame Unload; unloading on the main thread");
+        unsafe { super::raw_sink().unload(&UnloadTicket::issue(mt)) };
+        sp.mark("sf_unload");
+        finish_unloaded_object(mt, epoch, sp);
+        destroy_native_window(mt, sp);
+    }
+    th
+}
+
+/// **The runner of [`super::release::NativeRelease`].** Once a frame (and at the head of a start):
+/// join the `Unload` worker only if it has returned (so the join cannot block), feed that and the
+/// clock to the machine, and execute what it asks: the main-thread tail, the start that was queued
+/// behind the release, or the typed refusal once the release is overdue. `true` when a tail ran.
+pub fn poll_release(
+    ps: &mut crate::route::PlaybackSession,
+    pa: &mut super::adapter::PlayerAdapter,
+    now: std::time::Instant,
+) -> bool {
+    let (fx, joined) = drive_release(pa, now, None);
+    run_release_effects(ps, pa, fx, joined, true).tail_ran
+}
+
+/// [`poll_release`] at the wall clock: the per-frame entry `app::run` calls.
+pub fn poll_release_frame(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter) -> bool {
+    poll_release(ps, pa, std::time::Instant::now())
+}
+
+/// What one pass of the effects did.
+#[derive(Default)]
+struct ReleasePass {
+    tail_ran: bool,
+    exit: Option<super::release::ReleaseEffect>,
+}
+
+/// Join a returned worker, then step the machine with its return, the clock and (at the exit) the
+/// exit request. Returns the effects and the joined release, whose tail the effects may run.
+fn drive_release(
+    pa: &mut super::adapter::PlayerAdapter,
+    now: std::time::Instant,
+    exit: Option<std::time::Instant>,
+) -> (Vec<super::release::ReleaseEffect>, Option<PendingRelease>) {
+    use super::release::ReleaseEvent as V;
+    let mut fx = Vec::new();
+    let joined = pa.take_finished_release().map(|mut p| {
+        if let Some(th) = p.unload_th.take() {
+            plx_base::task::join("sf-unload", th);
+        }
+        pa.release_step(&V::UnloadReturned { epoch: p.epoch }, &mut fx);
+        p
+    });
+    pa.release_step(&V::Tick { now }, &mut fx);
+    if let Some(at) = exit {
+        pa.release_step(&V::Exit { now: at }, &mut fx);
+    }
+    (fx, joined)
+}
+
+fn run_release_effects(
+    ps: &mut crate::route::PlaybackSession,
+    pa: &mut super::adapter::PlayerAdapter,
+    fx: Vec<super::release::ReleaseEffect>,
+    mut joined: Option<PendingRelease>,
+    may_start: bool,
+) -> ReleasePass {
+    use super::release::ReleaseEffect as E;
+    let mut pass = ReleasePass::default();
+    for effect in fx {
+        match effect {
+            E::RunTail { epoch } => {
+                if let Some(p) = joined.take() {
+                    debug_assert_eq!(p.epoch, epoch);
+                    run_release_tail(pa.mt(), p);
+                    pass.tail_ran = true;
+                }
+            }
+            E::Start(q) if may_start => {
+                let launched = match start_bufferfeed_for(ps, pa, q.route_start) {
+                    BufferfeedStartOutcome::Launched(attempt) => Some(attempt),
+                    _ => None,
+                };
+                pa.settle_preview_admission(launched.is_some(), true);
+                pa.queued_start_ran(launched);
+            }
+            // The exit does not start playback; the transaction is settled instead.
+            E::Start(q) => {
+                pa.settle_preview_admission(false, false);
+                let _ = crate::route::abort_route_start(q.route_start, crate::route::RouteStartResult::StartFailed);
+            }
+            E::AbortSuperseded(q) => {
+                pa.settle_preview_admission(false, false);
+                pa.queued_start_dropped();
+                let _ = crate::route::abort_route_start(q.route_start, crate::route::RouteStartResult::StartFailed);
+            }
+            E::RefuseStart(q) => {
+                refuse_start_for_release(ps, q);
+                pa.settle_preview_admission(false, true);
+                pa.queued_start_ran(None);
+            }
+            exit @ (E::ExitClean | E::ExitWaiting | E::ExitWorkerInFirmware) => pass.exit = Some(exit),
+        }
+    }
+    pass
+}
+
+/// The deadline passed over a start: settle its transaction as failed and record where
+/// `player::state` derives the `release_timeout` read-out from. No Engine, no second object.
+fn refuse_start_for_release(ps: &mut crate::route::PlaybackSession, q: super::release::QueuedStart) {
+    log("native lifecycle: the previous Unload is overdue (refusing native start)");
+    let _ = crate::route::abort_route_start(q.route_start, crate::route::RouteStartResult::StartFailed);
+    ps.native_start_refused = Some(crate::route::StartRefusal::ReleaseTimeout);
+}
+
+/// The main-thread tail of a finished off-frame release: gate, epoch, ACB, D1, window.
+fn run_release_tail(mt: &MainThread, p: PendingRelease) {
+    let mut sp = TeardownSpans::new();
+    sp.mark("join");
+    finish_unloaded_object(mt, p.epoch, &mut sp);
+    destroy_native_window(mt, &mut sp);
+    sp.emit("release");
+    log(&format!(
+        "native lifecycle: off-frame Unload epoch={} released {} ms after the stop",
+        p.epoch,
+        p.handed_off_at.elapsed().as_millis(),
+    ));
+    // `p._engine` drops here, after the object it belonged to is gone.
+}
+
+/// Whether the process may tear the display down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeExit {
+    Clean,
+    /// Native ownership is unresolved: a worker may still be inside firmware, or a URI
+    /// registration may remain quarantined after its worker ended. Skip `SDL_Quit` and the
+    /// Wayland window destroy until the OS reclaims that ownership.
+    WorkerInFirmware,
+}
+
+/// The native half of `app::run::shutdown`, after the final stop. Waits for the native Unload or
+/// URI registration release up to the release deadline, then preserves unresolved display ownership.
+pub fn exit_native(pa: &mut super::adapter::PlayerAdapter) -> NativeExit {
+    exit_native_with(pa, std::time::Instant::now, || std::thread::sleep(std::time::Duration::from_millis(2)))
+}
+
+pub(super) fn exit_native_with(
+    pa: &mut super::adapter::PlayerAdapter,
+    mut clock: impl FnMut() -> std::time::Instant,
+    mut idle: impl FnMut(),
+) -> NativeExit {
+    #[cfg(feature = "devtriggers")]
+    if pa.uri_live() {
+        let started = clock();
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        super::uriprobe_drive::stop(&mut ps, pa);
+        while pa.uri_live() {
+            super::uriprobe_drive::drive(&mut ps, pa);
+            if !pa.uri_live() { break; }
+            if pa.uri_acb_exit_quarantine() || clock().saturating_duration_since(started) >= super::release::RELEASE_DEADLINE {
+                log("exit: URI ownership unresolved; the display is left to the OS");
+                if let Some(session) = pa.take_uri() { std::mem::forget(session); }
+                leak_parked_for_exit(pa);
+                return NativeExit::WorkerInFirmware;
+            }
+            idle();
+        }
+    }
+    reap_abandoned_load(pa);
+    if pa.has_abandoned_load() {
+        log("exit: a timed-out Load is still inside firmware; the display is left to the OS");
+        leak_parked_for_exit(pa);
+        return NativeExit::WorkerInFirmware;
+    }
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    loop {
+        let now = clock();
+        let (fx, joined) = drive_release(pa, now, Some(now));
+        match run_release_effects(&mut ps, pa, fx, joined, false).exit {
+            Some(super::release::ReleaseEffect::ExitClean) => return NativeExit::Clean,
+            Some(super::release::ReleaseEffect::ExitWorkerInFirmware) => {
+                log("exit: the native Unload is overdue; the display is left to the OS");
+                leak_parked_for_exit(pa);
+                return NativeExit::WorkerInFirmware;
+            }
+            _ => idle(),
+        }
+    }
+}
+
+/// **A worker still in firmware reads memory its owner is about to drop.** The caller skips
+/// `SDL_Quit` and `app::run_and_shutdown` ends the process with `_exit` (no `App` drop, no libc
+/// finalizers), but the stack above it may still unwind, so the parked
+/// [`PendingRelease`] (its Engine: the Load payload Starfish holds a raw pointer into, the
+/// handle set, the AU queues) and the parked [`AbandonedLoad`] (the payload its `media` thread
+/// reads) would be freed under the live call. They are leaked instead, for the life of the process
+/// (`release.rs`: the `_exit` that follows skips their destructors). Only `exit_native` calls this, and only on that outcome.
+fn leak_parked_for_exit(pa: &mut super::adapter::PlayerAdapter) {
+    if let Some(p) = pa.take_pending_release_any() {
+        std::mem::forget(p);
+    }
+    if let Some(l) = pa.take_abandoned_load() {
+        std::mem::forget(l);
+    }
+}
+
+/// Test helper: finish the pending release the way the exit does, with no deadline concerns.
+#[cfg(all(test, feature = "hostsim"))]
+pub(crate) fn finish_release_for_test(pa: &mut super::adapter::PlayerAdapter) {
+    let mut ps = crate::route::PlaybackSession::IDLE;
+    while pa.release_busy() {
+        let (fx, joined) = drive_release(pa, std::time::Instant::now(), None);
+        let _ = run_release_effects(&mut ps, pa, fx, joined, false);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// Unload and retire the native object of `epoch`, then destroy it only with complete evidence.
 /// The engine's own teardown and the abandoned-Load release share this so the order below is one
 /// definition.
 fn release_native_object(mt: &MainThread, epoch: u32) {
+    release_native_object_timed(mt, epoch, &mut TeardownSpans::new());
+}
+
+/// **Where a teardown's frame goes, one step at a time.** Each step's wall time is appended as
+/// `label:ms` and the whole run is logged as ONE `teardown spans:` line at the end, so a slow BACK
+/// frame names the call that held the main thread instead of being inferred from a sched trace.
+/// Measuring costs two `Instant::now()` per step; the line is written once per teardown.
+pub(crate) struct TeardownSpans {
+    t0: std::time::Instant,
+    last: std::time::Instant,
+    out: String,
+}
+
+impl TeardownSpans {
+    pub(crate) fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self { t0: now, last: now, out: String::new() }
+    }
+
+    /// Close the step that ran since the previous mark under `label`.
+    pub(crate) fn mark(&mut self, label: &str) {
+        use std::fmt::Write as _;
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
+        self.last = now;
+        let _ = write!(self.out, "{}{label}:{ms:.1}", if self.out.is_empty() { "" } else { "," });
+    }
+
+    pub(crate) fn emit(&self, what: &str) {
+        log(&format!(
+            "teardown spans: {what} total={:.1} {}",
+            self.t0.elapsed().as_secs_f64() * 1000.0,
+            self.out,
+        ));
+    }
+}
+
+fn release_native_object_timed(mt: &MainThread, epoch: u32, sp: &mut TeardownSpans) {
     // Stop the pipeline, close native callback admission, then drain the Rust epoch.
     //
     // `Unload` waits for the GStreamer state transition, but neither libpf's raw callback fields nor
@@ -386,11 +755,29 @@ fn release_native_object(mt: &MainThread, epoch: u32) {
     // runtime evidence that this firmware followed the audited path. If any proof is missing, C
     // retains the constructed object forever and permanently refuses another Load. Leaking one
     // object is preferable to letting D1 turn a late producer callback into a use-after-free.
-    if unsafe { sink().ready(mt) } != 0 {
-        unsafe { sink().unload(mt) };
+    if unsafe { super::raw_sink().ready(mt) } != 0 {
+        sp.mark("pre_unload");
+        unsafe { super::raw_sink().unload(&UnloadTicket::issue(mt)) };
+        sp.mark("sf_unload");
+        finish_unloaded_object(mt, epoch, sp);
+    } else if !SHARED.retire_native_session(epoch) {
+        log(&format!(
+            "native lifecycle: no dispatchable object and epoch={epoch} was already retired",
+        ));
+    }
+    destroy_native_window(mt, sp);
+}
+
+/// Everything after `Unload` returns, in the audited order: close and drain the C callback gate,
+/// retire the Rust epoch, unload the ACB plane, then D1 with complete evidence or quarantine. The
+/// synchronous release and the off-frame release's main-thread tail ([`run_release_tail`]) share
+/// it, so the order is one definition.
+fn finish_unloaded_object(mt: &MainThread, epoch: u32, sp: &mut TeardownSpans) {
+    {
         window_step(WindowStage::NativeUnload);
-        let callback_gate_proven = unsafe { sink().callback_gate_retire(mt) } != 0;
-        let callback_intercepts = unsafe { sink().callback_intercepts(mt) };
+        let callback_gate_proven = unsafe { super::raw_sink().callback_gate_retire(mt) } != 0;
+        sp.mark("gate_retire");
+        let callback_intercepts = unsafe { super::raw_sink().callback_intercepts(mt) };
         let unload_completed = SHARED.native_unload_completed(epoch);
         let rust_epoch_retired = SHARED.retire_native_session(epoch);
         if !unload_completed {
@@ -408,14 +795,18 @@ fn release_native_object(mt: &MainThread, epoch: u32) {
                 "native lifecycle: failed to retire epoch={epoch} after Unload",
             ));
         }
+        sp.mark("retire");
         if ACB_OK.load(Ordering::Relaxed) {
-            unsafe { sink().plane_unload(mt) };
+            unsafe { super::raw_sink().plane_unload(mt) };
+            sp.mark("acb_unload");
             window_step(WindowStage::AcbPlaneUnload);
         }
         match native_object_disposition(unload_completed, callback_gate_proven, rust_epoch_retired)
         {
             NativeObjectDisposition::Destroy => {
-                if unsafe { sink().destroy(mt) } == 0 {
+                let destroyed = unsafe { super::raw_sink().destroy(mt) } != 0;
+                sp.mark("sf_destroy");
+                if !destroyed {
                     log("native lifecycle: C seam rejected D1 and quarantined the object");
                     window_step(WindowStage::NativeQuarantined);
                 } else {
@@ -423,22 +814,23 @@ fn release_native_object(mt: &MainThread, epoch: u32) {
                 }
             }
             NativeObjectDisposition::Quarantine => {
-                unsafe { sink().quarantine(mt) };
+                unsafe { super::raw_sink().quarantine(mt) };
+                sp.mark("quarantine");
                 window_step(WindowStage::NativeQuarantined);
             }
         }
-    } else if !SHARED.retire_native_session(epoch) {
-        log(&format!(
-            "native lifecycle: no dispatchable object and epoch={epoch} was already retired",
-        ));
     }
+}
+
+fn destroy_native_window(mt: &MainThread, sp: &mut TeardownSpans) {
     // The webOS 5+ counterpart of acb_unload, and the other half of `with_window_id`'s create.
     // Outside the sf_ready guard because readiness means dispatchable, not "object exists", and
     // because the window is created BEFORE Load — a session that failed between the two would
     // otherwise leak it, and the next Load would ask for another. Unguarded because the seam
     // already no-ops in the other modes (see starfish.h).
-    unsafe { sink().destroy_window(mt) };
-    if sink().window_mode() == super::VP_EXPORTED {
+    unsafe { super::raw_sink().destroy_window(mt) };
+    sp.mark("destroy_window");
+    if super::raw_sink().window_mode() == super::VP_EXPORTED {
         window_step(WindowStage::ExportedWindowDestroy);
     }
 }
@@ -534,7 +926,7 @@ fn bf_split(data: &[u8], aud5: u8) -> Vec<usize> {
 }
 
 /// Build the streamed BUFFERSTREAM Load payload from PAYLOAD_AV, substituting the item's real
-/// video/audio codecs + a sink envelope. video = "H264"|"H265", audio = "AC3"|"AC3 PLUS"|"AAC"|"DTS".
+/// video/audio codecs + a sink envelope. video = "H264"|"H265", audio = "AC3"|"AC3 PLUS"|"AAC"|"DTS"|"OPUS"|"PCM".
 /// What the Load's `adaptiveStreaming` block declares: the sink the pipeline ALLOCATES for, on the
 /// firmwares that allocate against the declaration rather than the bitstream (webOS 10.3.1,
 /// measured — `docs/webos10-resource-allocation.md`).
@@ -644,7 +1036,8 @@ pub(crate) fn load_video_refused(lv: LoadVideo, caps: &plx_platform::devcaps::Ca
 ///   above, and `fps` is never raised above 60 by the table (120 is a claim nobody has tested).
 ///
 /// `maxFrameRate`: **H.264 declares the stream's own rate class** (24/25/30/50/60, never below
-/// the stream; 60 when the rate is unknown) — see the measurement inside; HEVC stays at 60, the
+/// the stream beyond one 1 ms container-timebase tick per frame, so 30.303 declares 30, issue
+/// #665; 60 when the rate is unknown) — see the measurement inside; HEVC stays at 60, the
 /// value every Dolby Vision verification was taken under. `/tmp/plxnative-sinkmax=WxH@F`
 /// overrides the whole result so the remaining legs are an A/B with no rebuild. Pure; the
 /// wrappers feed it the route.
@@ -675,17 +1068,17 @@ fn sink_envelope(
     // displayed-frame counter (callback type 47, see the payload note above) put a number on
     // what the eye saw: declared at 60 the 4K 24p stream was PRESENTED at 13.0 fps mean, worst
     // second 10; declared at 24, 24.1 fps.** The class, not the exact value: 23.976 → 24 keeps
-    // the declaration a ceiling the stream fits under.
+    // the declaration a ceiling the stream fits under. The one deliberate exception is a
+    // millisecond-timebase 30.303 → 30 (`fps_class`, issue #665), where the declaration sits
+    // about 1% BELOW the fed rate. Suspected, NOT yet device-verified: the k6lp SoC's H.264
+    // decoder is 4K@30-limited, so declaring 50 on a 30p 4K stream is refused with num=601;
+    // `pipe_h264_uhd_30p_ms_timebase` and an owner retest on the 60UN7310 are the proof, with a
+    // second `/tmp/plxnative-nofps` leg to tell a rate-pair refusal from the 4K@30 limit.
     if video == LoadVideo::H264 && stream_fps > 0.0 && stream_fps.is_finite() {
         env.fps = fps_class(stream_fps);
     }
     if measured {
-        let (rw, rh, rf) = match video {
-            LoadVideo::H264 => caps.h264_row,
-            LoadVideo::H265 => caps.hevc_row,
-            LoadVideo::Av1 => caps.av1_row,
-            LoadVideo::Vp9 => caps.vp9_row,
-        };
+        let (rw, rh, rf) = decoder_row(video, caps);
         let clamp = |v: u32, bound: u32| if bound == 0 { v } else { v.min(bound) };
         env.w = clamp(env.w, rw);
         env.h = clamp(env.h, rh);
@@ -695,6 +1088,51 @@ fn sink_envelope(
         }
     }
     env
+}
+
+/// The device's measured decoder row (`(w, h, fps)`, 0 = no bound) for the codec a Load declares:
+/// what [`sink_envelope`] clamps to and [`speed_fps_ceiling`] reads.
+fn decoder_row(video: LoadVideo, caps: &plx_platform::devcaps::Caps) -> (u32, u32, u32) {
+    match video {
+        LoadVideo::H264 => caps.h264_row,
+        LoadVideo::H265 => caps.hevc_row,
+        LoadVideo::Av1 => caps.av1_row,
+        LoadVideo::Vp9 => caps.vp9_row,
+    }
+}
+
+/// **The frame rate a playback speed may feed this stream at**: [`super::SPEED_MAX_FPS`], or the
+/// measured decoder row's rate when that is lower. A speed feeds every frame `rate` times closer
+/// together and the Load declares that fed rate, which [`sink_envelope`] then clamps to the row; a
+/// speed whose fed rate passes the row is one the Load cannot declare, so the menu does not offer
+/// it. Only a table that was actually READ bounds anything (`measured`,
+/// the same condition [`sink_envelope_now`] clamps under), a stream whose codec the Load cannot
+/// declare has no row, and a row with no rate (0) is no bound. The `+ 0.5` is the 60.5 ceiling's own
+/// tolerance, so a 29.97 stream is not turned away from a 30 row. Pure; the wrapper feeds it the
+/// route.
+pub(crate) fn speed_fps_ceiling(
+    video: Option<LoadVideo>,
+    caps: &plx_platform::devcaps::Caps,
+    measured: bool,
+) -> f64 {
+    let row_fps = match video {
+        Some(video) if measured => decoder_row(video, caps).2,
+        _ => 0,
+    };
+    if row_fps == 0 {
+        return super::SPEED_MAX_FPS;
+    }
+    (f64::from(row_fps) + 0.5).min(super::SPEED_MAX_FPS)
+}
+
+/// [`speed_fps_ceiling`] for the playback on screen, from the live caps the way
+/// [`sink_envelope_now`] reads them.
+pub(crate) fn speed_fps_ceiling_now(ps: &crate::route::PlaybackSession) -> f64 {
+    speed_fps_ceiling(
+        LoadVideo::of_stream(&crate::route::stream_vcodec(ps)),
+        &plx_platform::devcaps::caps(),
+        plx_platform::devcaps::measured() && !crate::route::forced_direct_play(ps),
+    )
 }
 
 /// The sink envelope for THIS Load, from the route (main thread), with the dev override applied.
@@ -720,11 +1158,27 @@ fn renamed_static_payload(video: LoadVideo) -> String {
     PAYLOAD_H265.replacen(r#""video":"H265""#, &to, 1)
 }
 
-/// The smallest of the broadcast/film rate classes the stream fits under: 24, 25, 30, 50, 60,
-/// else the rate rounded up. A ceiling, never below the stream.
+/// The broadcast/film rate class (24, 25, 30, 50, 60) a stream's reported rate belongs to, else
+/// the rate rounded up.
+///
+/// A rate belongs to the smallest class `c` for which either `fps <= c + 0.01` (the exact and
+/// NTSC rates: 23.976, 29.97, 59.94) or its mean frame duration is within **1 ms** of the class's
+/// (`1000/fps > 1000/c - 1`). The 1 ms is the Matroska timebase: timestamps are integers in
+/// `TimestampScale` = 1 ms, so a frame interval estimated from them is off by less than one tick,
+/// and a 30p file reports `avg_frame_rate` 1000/33 (30.303) and PMS `frameRate` 30.303 (issue
+/// #665). The error is constant in TIME, not in rate, so the tolerance grows with the class: the
+/// windows top out at 24.59, 25.64, 30.93, 52.63 and 63.83 and never overlap the next class.
+///
+/// This is NOT a claim that the stream is exactly the class: a constant-33 ms file really is fed
+/// at 30.303 fps, so the declaration can sit about 1% below the fed rate. libpf has never been
+/// measured accepting `maxFrameRate` below `videoFps`; the esInfo rational deliberately stays the
+/// raw rate (it is a timing input for libpf's PTS lattice, not a ceiling), and only the ceiling
+/// is snapped. Only the H.264 path reaches this; HEVC and a video re-encode (no known rate) keep 60. A remux
+/// copies the source video, so it arrives here with the source's rate like a direct play.
 fn fps_class(fps: f64) -> u32 {
     for class in [24u32, 25, 30, 50, 60] {
-        if fps <= f64::from(class) + 0.01 {
+        let c = f64::from(class);
+        if fps <= c + 0.01 || 1000.0 / fps > 1000.0 / c - 1.0 {
             return class;
         }
     }
@@ -746,8 +1200,8 @@ fn sink_envelope_now(ps: &crate::route::PlaybackSession, video: LoadVideo) -> Si
     sink_envelope(
         video,
         crate::route::sink_max_raster(ps),
-        crate::route::stream_fps(ps),
-        plx_platform::devcaps::caps(),
+        fed_fps(crate::route::stream_fps(ps), super::applied_rate_permille()),
+        &plx_platform::devcaps::caps(),
         plx_platform::devcaps::measured() && !crate::route::forced_direct_play(ps),
     )
 }
@@ -768,21 +1222,167 @@ fn parse_sinkmax(spec: &str) -> Option<SinkEnvelope> {
 /// getAudioCaps selects audio/x-dts and setAdecSinkInfo_ES configures dts-seamless (issue #221).
 /// Unsupported formats must never be mislabeled as AC3: that can stall the audio master clock.
 fn audio_payload_codec(codec: &str) -> Option<(&'static str, u8)> {
-    match codec {
+    // PMS names DTS `dca`; the shared canonicaliser maps every spelling onto the pipeline's.
+    match plx_platform::devcaps::audio_codec_id(codec).as_ref() {
         "ac3" => Some(("AC3", 1)),
         "eac3" => Some(("AC3 PLUS", 2)),
         "aac" => Some(("AAC", 3)),
         "dts" => Some(("DTS", 4)),
+        // SMP's Opus: raw packets plus `contents.opusInfo` ([`with_opus_info`]), as ss4s feeds it.
+        "opus" => Some(("OPUS", 6)),
+        // decoded in the app (`ff::PcmDecoder`) and fed as PCM: libpf has no FLAC or ALAC input,
+        // and LPCM arrives in containers it does not take. `PCM_AUDIO_CODECS` is the set.
+        c if plx_platform::devcaps::PCM_AUDIO_CODECS.split(',').any(|p| p == c) => Some(("PCM", 5)),
         _ => None,
     }
+}
+
+/// The audio name and diagnostic code a Load declares for `codec`: PCM whenever the app decodes the
+/// stream itself (`pcm` is the shape [`crate::route::stream_pcm`] declared), whatever the codec
+/// is — DTS is `DTS` only when the set's own decoder takes it — else [`audio_payload_codec`]'s.
+/// PURE.
+fn audio_declaration(codec: &str, pcm: Option<&crate::route::PcmFormat>) -> Option<(&'static str, u8)> {
+    if pcm.is_some() {
+        return Some(("PCM", 5));
+    }
+    audio_payload_codec(codec)
+}
+
+/// RFC 7845 §5.1 `OpusHead` as libopus's surround encoder writes it: mapping family 0 for mono and
+/// stereo, family 1 (Vorbis channel order) for 3-8 channels, pre-skip 312, 48 kHz, 0 dB gain.
+/// The Load is built before the demuxer opens the file, so the file's own CodecPrivate is not
+/// available here; a 5.1 Opus track of a real library carries exactly this header (see the test).
+fn opus_head(channels: i64) -> Option<Vec<u8>> {
+    // (streams, coupled streams, channel mapping) for 3..=8 channels — libopus `vorbis_mappings`.
+    const FAMILY1: [(u8, u8, &[u8]); 6] = [
+        (2, 1, &[0, 2, 1]),
+        (2, 2, &[0, 1, 2, 3]),
+        (3, 2, &[0, 4, 1, 2, 3]),
+        (4, 2, &[0, 4, 1, 2, 3, 5]),
+        (4, 3, &[0, 4, 1, 2, 3, 5, 6]),
+        (5, 3, &[0, 6, 1, 2, 3, 4, 5, 7]),
+    ];
+    let ch = u8::try_from(channels).ok().filter(|c| (1..=8).contains(c))?;
+    let mut head = b"OpusHead".to_vec();
+    head.extend_from_slice(&[1, ch]);
+    head.extend_from_slice(&312u16.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&0u16.to_le_bytes());
+    if ch <= 2 {
+        head.push(0);
+    } else {
+        let (streams, coupled, mapping) = FAMILY1[usize::from(ch) - 3];
+        head.extend_from_slice(&[1, streams, coupled]);
+        head.extend_from_slice(mapping);
+    }
+    Some(head)
+}
+
+/// The `contents.opusInfo` node an `OPUS` Load needs: SMP has no in-band way to learn a
+/// multistream layout, so the channel count and the identification header travel in the payload
+/// (`streamHeader` is standard padded base64, as ss4s sends it).
+/// `None` when the count cannot be described or the payload has no `contents` anchor: the caller
+/// refuses the Load rather than declaring a layout the stream does not have.
+fn with_opus_info(p: &str, channels: i64) -> Option<String> {
+    let head = opus_head(channels)?;
+    let anchor = r#""provider":"plxnative""#;
+    p.contains(anchor).then(|| {
+        p.replace(
+            anchor,
+            &format!(
+                r#"{anchor},"opusInfo":{{"channels":{channels},"sampleRate":48,"streamHeader":"{}"}}"#,
+                plx_base::b64::encode(&head)
+            ),
+        )
+    })
+}
+
+/// **Who owns the PCM a Load declares.** Audio the app decodes at 1x (FLAC, ALAC, LPCM, and a lossy codec the attempt decodes in
+/// the app: `ff_pcm`)
+/// declares its own shape; at any other speed the speed decoder (`ff::SpeedDecoder`) decodes every
+/// codec, those included, and feeds stereo PCM that [`build_av_payload`] declares with its own
+/// fixed `pcmInfo` (kilohertz). The app-decoded shape is then dropped and, at 1x, that fixed node is dropped
+/// instead, so the Load carries ONE `pcmInfo` and the demuxer opens ONE decoder.
+/// PURE.
+fn app_pcm_for_rate(
+    session_rate: i32, pcm: Option<Result<crate::route::PcmFormat, String>>,
+) -> Option<Result<crate::route::PcmFormat, String>> {
+    if session_rate == super::RATE_NORMAL { pcm } else { None }
+}
+
+/// `hz` as the kilohertz number `pcmInfo.sampleRate` is matched as: `48`, `44.1`, `22.05`. libpf
+/// reads the key with getFloat and looks it up in a kilohertz table; a rate in hertz matches
+/// nothing and plays at the 44.1 kHz fallback. Declared as `48000`, a 1 kHz tone in a 48 kHz FLAC
+/// was recorded from the room at 918.8 Hz on webOS 4.4.3 (OLED55B8), a 32 kHz one at 1378 Hz and
+/// a 22.05 kHz one at about 2006 Hz: each is 1000 x 44100 / the file's rate.
+/// PURE.
+fn pcm_rate_khz(hz: u32) -> String {
+    (f64::from(hz) / 1000.0).to_string()
+}
+
+/// The `contents.pcmInfo` node a PCM Load needs — the only way the pipeline learns the raw
+/// stream's shape (libpf reads `pcmInfo.{format,channelMode,layout,sampleRate,bitsPerSample}`).
+/// `sampleRate` is in kilohertz ([`pcm_rate_khz`]), the unit the speed decoder's node uses too.
+/// PURE, spliced at the `provider` anchor like [`with_immersive`].
+fn with_pcm_info(p: &str, audio: &str, pcm: Option<crate::route::PcmFormat>) -> String {
+    let (Some(f), "PCM") = (pcm, audio) else {
+        return p.to_string();
+    };
+    let anchor = r#""provider":"plxnative""#;
+    let format = if f.bits == 16 { "S16LE" } else { "S32LE" };
+    let mode = if f.channels == 1 { "mono" } else { "stereo" };
+    p.replace(
+        anchor,
+        &format!(
+            r#"{anchor},"pcmInfo":{{"format":"{format}","channelMode":"{mode}","layout":"interleaved","sampleRate":{},"bitsPerSample":{}}}"#,
+            pcm_rate_khz(f.sample_rate),
+            f.bits
+        ),
+    )
+}
+
+/// The diagnostics line for an app-decoded PCM Load: the declared shape, and where the app resamples it
+/// the track's own rate (` (resampled from 96000Hz)`; nothing when the two are the same).
+/// PURE.
+fn pcm_decode_line(codec: &str, f: &crate::route::PcmFormat) -> String {
+    let resampled = if f.source_rate != f.sample_rate { format!(" (resampled from {}Hz)", f.source_rate) } else { String::new() };
+    format!("pcm: {codec} decoded in-app -> {}Hz {}-bit {}ch{resampled}", f.sample_rate, f.bits, f.channels)
 }
 
 /// The pipeline reads the true dimensions from the SPS (Phase 0 HEVC probe), so mw/mh are only
 /// the sink envelope.
 fn build_av_payload(ps: &crate::route::PlaybackSession, video: &str, audio: &str, env: SinkEnvelope) -> String {
+    build_av_payload_at(ps, video, audio, env, super::applied_rate_permille())
+}
+
+/// [`build_av_payload`] at an explicit session speed (`rate`, permille), so the host tests can pin
+/// it without touching the process-wide `applied_rate_permille`.
+fn build_av_payload_at(
+    ps: &crate::route::PlaybackSession, video: &str, audio: &str, env: SinkEnvelope, rate: i32,
+) -> String {
+    // WHO declares the PCM, decided once: FLAC at 1x (the app decodes it, `ff_pcm`) declares its
+    // own shape below via `with_pcm_info`; every other PCM Load (the speed decoder, any codec,
+    // `rate != 1x`) gets the fixed stereo node here. `audio == "PCM"` is true for BOTH, so the
+    // fixed node is skipped when the app's shape exists, else the Load would carry two `pcmInfo`
+    // keys that disagree on the rate's unit and the bit depth. (A FLAC track whose facts are
+    // missing is `Err`: that Load is refused in `start_bufferfeed` before this payload is used.)
+    let app_pcm = app_pcm_for_rate(rate, crate::route::stream_pcm(ps)).and_then(Result::ok);
     let mut p = PAYLOAD_AV
         .replace(r#""video":"H264""#, &format!(r#""video":"{video}""#))
         .replace(r#""audio":"AC3""#, &format!(r#""audio":"{audio}""#))
+        // The speed decoder's PCM (playback speed) needs its format. libpf 3.9.3 reads `sampleRate`
+        // with getFloat and matches it against a KILOHERTZ table (48, 44.1, 32, …): `48000`
+        // matches nothing and silently falls back to 44.1, which plays 48 kHz audio 9% slow and
+        // resyncs every few seconds (measured 2026-10-15). `channelMode` is one of
+        // mono/dual/stereo/joint stereo. So this node's rate is in kHz, and so is the FLAC node
+        // `with_pcm_info` splices below (it declared hertz first: on a C1, webOS 6.5.3, every PCM
+        // Load then ran at 44.1 kHz — GStreamer caps `rate=44100` — so a 48 kHz FLAC was 9% slow
+        // and 32/22.05 kHz stuttered; an OLED55B8, webOS 4.4.3, did the same).
+        .replace(r#""esInfo":"#, if audio == "PCM" && app_pcm.is_none() {
+            r#""pcmInfo":{"bitsPerSample":16,"sampleRate":48,"channelMode":"stereo"},"esInfo":"#
+        } else {
+            r#""esInfo":"#
+        })
         .replace(r#""maxWidth":1920"#, &format!(r#""maxWidth":{}"#, env.w))
         .replace(r#""maxHeight":1080"#, &format!(r#""maxHeight":{}"#, env.h))
         .replace(
@@ -803,7 +1403,7 @@ fn build_av_payload(ps: &crate::route::PlaybackSession, video: &str, audio: &str
     if plx_base::devtrig::flag("nofps") {
         #[cfg(feature = "devtriggers")]
         log("esInfo: videoFps WITHHELD by /tmp/plxnative-nofps");
-    } else if let Some((num, den)) = fps_rational(crate::route::stream_fps(ps)) {
+    } else if let Some((num, den)) = fed_fps_rational(crate::route::stream_fps(ps), rate) {
         p = p
             .replace(
                 r#""seperatedPTS":true}"#,
@@ -819,6 +1419,9 @@ fn build_av_payload(ps: &crate::route::PlaybackSession, video: &str, audio: &str
         ));
     }
     let p = with_dolby_hdr_info(&p, video, crate::route::stream_dv_presentation(ps));
+    // The app-decoded (FLAC, 1x) node: sampleRate in kHz and a format name. The speed decoder's
+    // fixed node above is the only other `pcmInfo` a Load can carry, and never together with this.
+    let p = with_pcm_info(&p, audio, app_pcm);
     with_immersive(&p, audio, crate::route::stream_immersive(ps))
 }
 
@@ -889,7 +1492,10 @@ fn with_immersive(p: &str, audio: &str, atmos: bool) -> String {
 ///   branch falls THROUGH into the Dolby Vision tail; there is no DVHE/DVH1 entry in its codec
 ///   table (those literals belong to AdaptivePipeline's RFC-6381 parser, a different pipeline).
 ///   LG's own Chromium client also reports `codec.video = "H265"` for a Dolby Vision stream. The
-///   `video == "H265"` guard below is therefore a consistency check, not a translation.
+///   codec guard below is therefore a consistency check, not a translation. It also admits
+///   `"AV1"` (Profile 10) with the codec string unchanged likewise; that the AV1 branch reaches
+///   the same tail is measured on a webOS 6 set, not decompiled
+///   ([`plx_data::metadata::Dovi::presentation`]).
 /// - **`profileId` must be a JSON integer** (`getInt`). Quoting it would leave the `-1` sentinel.
 /// - **the library's injected platform metadata is not a safety gate.** libplayerAPIs injects
 ///   `platformSupportDolbyVision` / `supportDolbyTVATMOS` at the root, but libpf enables DV from
@@ -912,13 +1518,13 @@ fn with_dolby_hdr_info(p: &str, video: &str, dv: plx_data::metadata::DvPresentat
         ));
         return p.to_string();
     }
-    if video != "H265" {
+    if video != "H265" && video != "AV1" {
         // Unreachable by construction — `route` records the DV layering on the direct-play branch
-        // only, and that branch's payload codec is the file's own hevc — so this is the guard that
-        // says so out loud rather than declaring Dolby Vision over an H264 elementary stream. A
-        // malformed sourceInfo does not fail loudly; it wedges the sink.
+        // only, and that branch's payload codec is the file's own hevc or av1 — so this is the
+        // guard that says so out loud rather than declaring Dolby Vision over an H264 elementary
+        // stream. A malformed sourceInfo does not fail loudly; it wedges the sink.
         log(&format!(
-            "dv: DolbyHdrInfo P{} NOT sent — payload video codec is {video}, not H265",
+            "dv: DolbyHdrInfo P{} NOT sent — payload video codec is {video}, not H265 or AV1",
             n.profile_id
         ));
         return p.to_string();
@@ -1001,6 +1607,26 @@ fn with_window_id(mt: &MainThread, p: &str) -> String {
 
 /// Plex decimal fps → (value, scale) rational for the Load esInfo. Broadcast rates map to their
 /// exact NTSC/film ratios; integer rates to n/1; anything else to milli-fps. None if fps is unknown.
+/// The frame rate the pipeline is actually FED: at a playback speed every frame is fed, `rate`
+/// times closer together (`player::to_sink_ns`), so a 30p film at 2x arrives at 60. What the Load
+/// declares (the envelope's `maxFrameRate`, `videoFpsValue`/`videoFpsScale`) must be this, not the
+/// file's: newer sets allocate the decoder against the declaration.
+fn fed_fps(fps: f64, rate_permille: i32) -> f64 {
+    fps * rate_permille as f64 / 1000.0
+}
+
+/// [`fps_rational`] of the fed rate, scaled exactly: 24000/1001 at 1.5x is 36000/1001.
+fn fed_fps_rational(fps: f64, rate_permille: i32) -> Option<(i64, i64)> {
+    let (num, den) = fps_rational(fps)?;
+    let (num, den) = (num * rate_permille as i64, den * 1000);
+    let g = gcd(num, den);
+    Some((num / g, den / g))
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a.abs().max(1) } else { gcd(b, a % b) }
+}
+
 fn fps_rational(fps: f64) -> Option<(i64, i64)> {
     if fps <= 0.0 {
         return None;
@@ -1029,11 +1655,15 @@ fn fps_rational(fps: f64) -> Option<(i64, i64)> {
 pub enum BufferfeedStartOutcome {
     AlreadyRunning,
     Launched(crate::route::RouteStartAttempt),
+    /// The previous object's `Unload` is still running: the start is queued in the release
+    /// machine and runs the frame its tail has run (or fails typed at the deadline). Accepted:
+    /// the route stays on the Player and the HUD shows Connecting.
+    Deferred,
     Failed,
 }
 
 impl BufferfeedStartOutcome {
-    fn accepted(self) -> bool {
+    pub fn accepted(self) -> bool {
         !matches!(self, Self::Failed)
     }
 }
@@ -1056,7 +1686,28 @@ pub fn start_bufferfeed_tracked(ps: &mut crate::route::PlaybackSession, pa: &mut
         return BufferfeedStartOutcome::Failed;
     }
     ps.jail_load_blocked = false;
-    ps.native_start_refused = false;
+    ps.native_start_refused = None;
+    // A fresh play (not a `reload_at`, which reaches `start_bufferfeed_for` directly) is a new
+    // playback: it gets to try the native Seek again.
+    if pa.engine().is_none() {
+        super::set_native_seek_refused(false);
+    }
+    // A URI-mode probe session (dev trigger `plxnative-uriprobe`) holds the route-start attempt and
+    // the exported window without an Engine in the slot. Active double-start stays a no-op;
+    // closing or quarantined ownership refuses a new start until actual release.
+    #[cfg(feature = "devtriggers")]
+    if pa.uri_live() {
+        log("start_bufferfeed: a URI-mode registration still owns its resources");
+        if pa.uri_closing() {
+            if let Some(existing) = pa.uri_attempt() {
+                if let crate::route::LiveEngineStartRelation::Conflict(transaction) = crate::route::classify_live_engine_start(existing) {
+                    let _ = crate::route::abort_route_start(transaction, crate::route::RouteStartResult::StartFailed);
+                }
+            }
+            return BufferfeedStartOutcome::Failed;
+        }
+        return BufferfeedStartOutcome::AlreadyRunning;
+    }
     if let Some(existing) = pa.engine().map(|engine| engine.route_start) {
         match crate::route::classify_live_engine_start(existing) {
             crate::route::LiveEngineStartRelation::CurrentAttempt => {
@@ -1092,7 +1743,7 @@ pub fn start_bufferfeed_tracked(ps: &mut crate::route::PlaybackSession, pa: &mut
     // why the player is empty. Record it where `player::state` derives the read-out from; the start
     // itself stays refused.
     if outcome == BufferfeedStartOutcome::Failed && pa.has_abandoned_load() {
-        ps.native_start_refused = true;
+        ps.native_start_refused = Some(crate::route::StartRefusal::LoadTimeout);
     }
     outcome
 }
@@ -1114,13 +1765,59 @@ fn start_bufferfeed_for(
     pa: &mut super::adapter::PlayerAdapter,
     route_start: crate::route::RouteStartTransaction,
 ) -> BufferfeedStartOutcome {
+    #[cfg(feature = "devtriggers")]
+    if pa.uri_live() {
+        // Reload/foreground starts reach this seam directly too. URI ownership never queues one.
+        let _ = crate::route::abort_route_start(route_start, crate::route::RouteStartResult::StartFailed);
+        return BufferfeedStartOutcome::Failed;
+    }
+    // The last real stop's object may still be inside its off-frame `Unload`. A tail that is ready
+    // runs now; one that is not defers this start into the release machine (never a blocking join:
+    // PLX-NATIVE-1Q), which starts it the frame the tail has run or refuses it at the deadline.
+    if pa.release_busy() {
+        poll_release(ps, pa, std::time::Instant::now());
+    }
+    let mut fx = Vec::new();
+    pa.release_step(
+        &super::release::ReleaseEvent::StartRequested(super::release::QueuedStart { route_start }),
+        &mut fx,
+    );
+    let mut go = false;
+    let mut refused = false;
+    for effect in fx {
+        match effect {
+            super::release::ReleaseEffect::Start(_) => go = true,
+            super::release::ReleaseEffect::RefuseStart(q) => {
+                refuse_start_for_release(ps, q);
+                refused = true;
+            }
+            super::release::ReleaseEffect::AbortSuperseded(q) => {
+                pa.settle_preview_admission(false, false);
+                pa.queued_start_dropped();
+                let _ = crate::route::abort_route_start(q.route_start, crate::route::RouteStartResult::StartFailed);
+            }
+            _ => {}
+        }
+    }
+    if refused {
+        return BufferfeedStartOutcome::Failed;
+    }
+    if !go {
+        log("start_bufferfeed: the previous Unload is still running; start deferred");
+        return BufferfeedStartOutcome::Deferred;
+    }
     match start_bufferfeed_inner(ps, pa, route_start) {
         Ok(attempt) => {
             // Every start funnels through here (fresh, reload and the rollback's reload alike), so
             // the refusal's read-out ends at the first start that is NOT refused. Clearing it only
             // in `start_bufferfeed_tracked` left a reload landing after a refused fresh start
             // (the foreground restore's rollback) with an Error over the video it began.
-            ps.native_start_refused = false;
+            ps.native_start_refused = None;
+            // The request's failed-open ladder rules on this Engine's open too: a Load it did not
+            // ask for (the foreground restore after a Home during a recovery flight or over the
+            // read-out) takes it out of `Flight` or `Failed`. The recovery landing's own reload has
+            // already moved it (`FlightLanded`), so this is a no-op there.
+            let _ = ps.open_recovery().step(&super::recovery::RecoveryEvent::LoadStarted, &mut Vec::new());
             BufferfeedStartOutcome::Launched(attempt)
         }
         Err(result) => {
@@ -1135,6 +1832,8 @@ fn start_bufferfeed_inner(
     pa: &mut super::adapter::PlayerAdapter,
     route_start: crate::route::RouteStartTransaction,
 ) -> Result<crate::route::RouteStartAttempt, crate::route::RouteStartResult> {
+    // The previous object's release is finished or the start was deferred before this point
+    // (`start_bufferfeed_for`), so the epoch is retired and the object destroyed already.
     // A timed-out Load from an earlier Engine may still own the one native object the C seam
     // holds. Release it now if it has returned; otherwise refuse before anything below (the
     // exported window in particular) can touch state that object is still using.
@@ -1153,6 +1852,7 @@ fn start_bufferfeed_inner(
     ATOT.store(0, Ordering::Relaxed);
     VATT.store(0, Ordering::Relaxed);
     AATT.store(0, Ordering::Relaxed);
+    super::native_stall::reset();
     // resolve the URL, in precedence order: route (a selected movie) wins, then
     // /tmp/plxnative-playurl (a URL + its declaration), then /tmp/plxnative-url (a URL
     // alone), then a local sample.
@@ -1255,12 +1955,37 @@ fn start_bufferfeed_inner(
         return Err(crate::route::RouteStartResult::StartFailed);
     }
     let stream = sample.is_none();
+    // dev: /tmp/plxnative-uriprobe — play this URL through `com.webos.media` (URI mode) instead of
+    // building an Engine, to learn what webOS 5+ does with it (issue #1064). Taken AFTER the route
+    // is prepared and BEFORE anything native is touched (the clock and session guards, the exported
+    // window, the payload), and never for a preview or a local sample: the probe needs a real stream
+    // URL and the foreground play which owns the screen. The content names the variant; text which
+    // names none leaves the probe unarmed and the play normal rather than running a variant nobody
+    // asked for.
+    #[cfg(feature = "devtriggers")]
+    if stream && !crate::route::is_preview(ps) {
+        if let Some(text) = plx_base::devtrig::read("uriprobe") {
+            match super::uriprobe::Variant::from_trigger(&text) {
+                Some(variant) => {
+                    // The probe takes no native session of its own, but its window verbs reach the
+                    // same seam, so it refuses like an Engine does while an earlier session still
+                    // owns the object (a parked timed-out Load): the tester plays again.
+                    if NativeSessionStartGuard::arm().is_none() {
+                        log("uriprobe: the native object is still owned by an earlier session: probe NOT started");
+                        return Err(crate::route::RouteStartResult::StartFailed);
+                    }
+                    return super::uriprobe_drive::start(ps, pa, route_start, &url, variant);
+                }
+                None => log("uriprobe: the trigger file names no variant (empty, load, late, none or drive): NOT armed, playing normally"),
+            }
+        }
+    }
     // For a streamed direct-play/transcode, pick the Load codecs from the item: video H264 vs
     // H265 (native HEVC direct-play), audio AC3/EAC3/AAC/DTS. (The local sample paths keep their
     // fixed payloads.)
     // dev A/B: /tmp/plxnative-noaudio feeds video only (needAudio:false + skip es=2) to isolate
     // whether the audio ES (E-AC3/Atmos) is what stalls the sink on 4K HEVC.
-    let no_audio = plx_base::devtrig::flag("noaudio");
+    let no_audio = super::no_audio_armed();
     crate::ff::set_feed_audio(!no_audio);
     let stream_payload;
     // Every arm below assigns this — the static payloads through `static_envelope`, the streamed
@@ -1269,25 +1994,37 @@ fn start_bufferfeed_inner(
     // The LG-side audio name the payload ended up carrying, hoisted so the `load:` line below can
     // report it. "-" is the video-only case, where there is no audio ES to name.
     let mut audio_declared: &str = "-";
+    // ...and the plan for the sink lead that declaration carries (`load_audio`), none for a
+    // compressed or absent track.
+    let mut audio_lead = PcmLead::Off;
     // ...and the video name beside it, for the same reason and to keep the codec->name mapping
     // written ONCE (`LoadVideo`): the `load:` line below would otherwise re-read the route and
     // re-derive it.
     let mut video_declared: &str = "-";
+    // Playback speed for THIS Load (`player::session_rate_for`), published before the demuxer is
+    // spawned: it reads it to decide whether to decode the audio, and every timestamp crossing to
+    // the pipeline is scaled by it (`player::to_sink_ns`). After any `reset_session`, which puts
+    // it back to 1x.
+    let session_rate = if stream { super::session_rate_for(ps) } else { super::RATE_NORMAL };
+    SHARED.applied_rate_permille.store(session_rate, Ordering::Relaxed);
+    if session_rate != super::RATE_NORMAL {
+        log(&format!("speed: this Load plays at {session_rate} (audio decoded in the app, fed as PCM)"));
+    }
     let payload_str: &str = if stream {
         let stream_vcodec = crate::route::stream_vcodec(ps);
         let Some(lv) = LoadVideo::of_stream(&stream_vcodec) else {
             log(&format!(
                 "start_bufferfeed: the pipeline cannot feed video codec {stream_vcodec:?}; refusing the Load instead of declaring it H.264"
             ));
-            SHARED.demux_failed.store(true, Ordering::Release);
+            SHARED.fail_demux(DemuxExitClass::LoadRefused);
             return Err(crate::route::RouteStartResult::StartFailed);
         };
-        if load_video_refused(lv, plx_platform::devcaps::caps()) {
+        if load_video_refused(lv, &plx_platform::devcaps::caps()) {
             log(&format!(
                 "start_bufferfeed: {} stream but the device table lists no such decoder; refusing the Load",
                 lv.payload_name()
             ));
-            SHARED.demux_failed.store(true, Ordering::Release);
+            SHARED.fail_demux(DemuxExitClass::LoadRefused);
             return Err(crate::route::RouteStartResult::StartFailed);
         }
         video_declared = lv.payload_name();
@@ -1311,13 +2048,49 @@ fn start_bufferfeed_inner(
             // wrong string leaves the audio ES unconfigured, and with audioSync the video
             // sink slaves to the dead audio clock and stalls (verified: video-only plays).
             let codec = crate::route::stream_acodec(ps);
-            let Some((ac, diagnostic)) = audio_payload_codec(&codec) else {
+            // App-decoded audio: the Load must state the PCM shape, and the demuxer must produce
+            // exactly that. Missing facts refuse the Load — a guessed rate plays at the wrong pitch.
+            let pcm = match app_pcm_for_rate(session_rate, crate::route::stream_pcm(ps)) {
+                Some(Ok(f)) => Some(f),
+                Some(Err(why)) => {
+                    log(&format!("start_bufferfeed: PCM audio refused — {why}"));
+                    SHARED.demux_failed.store(true, Ordering::Release);
+                    return Err(crate::route::RouteStartResult::StartFailed);
+                }
+                None => None,
+            };
+            // Dev trigger `pcmavoffset=<ms>` (debug builds, read per Load): how the lead is measured
+            // on an output the default was not filmed on.
+            let lead_override = plx_base::devtrig::read("pcmavoffset");
+            let Some(audio) = load_audio(
+                &codec, session_rate, pcm.as_ref(), lead_override.as_deref(), plx_platform::devcaps::audio_stack(),
+            ) else {
                 log(&format!("start_bufferfeed: unsupported audio codec {codec:?}; refusing incorrect Load declaration"));
-                SHARED.demux_failed.store(true, Ordering::Release);
+                SHARED.fail_demux(DemuxExitClass::LoadRefused);
                 return Err(crate::route::RouteStartResult::StartFailed);
             };
-            SHARED.dg_load_a.store(diagnostic, Ordering::Relaxed);
+            crate::ff::set_pcm_out(
+                pcm.map(|f| crate::ff_pcm::PcmOut {
+                    rate: f.sample_rate, bits: f.bits, channels: f.channels, source_rate: f.source_rate,
+                }),
+                pcm.is_some() && crate::route::stream_pcm_is_lossy(ps),
+            );
+            if let Some(f) = pcm {
+                log(&pcm_decode_line(&codec, &f));
+            }
+            SHARED.dg_load_a.store(audio.diagnostic, Ordering::Relaxed);
+            // App-decoded audio (`pcm`) and a speed session (`ff::SpeedDecoder`) both declare PCM;
+            // `load_audio` has already put that into the declared name and the lead plan with it.
+            let ac = audio.name;
             audio_declared = ac;
+            audio_lead = audio.lead;
+            // A lead that follows the sound output is read and logged by the Load thread, which may
+            // block on the bus (`resolve` asks nothing for the other plans); the dev override, a
+            // stack whose lead is the same on every output (`Fixed`) and a stack with no lead
+            // (`NoLead`) are settled here and say so now.
+            if let Some(line) = audio_lead.start_log_line() {
+                log(&line);
+            }
             // The sink envelope — `adaptiveStreaming`'s maxWidth/maxHeight/maxFrameRate — used
             // to be the panel max (4K60) for every codec and every source, on the reasoning that
             // the pipeline reads the true dims from the SPS and the block is "just a ceiling".
@@ -1329,7 +2102,19 @@ fn start_bufferfeed_inner(
             // path and is false here for every streamed HEVC playback (device-measured 2026-09-03:
             // three HEVC cells declared FHD before this read the right flag).
             sink_env = sink_envelope_now(ps, lv);
-            stream_payload = build_av_payload(ps, lv.payload_name(), ac, sink_env);
+            let av = build_av_payload(ps, lv.payload_name(), ac, sink_env);
+            stream_payload = if ac == "OPUS" {
+                let channels = crate::route::stream_achannels(ps);
+                let Some(p) = with_opus_info(&av, channels) else {
+                    log(&format!("start_bufferfeed: no Opus layout for {channels} channel(s); refusing the Load"));
+                    SHARED.demux_failed.store(true, Ordering::Release);
+                    return Err(crate::route::RouteStartResult::StartFailed);
+                };
+                log(&format!("start_bufferfeed: opusInfo channels={channels}"));
+                p
+            } else {
+                av
+            };
             &stream_payload
         }
     } else if is_h265 {
@@ -1445,7 +2230,10 @@ fn start_bufferfeed_inner(
             let acodec = crate::route::stream_acodec(ps);
             let abr = crate::route::hls_abr_control(ps);
             let auto_original = crate::route::auto_original_watch(ps);
-            SHARED.side_subs_owner.store(side_target.is_some(), Ordering::Release);
+            // Before the demuxer exists, so what it publishes is this session's.
+            crate::ff::native_audio::reset();
+            // A clock-only reader (a sidecar) reads no subtitle: the demuxer keeps what it enumerates.
+            SHARED.side_subs_owner.store(side_target.as_ref().is_some_and(|t| !t.clock_only()), Ordering::Release);
             stream_th = plx_base::task::spawn_off_frame_keeping("demux", move |off| {
                 crate::ff::demux(off, origin, path, acodec, abr, auto_original, aqp, aqap, hsp)
             });
@@ -1469,7 +2257,7 @@ fn start_bufferfeed_inner(
     let payload_ptr = threads::SendPtr(payload_c.as_ptr() as *mut c_char);
     let native_epoch = native_start.epoch();
     let load_th = plx_base::task::spawn("media", move || {
-        threads::load_thread(payload_ptr, native_epoch, Some(route_attempt))
+        threads::load_thread(payload_ptr, native_epoch, Some(route_attempt), audio_lead)
     });
     if load_th.is_none() {
         // Without the media thread nothing is ever Loaded and nothing drains the AU queues, so the
@@ -1518,11 +2306,13 @@ fn start_bufferfeed_inner(
         None
     };
 
+    let (lead_at_start, lead_pending) = audio_lead.at_engine_start();
     let eng = Engine {
         route_start: route_attempt,
         native_epoch,
         stage: Stage::Loading,
         video_info_sent: false,
+        bound_at_frames: None,
         placed_src: (0, 0),
         eos_pushed: false,
         // if a seek is armed for the FIRST open (resume, or reload_at), rebase the first
@@ -1538,6 +2328,8 @@ fn start_bufferfeed_inner(
         max_fed_video_pts: 0,
         max_fed_audio_pts: 0,
         audio_start_fp: None,
+        pcm_sink_lead_ns: lead_at_start,
+        pcm_lead_pending: lead_pending,
         feed_pace: FeedPace::default(),
         seek_base_pts: 0,
         prime_play: false,
@@ -1553,41 +2345,22 @@ fn start_bufferfeed_inner(
         report_th,
         report_stop: Some(report_stop),
         preview_abandon: false,
+        foreground_follows_load: false,
+        era_watch: super::era_callbacks::Watch::new(),
     };
-    // Re-arm the in-place-seek probe for this session. `feed_stream` clears it when
-    // `sf_send_segment` can't reach the pipeline, and that is a fact about the StarfishMediaAPIs
-    // object — which `sf_load` constructs and teardown's `sf_destroy` destructs, once per session
-    // — not about the TV (see the SCOPE note on INPLACE_SEEK_OK in mod.rs). Left latched for the
-    // process, one teardown-window race silently turned every subsequent seek, of every
-    // subsequent item, into a full reload for the rest of the app's life. Placed HERE rather than
-    // at the top of this function on purpose: the `engine_is_live` no-op return above must NOT
-    // re-arm, or a stray PLAY landing mid-session would cancel a fallback that is still needed.
-    //
-    // NOT re-armed on webOS 5+. In-place seek reaches the pipeline through two decompile-derived
-    // offsets into LG-private C++ objects — `StarfishMediaAPIs::player` at object+0x4c, then
-    // `AbstractPlayer::pipeline` at +0x04 (src/starfish.c's sf_pipeline), plus
-    // MEDIA_CUSTOM_CONTENT_INFO's ptsToDecode at +0x28. Every one of those was read off a
-    // webOS 4.5 binary with a disassembler, and nothing in a symbol table can confirm them on
-    // another firmware: a field added to StarfishMediaAPIs by any 5.x build moves +0x4c and the
-    // very next seek dereferences whatever now lives there. The reload fallback is slower but is
-    // built out of Load/Play alone and assumes no layout at all. Re-enable per release only once
-    // somebody has re-derived the offsets on that firmware.
-    //
-    // NOR when the library is the pre-C++11 build (`inplace_layout_known`): its StarfishMediaAPIs
-    // is a different object from the 4.5 one, and the first fast-forward on a 3.4.0 set crashed
-    // through these offsets. The old-ABI Feed (`sf_feed_abi_is_cow`) is the direct evidence, and
-    // it covers 3.9.x too. A KNOWN release below 4 is refused as well; an UNKNOWN one
-    // (`major == 0`, os_info unreadable) with the C++11 Feed keeps in-place seek, as before
-    // #578, because that Feed says the library is 4.x or later and the VP_EXPORTED exclusion
-    // below already handles 5+.
-    let layout_known = inplace_layout_known(
-        plx_platform::tv::device::info().major,
-        sink().feed_abi_is_cow(),
-    );
-    super::INPLACE_SEEK_OK.store(
-        layout_known && sink().window_mode() != super::VP_EXPORTED,
-        Ordering::Relaxed,
-    );
+    // Select this session's direct-play seek mode (`SeekMode`, mod.rs, whose SCOPE note argues why
+    // it is per session). `feed_stream` can downgrade it to `Reload` mid-session (the pipeline was
+    // unreachable, or LG refused a `Seek`), and that is a fact about the StarfishMediaAPIs object
+    // — which `sf_load` constructs and teardown's `sf_destroy` destructs, once per session — not
+    // about the TV, so it is re-selected here for every session. Placed HERE rather than at the
+    // top of this function on purpose: the `engine_is_live` no-op return above must NOT re-select,
+    // or a stray PLAY landing mid-session would cancel a downgrade that is still needed.
+    let major = plx_platform::tv::device::info().major;
+    let layout_known = inplace_layout_known(major, sink().feed_abi_is_cow());
+    let old_abi_seek = old_abi_seek_tested(major);
+    let mode = session_seek_mode(layout_known, old_abi_seek, sink().window_mode(), dev_seek_mode());
+    log(&format!("seek mode: {mode:?} (layout_known={layout_known} old_abi_seek={old_abi_seek})"));
+    super::set_seek_mode(mode);
     pa.install(eng);
     native_start.commit();
     clock_start.commit();
@@ -1791,15 +2564,23 @@ fn reload_start_outcome(
 }
 
 /// Start the side subtitle reader for the live remux this engine run plays, drawing the track
-/// the route's target names.
+/// the route's target names (or, for a sidecar, measuring the clock only).
 fn start_side_reader(target: &crate::route::SideReaderTarget) {
+    let clock_only = target.clock_only();
     let started = super::subside::spec_for(target).is_some_and(super::subside::start);
     if !started {
-        log("subside: could not start the reader thread");
+        // One place decides the label and the burn, so the two roles can never drift: a
+        // clock-only reader that cannot start — no client for the running server, or a refused
+        // thread — never raises the failure that rebuilds the stream.
+        super::subside::failed_reading(clock_only, "subside: could not start the reader thread");
+        if clock_only {
+            // The app fetches that subtitle itself and no reader owns it: the sidecar is drawn on
+            // the remux's clock, as it was before the reader measured it.
+            return;
+        }
         // Nothing reads beside the stream: the demuxer must not leave the subtitle to a reader
         // that is not there.
         SHARED.side_subs_owner.store(false, Ordering::Release);
-        super::subside::raise_failure(); // the route falls back to the server's burn
     }
 }
 
@@ -1815,7 +2596,28 @@ fn reload_transcode_start(ps: &mut crate::route::PlaybackSession, pa: &mut super
     Some(start_bufferfeed_for(ps, pa, ticket))
 }
 
+/// Every target `reload_at` was asked for (test probe, #568): proves a refused native Seek reloads
+/// exactly once, at the user's target.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) static RELOAD_AT_LOG: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether the paused-seek preroll was open as each `reload_at` / `reload_transcode` was entered,
+/// before its teardown (test probe): the reload keeps it, so what the fresh session's feed gate and
+/// prime see is whatever the dispatcher left open here.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) static RELOAD_PREROLL_LOG: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "test-support"))]
+fn note_reload_preroll() {
+    RELOAD_PREROLL_LOG.lock().unwrap_or_else(|e| e.into_inner()).push(TX.seek_preroll_active());
+}
+
 pub fn reload_at(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter, target_ns: i64) -> ReloadOutcome {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        RELOAD_AT_LOG.lock().unwrap_or_else(|e| e.into_inner()).push(target_ns);
+        note_reload_preroll();
+    }
     if crate::route::url(ps).is_empty() {
         log("reload_at: no url (ignored)");
         settle_missing_route_start();
@@ -1853,6 +2655,8 @@ pub fn switch_audio_native(ps: &mut crate::route::PlaybackSession, pa: &mut supe
 /// start.mkv is already 0-based at `&offset`, so no av_seek — just set disp_base to the offset.
 /// route::retranscode has already set the URL + session + STREAM_VCODEC=h264 before this call.
 pub fn reload_transcode(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter, offset_ns: i64) -> ReloadOutcome {
+    #[cfg(any(test, feature = "test-support"))]
+    note_reload_preroll();
     if crate::route::url(ps).is_empty() {
         // The other abandonment path with the same hole: `request_seek` armed the spinner and
         // nothing here would ever disarm it. See `player::abandon_seek`.
@@ -1867,7 +2671,9 @@ pub fn reload_transcode(ps: &mut crate::route::PlaybackSession, pa: &mut super::
         // `start_bufferfeed_for` always creates a fresh attempt, but keep the conversion total if
         // that implementation changes.
         Some(BufferfeedStartOutcome::AlreadyRunning) => ReloadOutcome::Started,
-        Some(BufferfeedStartOutcome::Launched(_)) => unreachable!("accepted handled above"),
+        Some(BufferfeedStartOutcome::Launched(_) | BufferfeedStartOutcome::Deferred) => {
+            unreachable!("accepted handled above")
+        }
     }
 }
 
@@ -1884,8 +2690,11 @@ pub fn reload_transcode_tracked(ps: &mut crate::route::PlaybackSession, pa: &mut
     reload_transcode_start(ps, pa, offset_ns).unwrap_or(BufferfeedStartOutcome::Failed)
 }
 
-/// Stop playback: unblock+join threads, unload+destruct the pipeline, release the
-/// video plane, reset all state so a fresh start_bufferfeed() can restart.
+/// Stop playback: unblock+join threads, reset all state so a fresh start_bufferfeed() can
+/// restart, and release the pipeline and the video plane. With a ready object the native Unload is
+/// handed to the `sf-unload` worker and the destroy / plane release finish later in
+/// [`poll_release`] (`PendingRelease`), so the object may still exist when this returns; anything
+/// that needs it gone is queued behind it in the release machine (`Deferred`), never waited for.
 pub fn stop_bufferfeed(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter) {
     teardown(ps, pa, false);
 }
@@ -1896,6 +2705,57 @@ pub fn stop_bufferfeed(ps: &mut crate::route::PlaybackSession, pa: &mut super::a
 /// (begin_resume + start_bufferfeed), the known-good path, instead of resurrecting a stopped session.
 pub fn suspend_bufferfeed(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter) {
     teardown(ps, pa, true);
+}
+
+/// Set where the pump ends an Engine for good under the failure read-out; spent by
+/// [`release_failed_engine`] or by any teardown.
+static FAILED_ENGINE_RELEASE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The pump just failed the Engine for good ([`crate::route::fail_current_engine`] and the Error
+/// state): release it next frame. Armed, not done here, because the pump still holds the Engine.
+pub(super) fn arm_failed_engine_release() {
+    FAILED_ENGINE_RELEASE_ARMED.store(true, Ordering::Release);
+}
+
+/// **A terminal playback error lets go of the pipeline.** The failure read-out stands on the
+/// session, but an Engine left loaded behind it keeps the native pipeline and the video plane,
+/// which the television reads as playback still going: its screensaver never starts.
+///
+/// Releases them the frame after the Engine failed, the same teardown an app switch uses
+/// ([`suspend_bufferfeed`]: the session, URL and transcode session stay, nothing is reported as
+/// stopped). What the read-out and its actions need survives it, in the session: the cause
+/// ([`crate::route::note_engine_failure`], so `state()` and `error_now` still answer) and the
+/// playhead a retry resumes from (the unpresented-resume slot `retry_failed_playback` reads).
+/// Try again, Play automatically and a quality pick start a new playback from scratch, and Back
+/// ends the session with a real stop, so none of them needs the loaded pipeline.
+/// Returns whether an Engine was released.
+pub fn release_failed_engine(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter) -> bool {
+    if !FAILED_ENGINE_RELEASE_ARMED.load(Ordering::Acquire) {
+        return false;
+    }
+    // Armed by an Engine that has since been replaced (an automatic retry started a new playback
+    // in the same frame): not this Engine's end, and nothing left to release.
+    if !pa.is_live() {
+        FAILED_ENGINE_RELEASE_ARMED.store(false, Ordering::Release);
+        return false;
+    }
+    // Not this Engine's end: a preview, one a recovery is still flying for, or one that never put
+    // a picture up (a Load that failed, an open that never produced a frame) and so holds nothing
+    // the television mistakes for playback.
+    if crate::route::is_preview(ps)
+        || SHARED.pb_state.load(Ordering::Relaxed) != super::shared::PlaybackState::Error as u8
+        || SHARED.frames.load(Ordering::Relaxed) == 0
+        || crate::route::recovery_flight_outstanding()
+        || crate::route::engineless_flight_outstanding()
+    {
+        return false;
+    }
+    FAILED_ENGINE_RELEASE_ARMED.store(false, Ordering::Release);
+    let cause = super::live_runtime_failure(ps);
+    crate::route::note_engine_failure(ps, cause, super::intended_pos_ns(ps));
+    log("player: the failed Engine's pipeline is released under the failure read-out");
+    teardown(ps, pa, true);
+    true
 }
 
 /// Retire a failed foreground Engine only if it still owns the exact Load the foreground reducer
@@ -1915,10 +2775,40 @@ pub fn suspend_bufferfeed_if_attempt(
     owns_attempt
 }
 
+/// The foreground lifecycle follows `attempt` (it launched that Load, or took over following it):
+/// from now on the Load call's own synchronous refusal is the lifecycle's to settle
+/// ([`Engine::foreground_follows_load`]). True when the live Engine owns that exact attempt; a
+/// replaced Engine (a different attempt) is not marked.
+pub fn foreground_follows_load(pa: &mut super::adapter::PlayerAdapter, attempt: crate::route::RouteStartAttempt) -> bool {
+    match pa.engine() {
+        Some(engine) if engine.route_start == attempt => {
+            engine.foreground_follows_load = true;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The teardown body. `for_reload` = this is a direct-play seek reload (reload_at), NOT a real
 /// stop: preserve the playback session so start_bufferfeed can restart the SAME item — skip
 /// the "stopped" timeline scrobble, the server transcode stop, and the URL clear.
 fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::PlayerAdapter, for_reload: bool) {
+    FAILED_ENGINE_RELEASE_ARMED.store(false, Ordering::Release);
+    // A URI-mode probe session (dev trigger `plxnative-uriprobe`) ends with the playback it stands
+    // in for, whatever ended it (Back, an app switch, the next Play): its machine settles a start
+    // still pending and requests unload/close; the adapter retains its window until release. It owns no Engine, so the
+    // Engine-less ritual below then finishes the stop (the transcode session, the route) as it does
+    // for a start which failed before an Engine existed.
+    #[cfg(feature = "devtriggers")]
+    super::uriprobe_drive::stop(ps, pa);
+    // A start still queued behind the previous object's `Unload` is the playback this stop ends.
+    // Always sent: the machine owns whether anything is queued (a no-op otherwise), and no copy of
+    // that fact in the session can go stale across a landing that replaced the session.
+    {
+        let mut fx = Vec::new();
+        pa.release_step(&super::release::ReleaseEvent::CancelQueued, &mut fx);
+        let _ = run_release_effects(ps, pa, fx, None, false);
+    }
     // A prepared route whose native start failed has no Engine but still owns its exact PMS
     // resource and Session projection. A real stop must retire that ownership exactly once;
     // returning here used to leak the candidate forever while the reducer remained Failed.
@@ -1931,7 +2821,18 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
             crate::route::begin_engine_teardown(true);
         }
         if !for_reload {
-            crate::route::scrobble_stop(ps, None, None);
+            // A real stop under the failure read-out whose Engine was released
+            // ([`release_failed_engine`]) ends the playback the Engine would have ended: the
+            // position it stopped at is the one the server keeps.
+            let mut final_report = None;
+            if crate::route::engine_failure(ps).is_some() {
+                let dur = SHARED.duration_ns.load(Ordering::Relaxed);
+                let pos = crate::route::unpresented_resume_ns(ps);
+                crate::player::report::ended(ps, pos, dur);
+                let rk = crate::route::cur_rk(ps);
+                final_report = (!rk.is_empty() && dur > 0).then(|| (rk, pos / 1_000_000, dur / 1_000_000));
+            }
+            crate::route::scrobble_stop(ps, final_report, None);
             crate::route::begin_engine_teardown(false);
             crate::route::drop_original_recovery(ps);
             crate::route::clear_url(ps);
@@ -1961,6 +2862,8 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
     // Revoke every worker ticket before asking those workers to stop. This is the synchronization
     // boundary that makes a late HLS candidate/fallback an ordinary stale event instead of a
     // mutation of the route the next Load is about to own.
+    let mut sp = TeardownSpans::new();
+    let mut unload_th = None;
     crate::route::begin_engine_teardown(for_reload);
     SHARED.stop_hls_clock();
     let mut eng = pa.take().expect("main-thread live check and take are one transaction");
@@ -1998,7 +2901,9 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
 
     // The side subtitle reader first: it reads the original Part over its own transport and must
     // be gone (its socket shut, its cues cleared) before the demux it was paired with is joined.
+    sp.mark("begin");
     super::subside::stop(if for_reload { "reload" } else { "stop" });
+    sp.mark("subside");
     // 1. unblock every thread (abort queues, close the demux socket)
     if let Some(st) = eng.report_stop.take() {
         st.stop(); // this reporter's own signal — unaffected by the reset_session below
@@ -2025,12 +2930,14 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         // doc explains why the handle lives in a registry rather than being passed up to here.
         crate::curlio::abort_active();
     }
+    sp.mark("unblock");
     // 2. JOIN every worker before freeing anything they hold raw ptrs into
     // Through `task::join` so a stall leaves a number behind: this is the main thread, and every
     // teardown freeze the engine has had was one of these three.
     if let Some(t) = eng.stream_th.take() {
         plx_base::task::join("demux", t);
     }
+    sp.mark("join_demux");
     // A Load the D.1.4 budget already gave up on, still inside `sf_load`: do NOT join it here.
     // This is the main thread, and on the set where the budget fires the call may never return —
     // BACK from the timeout read-out used to freeze the app on this line. The native object is
@@ -2045,6 +2952,7 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         }
         None => None,
     };
+    sp.mark("join_media");
     // 2b. every reader is now joined, so this thread is the sole owner: do the real close.
     // (Before the join it could only shutdown — see step 1.)
     if stream {
@@ -2069,9 +2977,11 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
     // one that could park). Safe to outlive the Engine: the reporter owns `ReportStop` and a
     // `TimelineLease`, samples only SHARED clock state, and the route reducer revalidates the lease
     // before each network effect.
+    sp.mark("http_close");
     if !for_reload {
         crate::route::scrobble_stop(ps, final_report, eng.report_th.take());
     }
+    sp.mark("scrobble");
     // 3. Release the native object (see `release_native_object` for the proof chain), unless its
     // Load is still in flight — then hand it, its thread and its payload to the adapter.
     if let Some(load_th) = abandoned_load {
@@ -2092,8 +3002,10 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
             _payload: std::mem::take(&mut eng.payload),
             abandoned_at: std::time::Instant::now(),
         });
+    } else if !for_reload {
+        unload_th = release_off_frame(pa.mt(), eng.native_epoch, &mut sp);
     } else {
-        release_native_object(pa.mt(), eng.native_epoch);
+        release_native_object_timed(pa.mt(), eng.native_epoch, &mut sp);
     }
     // 4. drain + destroy both queues (drain_aq also clears both pendings)
     if stream {
@@ -2105,12 +3017,13 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
             crate::aq::aq_destroy(&mut **q);
         }
     }
+    sp.mark("drain_aq");
     // 5. reset shared + transport. On a real stop also stop the server transcode + clear the
     // URL; on a reload KEEP them so start_bufferfeed restarts the same item (a direct-play
     // reload has no transcode session anyway, so the skip only matters for the URL).
     // The DURATION is a fact about the FILE, and a reload plays the same file: keep it across
     // the reset so the playbar has a denominator while the demuxer reopens. Without this every
-    // reload-based seek — which on webOS 5+ is EVERY seek, in-place being disabled there — drew
+    // reload-based seek (a refused native Seek, a speed seek, a transcode seek) drew
     // the playhead at position ÷ 0, i.e. the far left, for the few hundred ms until `ff.rs`
     // re-published it, while the clock beside it (position alone, seeded by `arm_seek`) read
     // correctly. Reported on an LG C3 (webOS 23). A real stop still zeroes it: the next item is
@@ -2144,14 +3057,32 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
         // the next session — which is exactly what the shared flag could not guarantee.
         drop(t);
     }
-    // Every worker `begin_engine_teardown` fenced is joined, the native object is retired and the
-    // URL is gone: the stop is COMPLETE, so retire the fence too. A reload keeps its own phase
+    // Every worker `begin_engine_teardown` fenced is joined and the URL is gone: the stop is
+    // COMPLETE as far as the route is concerned, so retire the fence too. The native object may
+    // still be inside its off-frame `Unload`; that is the adapter's fence (`PendingRelease`), not
+    // the route's, and every native start finishes it first. A reload keeps its own phase
     // (`Prepared`/`OriginalTrial`), which is the transaction the caller is about to start.
     if !for_reload {
         crate::route::finish_engine_teardown();
     }
-    log("stop_bufferfeed: torn down");
-    // Engine (hs/aq boxes, payload) drops here — after all joins
+    sp.mark("reset");
+    sp.emit(if for_reload { "reload" } else { "stop" });
+    match unload_th {
+        Some(unload_th) => {
+            log(&format!(
+                "stop_bufferfeed: torn down (native Unload epoch={} continues off-frame)",
+                eng.native_epoch,
+            ));
+            pa.park_release(PendingRelease {
+                epoch: eng.native_epoch,
+                unload_th: Some(unload_th),
+                handed_off_at: std::time::Instant::now(),
+                _engine: eng,
+            });
+        }
+        // Engine (hs/aq boxes, payload) drops here — after all joins
+        None => log("stop_bufferfeed: torn down"),
+    }
 }
 
 /// free every queued AU + the held pending one, BOTH lanes (seek + teardown).
@@ -2187,14 +3118,14 @@ const PRIME_NS: i64 = 700_000_000;
 // start anyway once video buffers PRIME_VIDEO_MAX_NS without audio (audioless / briefly starved),
 // so a genuinely audioless region can't hang.
 const PRIME_AUDIO_NS: i64 = 300_000_000;
-const PRIME_VIDEO_MAX_NS: i64 = 2_500_000_000;
+pub(crate) const PRIME_VIDEO_MAX_NS: i64 = 2_500_000_000;
 // Feed-ahead throttle (Kodi-parity): keep the VIDEO lane at most this far ahead of the presented
 // position (SHARED.pres_fed) instead of feeding greedily to BufferFull. Bounding the buffer to
 // ~1.6s (was ~10-20s: aq 6MB + the pipeline's own ~8MB) makes seeks flush far less, keeps the
 // clock from running ahead, and cuts latency. AUDIO gets a looser bound so it can ride slightly
 // ahead (audio buffer is cheap and it's the master clock) without unbounded race on odd muxes.
 pub(crate) const MAX_FEED_AHEAD_NS: i64 = 1_600_000_000;
-const AUDIO_SLACK_NS: i64 = 2_000_000_000;
+pub(crate) const AUDIO_SLACK_NS: i64 = 2_000_000_000;
 // A fed pts this far below a lane's high-water is a stale pre-seek AU (past the B-frame reorder
 // distance) → drop it rather than feed a backward jump.
 const STALE_BACKJUMP_NS: i64 = 2_000_000_000;
@@ -2268,6 +3199,14 @@ impl FeedPace {
     /// The position to throttle against at `now_ms`, given the current raw `pres_fed`.
     /// [`PRES_NONE`] passes through untouched (feed freely) and forgets the last report.
     pub fn reference(&mut self, pres: i64, now_ms: u32) -> i64 {
+        self.reference_at(pres, now_ms, super::RATE_NORMAL)
+    }
+
+    /// [`Self::reference`] for a pipeline playing at `rate_permille` (1500 = 1.5x): between two
+    /// reports the playhead moves that much media per wall-clock ms, so the run-on scales with it.
+    /// Run on at 1x under a faster pipeline, the estimate would trail the real playhead and the
+    /// lane would feed less lead than the throttle means to keep.
+    pub fn reference_at(&mut self, pres: i64, now_ms: u32, rate_permille: i32) -> i64 {
         if pres == PRES_NONE {
             self.last = None;
             return pres;
@@ -2280,7 +3219,7 @@ impl FeedPace {
             }
         };
         let run_on = now_ms.saturating_sub(at).min(FEED_PACE_CAP_MS) as i64;
-        pres.saturating_add(run_on * 1_000_000)
+        pres.saturating_add(run_on * 1_000 * i64::from(rate_permille.max(0)))
     }
 }
 
@@ -2449,6 +3388,11 @@ impl FeedSlice {
 /// `/tmp/plxnative-ptsnudge=<ns>` is kept because it is the instrument that produced that result
 /// and the next candidate value is one run away. Anything from 1 to ~11110 is in range; beyond
 /// that an already-correct frame is pushed a tick the other way.
+///
+/// It is also how the PCM lead (#1086) was first measured: `ptsnudge=-390000000` (the VIDEO 390 ms
+/// earlier) read -0.017 to -0.041 s on a PCM Load, against -0.377 s with no correction. The correction
+/// ships on the audio side instead ([`PCM_SINK_LEAD_NS`]), so the two are not to be combined in a
+/// run: the video's would be taken twice.
 fn pts_nudge_ns() -> i64 {
     const DEFAULT: i64 = -1;
     static NUDGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
@@ -2468,6 +3412,303 @@ fn pts_nudge_ns() -> i64 {
         ));
     }
     v
+}
+
+/// How much later than the picture an app-decoded audio unit is stamped for the sink, in
+/// nanoseconds, on LG's audio stacks when the sound output is not one that was filmed: 400 ms. The
+/// set plays a Load that declares `"audio":"PCM"` through a `PCMMC` mixer channel instead of its
+/// `ADEC` decoder (libplayerAPIs `allocateResource`, libpf's resource manager), and LG's renderer
+/// applies its DSP lip-sync stage to the hardware decoder and not to a mixer channel. That stage holds
+/// the decoder path back by an offset that a PCM Load never is; this lead gives it the same.
+///
+/// **Where it applies** ([`plx_platform::devcaps::audio_stack`], fingerprinted by the sink plugin; the
+/// table is [`pcm_output_lead`]). Everything below is firmware read by hand and by decompile passes
+/// (OTA IDs and releases named), never pasted; ONLY the dev set was filmed.
+///
+/// | Stack | Sets | Effective lip-sync offset | Per-output part |
+/// |---|---|---|---|
+/// | `liblxa` | 2019-2021 LG chips (dev set W19H 4.10.2), 2022/23 OLEDs before webOS 11 (inferred from the `tools/fwcompat.py` inventories, not from an image read) | 4.5: 505 with a +105 app bias = 400 (MEASURED); W21O 6.5.3: template 400 raw, no +105, effective 400 by the same convention | wireless 150 => Bluetooth 250 (MEASURED) |
+/// | `lgaudiosink` | 2022/23 OLEDs on webOS 11 (W22O 11.2.0-74, W23O 11.2.0-3711), 2024 (W24G 9.2.4), 2025 (W25G 10.3.1) | template `{150,150,400,5000,5000}`, 400 raw, no bias | none: 400 on every output |
+/// | `audiosink_new` | 2018 (OLED C8 W18O, LCD SK8500 W18H, 4.4.3) | `libkadaptor` default 475 with a +75 app bias = 400 (4.5 inherits it), hand-verified | decoder-only -150 for a wireless output (decompile only) => Bluetooth 250 |
+/// | `adecsink` | 2016 (W16M 3.4.3, element `audio_sink`), 2017 (W17H 3.9.2, element `adecsink`) | 2016: default 550, AUTO/mixer rule not in the plugin (not determined). 2017: default 442/472 ms, bias unknown, so differential and DSP bias cannot be split | 2017: decoder only, -100 DD / -150 wireless (a measurement must be per output); 2016: none found |
+/// | `other` | Realtek, MStar | their lip sync is NOT decoder-only: no mixer-off rule | none |
+///
+/// The rule behind the lead is that lip-sync mode AUTO turns the DSP stage ON for the decoder and OFF
+/// for a mixer channel, found in `liblxa`'s `lxao_play`, in 2018's `libkadaptor` `Media_Render_Play`
+/// (AUTO plus a mixer channel: `EnableLipsync(fd, 0)`) and, with the renderer compiled into the sink and
+/// renamed `lgao_*`, in `libgstlgaudiosink.so`. A stack that gets no lead is one where that rule was not
+/// found or its constants cannot be separated: Realtek (`rtkalsasink`) and MStar (`omxaudiosink`) have
+/// no mixer-off rule (their lip sync is not decoder-only), Realtek Bluetooth is not determined, and
+/// MStar may be up to about 128 ms early (its SoC delay floor), which is not "stays right". A set with
+/// no lead (`adecsink` on 2016/2017, not determined; Realtek; MStar; an unknown stack) gets NO lead
+/// (the behaviour before #1087, 0 ms), because if its PCM path was already in step, 400 ms makes it
+/// 0.4 s late. `pcmavoffset` is how such a chip gets measured, and it wins on any stack.
+///
+/// **`lgaudiosink`: 400 ms on every output, Bluetooth included, no output read.** The offset is the
+/// template's 400 raw (webOS 4.5 had 505 with +105; webOS 11 dropped both), and the sink's own 475 ms
+/// render delay is applied on both paths and cancels. libpf's `CustomPipeline` never sets the sink's
+/// `lipsync` property: CONFIRMED on webOS 11 (in W22O libpf every cross-reference of the string is
+/// inside `GenericPipeline::deepElementAddedCallback`). That the per-output table
+/// (`LIPSYNC_OFFSET_VALUES`) is unreferenced is checked in part, not proven: on W22O it has no
+/// relocation and no `movw`/`movt` pair for its address and its getter `lgao_get_delay` has no direct
+/// call site (W24G the same); a pc-relative reference was not ruled out. If it were read after all,
+/// Bluetooth would need 250 as on `liblxa` and this gives it 400, about 150 ms late. Per-output
+/// adjustment moved to the VIDEO plane (avSync keys by `soundOutput`), which moves both paths equally.
+///
+/// **The one link NOT proven on webOS 11: the `audio-port` value the `PCMMC` resource reaches the sink
+/// with.** The sink's rule is `audio-port == -1` and `mixer-port >= 0` => mixer path. In W22O
+/// libplayerAPIs `acquireResources` retypes the ADEC entry to `"PCMMC"` in place and libpf
+/// `CustomPipeline::setResource` forwards ports verbatim, so the decision and the sink's rule are the
+/// same as on 4.5, where the measurement shows the mixer path; the literal value was not read. If the
+/// port were 0 or 1 the sink would stay off the mixer path, AUTO would resolve to ON, app PCM would
+/// get the decoder's own 400 ms and be in step, and this lead would make it 0.4 s late. Settled on a
+/// set by the sink's own log: `mixer mode changing %s -> %s` and `mixer-port is %d`.
+///
+/// **`liblxa` on newer firmware** (2021 OLED, 6.5.3): the template is 400 raw with no +105 (effective
+/// 400 by the same convention) and its per-output table walk is still there; that the mixer channel is
+/// forced to type PCM (0) there was hand-verified on 4.5 only.
+///
+/// The lead is the mechanism and playback stays straight and lossless: re-encoding to a codec the set
+/// decodes itself (which would make the set's own compensation apply) was considered and not taken.
+///
+/// On `liblxa` and a TV-speaker output that is the whole story. On any other output the set also
+/// advances its OWN decoder's audio by a per-output delay that a mixer channel never gets (liblxa's
+/// `_lxao_find_lipsync_output_type`, read as reasoning and not copied: wireless 150 ms, Dolby
+/// bitstream 160, Atmos 170, DTS 160, WISA 100, ES 30), so the right lead is 400 ms minus the
+/// active output's delay. [`PCM_LEAD_BY_OUTPUT`] holds the outputs that were filmed; this is what
+/// every other output on `liblxa`, and no answer from the settings service, keeps. 2018's
+/// `audiosink_new` is read the same way (all cells not measured); `lgaudiosink` has no such part.
+///
+/// Filmed ON THE DEV SET ONLY (a `liblxa` set, webOS 4.10.2; flash and beep every 2.5 s, offset = beep minus flash,
+/// negative = audio early, FLAC clip): TV speakers, no correction -0.377 s; 330 ms -0.089; 390 ms
+/// +0.047 (24 fps camera); 400 ms -0.026 to -0.028 (30 fps), and in a later run -0.03 to +0.08; the
+/// set's own decoder on a DTS clip -0.02. Bluetooth headphones (`bt_soundbar`), earcup against the
+/// phone's microphone: 400 ms +0.13 to +0.19 s late; 250 ms +0.017 s, three of three; the set's own DTS
+/// decoder -0.028. NOT measured: every other stack (`lgaudiosink`, 2018 and 2016/2017 included), any
+/// other output (optical, ARC, wired headphones, LG Sound Sync), the user's "AV Sync Adjust" setting
+/// (its effect on a mixer channel is not known), and a seek (read from the sink's code, not filmed: it
+/// re-derives its render base at every SEGMENT and never from a buffer's pts, so the relative lead
+/// survives).
+///
+/// Applied to the SINK pts of the audio lane's one Feed ([`audio_sink_pts`]), after the speed
+/// division, and nowhere else: content-time bookkeeping stays in content time.
+const PCM_SINK_LEAD_NS: i64 = 400_000_000;
+
+/// The leads that were filmed on `liblxa` (the dev set), by the name the settings service gives the output
+/// (`getSystemSettings {"category":"sound","keys":["soundOutput"]}`, `tv::sound`). The TV speakers
+/// are listed so that "measured" is a property of the table, not of the default happening to equal
+/// them.
+const PCM_LEAD_BY_OUTPUT: [(&str, i64); 2] = [("tv_speaker", 400_000_000), ("bt_soundbar", 250_000_000)];
+
+/// The lead for a PCM Load on `stack` with the sound output named `output` (`None`: no answer), and
+/// whether that cell was measured: THE table, one cell per stack and output.
+///
+/// | Stack | Lead | Measured |
+/// |---|---|---|
+/// | [`AudioStack::Liblxa`] | follows the output: [`PCM_LEAD_BY_OUTPUT`] (400 TV speaker, 250 Bluetooth), else 400 | the two listed outputs |
+/// | [`AudioStack::AudioSinkNew`] (2018) | the same figures | none |
+/// | [`AudioStack::LgAudioSink`] | 400 on every output and for no answer | none |
+/// | [`AudioStack::AdecSink`] (2016/2017), `Other`, `Unknown` | 0 whatever the output | none |
+///
+/// PURE.
+fn pcm_output_lead(stack: AudioStack, output: Option<&str>) -> (i64, bool) {
+    let by_output = || {
+        output.and_then(|name| PCM_LEAD_BY_OUTPUT.iter().find(|(known, _)| *known == name)).map(|&(_, ns)| ns)
+    };
+    match stack {
+        AudioStack::Liblxa => by_output().map_or((PCM_SINK_LEAD_NS, false), |ns| (ns, true)),
+        AudioStack::AudioSinkNew => (by_output().unwrap_or(PCM_SINK_LEAD_NS), false),
+        AudioStack::LgAudioSink => (PCM_SINK_LEAD_NS, false),
+        AudioStack::AdecSink | AudioStack::Other | AudioStack::Unknown => (0, false),
+    }
+}
+
+/// The audio lane's sink pts: content time `fp` moved onto the pipeline's timeline
+/// ([`super::to_sink_ns`]) plus the Load's `pcm_lead_ns`. The lead is real time the set takes, so it
+/// is added AFTER the speed division: at 1.5x a 400 ms lead is still 400 ms, not 267. PURE.
+fn audio_sink_pts(fp: i64, pcm_lead_ns: i64) -> i64 {
+    super::to_sink_ns(fp).saturating_add(pcm_lead_ns).max(0)
+}
+
+/// How a Load's audio lead is to be decided, made with the declared audio and the set's audio stack
+/// by [`load_audio`] on the frame thread and finished by [`PcmLead::resolve`], where the sound output
+/// may be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PcmLead {
+    /// A compressed or absent track: the set's own decoder compensates, so no lead.
+    Off,
+    /// The `pcmavoffset` dev trigger's value, on the stack it was measured on; it wins over the table
+    /// and over the stack.
+    Override(i64, AudioStack),
+    /// App-decoded audio on a stack with no lead (2016/2017's `adecsink`, Realtek, MStar, or not
+    /// known): none was read from the firmware or measured there, so there is none, and the output is
+    /// not read.
+    NoLead(AudioStack),
+    /// App-decoded audio on a stack whose lead is the same on every sound output: the table's answer
+    /// for the stack, settled on the frame thread, with no read of the output.
+    Fixed(AudioStack),
+    /// App-decoded audio on a stack whose lead follows the active sound output (`liblxa`, 2018's
+    /// `audiosink_new`), read on the Load thread; the stack is carried for the table and the log line.
+    FromOutput(AudioStack),
+}
+
+/// What a plan came to: the lead and, for [`PcmLead::FromOutput`], the output it was read from.
+struct ResolvedLead {
+    ns: i64,
+    plan: PcmLead,
+    /// The output's name, or `None` when the plan did not ask or the settings service gave none.
+    output: Option<String>,
+}
+
+impl PcmLead {
+    /// What the Engine starts with: the lead the frame thread can settle without reading the output,
+    /// and whether the Load thread's read is still owed (then the lead is final only once
+    /// [`settle_pcm_lead`] has taken it). PURE.
+    fn at_engine_start(self) -> (i64, bool) {
+        match self {
+            Self::Off | Self::NoLead(_) => (0, false),
+            Self::Override(ns, _) => (ns, false),
+            Self::Fixed(stack) => (pcm_output_lead(stack, None).0, false),
+            Self::FromOutput(_) => (0, true),
+        }
+    }
+
+    /// What the frame thread logs when it starts the Load: the plans it settles itself (the dev
+    /// override, a stack with no lead, a stack whose lead is the same on every output). A lead that follows the output is logged by the Load thread
+    /// with the output it read, so a Load never writes a second, guessed line first. PURE.
+    fn start_log_line(self) -> Option<String> {
+        match self {
+            Self::Override(..) | Self::NoLead(_) | Self::Fixed(_) => self.resolve(|| None).log_line(),
+            Self::Off | Self::FromOutput(_) => None,
+        }
+    }
+
+    /// Settle the plan. `read_output` runs only for [`PcmLead::FromOutput`] (a compressed Load, one
+    /// with the dev override and one on a stack with no lead never ask the platform) and is a blocking
+    /// read, so only the Load thread may pass one that reaches the bus. PURE apart from that closure.
+    fn resolve(self, read_output: impl FnOnce() -> Option<String>) -> ResolvedLead {
+        match self {
+            Self::Off | Self::NoLead(_) => ResolvedLead { ns: 0, plan: self, output: None },
+            Self::Override(ns, _) => ResolvedLead { ns, plan: self, output: None },
+            Self::Fixed(stack) => ResolvedLead { ns: pcm_output_lead(stack, None).0, plan: self, output: None },
+            Self::FromOutput(stack) => {
+                let output = read_output();
+                let ns = pcm_output_lead(stack, output.as_deref()).0;
+                ResolvedLead { ns, plan: self, output }
+            }
+        }
+    }
+}
+
+impl ResolvedLead {
+    /// The line the Load logs for its lead, once per Load; `None` for a track with no lead.
+    fn log_line(&self) -> Option<String> {
+        let ms = self.ns / 1_000_000;
+        match self.plan {
+            PcmLead::Off => None,
+            PcmLead::Override(_, stack) => {
+                Some(format!("pcm: audio sink pts +{ms}ms (pcmavoffset override, stack {})", stack.label()))
+            }
+            PcmLead::NoLead(stack) => {
+                Some(format!("pcm: audio sink pts +{ms}ms (stack {}, not measured on this chip)", stack.label()))
+            }
+            PcmLead::Fixed(stack) => {
+                let note = if pcm_output_lead(stack, None).1 { "" } else { ", not measured" };
+                Some(format!("pcm: audio sink pts +{ms}ms (stack {}, every output{note})", stack.label()))
+            }
+            PcmLead::FromOutput(stack) => {
+                let measured = pcm_output_lead(stack, self.output.as_deref()).1;
+                let name = self.output.as_deref().unwrap_or("unknown");
+                let note = if measured { "" } else { ", not measured" };
+                let default_ms = PCM_SINK_LEAD_NS / 1_000_000;
+                Some(format!(
+                    "pcm: audio sink pts +{ms}ms (stack {}, output {name}, default {default_ms}ms{note})",
+                    stack.label()
+                ))
+            }
+        }
+    }
+}
+
+/// Resolve `plan` on the calling (Load) thread with the real platform read, and log what it decided.
+/// The one place the platform is asked for the output.
+pub(super) fn resolve_pcm_lead_on_load_thread(plan: PcmLead) -> Option<i64> {
+    if !matches!(plan, PcmLead::FromOutput(_)) {
+        return None;
+    }
+    let resolved = plan.resolve(plx_platform::tv::sound::output);
+    if let Some(line) = resolved.log_line() {
+        log(&line);
+    }
+    Some(resolved.ns)
+}
+
+/// The plan for a Load that declared `audio` on a set whose audio stack is `stack`, given the dev
+/// override's text (milliseconds): nothing for anything but `"PCM"` (the override moves only the PCM
+/// lead), the override when it is an integer (on any stack: it is how another chip gets measured),
+/// otherwise no lead unless the stack follows the sound output (`liblxa`, 2018's `audiosink_new`:
+/// [`PcmLead::FromOutput`] with the stack) or is the `lgaudiosink` one, where the lead is the same on
+/// every output and needs no read. PURE.
+fn pcm_lead_plan(audio: &str, override_ms: Option<&str>, stack: AudioStack) -> PcmLead {
+    if audio != "PCM" {
+        return PcmLead::Off;
+    }
+    if let Some(ms) = override_ms.and_then(|s| s.trim().parse::<i64>().ok()) {
+        return PcmLead::Override(ms.saturating_mul(1_000_000), stack);
+    }
+    match stack {
+        AudioStack::Liblxa | AudioStack::AudioSinkNew => PcmLead::FromOutput(stack),
+        AudioStack::LgAudioSink => PcmLead::Fixed(stack),
+        AudioStack::AdecSink | AudioStack::Other | AudioStack::Unknown => PcmLead::NoLead(stack),
+    }
+}
+
+/// What a Load declares for its audio, and the plan for the sink lead that follows from it: ONE
+/// value, so the payload's `"audio"` name and the Engine's lead cannot disagree. PURE.
+struct LoadAudio {
+    /// The LG-side name the payload carries; `"PCM"` for app-decoded audio.
+    name: &'static str,
+    /// The `dg_load_a` diagnostics code for the codec (`audio_payload_codec`).
+    diagnostic: u8,
+    /// [`pcm_lead_plan`] of `name` on the set's stack.
+    lead: PcmLead,
+}
+
+/// [`LoadAudio`] for a track of `codec` at `session_rate` (permille); `None` only at 1x, when the pipeline has
+/// no name for the codec and the app does not decode it. A speed session decodes and stretches the sound in the app
+/// (`ff::SpeedDecoder`), so at any speed but 1x every codec declares `"PCM"`; so does a track the app
+/// decodes itself at 1x (`app_pcm`, the shape [`crate::route::stream_pcm`] declared: DTS under the
+/// lossy gate, FLAC and the like), whatever its codec, and that name is what the lead plan is made
+/// from, so every Load that declares `"audio":"PCM"` is planned a lead. `lead_override_ms` is
+/// the dev trigger's text and `stack` the set's audio stack ([`plx_platform::devcaps::audio_stack`]).
+fn load_audio(
+    codec: &str, session_rate: i32, app_pcm: Option<&crate::route::PcmFormat>, lead_override_ms: Option<&str>,
+    stack: AudioStack,
+) -> Option<LoadAudio> {
+    let declared = audio_declaration(codec, app_pcm);
+    // A speed session declares PCM whatever the codec is called, so it needs no payload name for it
+    // (`mp3`, `vorbis` and `truehd` have none): its diagnostic code stays the codec's when it has one.
+    let (name, diagnostic) = if session_rate != super::RATE_NORMAL {
+        ("PCM", declared.map_or(5, |(_, code)| code))
+    } else {
+        declared?
+    };
+    Some(LoadAudio { name, diagnostic, lead: pcm_lead_plan(name, lead_override_ms, stack) })
+}
+
+/// Take the output's lead from the Load's return, once, before the first audio unit of this Load is
+/// fed. `false` while the Load has not returned (the audio waits; nothing can be fed before it
+/// anyway). A lead that was settled on the frame thread has nothing to take.
+fn settle_pcm_lead(eng: &mut Engine) -> bool {
+    if !eng.pcm_lead_pending {
+        return true;
+    }
+    let Some(ns) = SHARED.native_load_pcm_lead(eng.native_epoch) else {
+        return false;
+    };
+    eng.pcm_sink_lead_ns = ns;
+    eng.pcm_lead_pending = false;
+    true
 }
 
 fn hls_candidate_snapshot_stable(start: u64, end: u64) -> bool {
@@ -2598,7 +3839,14 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine) {
             };
             recovery.ready(playable)
         }
-        HlsPrimeKind::Fresh | HlsPrimeKind::Resume => balanced_runway_ready,
+        HlsPrimeKind::Fresh => balanced_runway_ready,
+        // A viewer Resume continues an existing timeline, not a replay of every acquisition
+        // since the rung was selected. That historical worst-permutation reserve can exceed
+        // native + AU queue capacity (#1216); no further media can arrive until Play. Keep the
+        // accepted A/V decoder prime below, but do not make user intent repay historical stress.
+        // An automatic rebuffer remains Rebuffer even across user Pause/Resume and must still
+        // close its own pause-local recovery epoch above.
+        HlsPrimeKind::Resume => true,
     };
     if decoder_ready && boundary_ready && TX.feed_allowed() {
         let Some((play_token, recovery)) =
@@ -2606,6 +3854,10 @@ pub fn try_prime(mt: &MainThread, eng: &mut Engine) {
         else {
             return;
         };
+        // A paused preroll plays one picture for a viewer who is paused: keep that window silent.
+        if TX.seek_preroll_active() {
+            super::mute_for_preroll(mt);
+        }
         let played = unsafe { sink().play(mt) };
         match SHARED.complete_hls_prime_play(play_token, played != 0) {
             HlsPlayCompletion::Accepted { resume_acb } => {
@@ -2724,19 +3976,68 @@ fn feed_stream(mt: &MainThread, eng: &mut Engine) {
                         continue;
                     }
                 }
-                if eng.flushed {
+                if eng.flushed && super::seek_mode() == SeekMode::NativeSeek {
+                    // NATIVE in-place seek (#568): feed the REAL content PTS (pts_shift=0,
+                    // disp_base=0 -> playpos = presented real pts = content time, as in the
+                    // Segment branch below) and anchor the pipeline with LG's public
+                    // `StarfishMediaAPIs::Seek(millis)`. Seek is a flushing `gst_element_seek`
+                    // whose new segment starts at EXACTLY the millis passed, so the PTS fed from
+                    // here on is on that timeline by construction; the pump skipped its own
+                    // `flush()` for this mode and nothing may flush after this (a `flush()` is
+                    // itself a seek to 0 and re-creates the stale-segment stall). `feed_stream`
+                    // runs on the main thread and is the only Feed caller, and this keyframe is
+                    // not fed yet, so Seek cannot race a Feed. Never a negative millis: Seek
+                    // refuses it, and a negative PTS is unparseable by Feed.
+                    SHARED.pts_shift.store(0, Ordering::Relaxed);
+                    let ms = super::to_sink_ns(pts.max(0)) / 1_000_000;
+                    let rv = unsafe { sink().seek(mt, ms) };
+                    log(&format!("in-place seek(native): Seek({ms}) rv={rv}"));
+                    if rv == 0 {
+                        // A refused Seek can leave the pipeline refusing every Feed. Drop the rest
+                        // of THIS SESSION's seeks to the reload path and redo THIS one as a
+                        // reload at the user's target (the pump reads the mailbox next tick;
+                        // `reload_at` REPLACES the engine). `eng.flushed`/`rebase_pending` stay
+                        // set so the audio lane keeps holding and no AU reaches a pipeline that
+                        // is rejecting Feed.
+                        super::set_seek_mode(SeekMode::Reload);
+                        // Latched across the reload this very seek is about to do, so the fresh
+                        // session's `select_seek_mode` does not offer the same firmware another
+                        // refused Seek on every later seek of this playback.
+                        super::set_native_seek_refused(true);
+                        log(
+                            "in-place seek DOWNGRADE: native Seek refused -> reload-per-seek for \
+                             the rest of this playback",
+                        );
+                        let tgt = SHARED.seek_target_ns.load(Ordering::Relaxed).max(0);
+                        TX.seek_reqs.store(1, Ordering::Release);
+                        TX.seek_to_ns.store(tgt, Ordering::Release);
+                        eng.pending_video = None;
+                        break;
+                    }
+                    segment_installed = true;
+                    eng.flushed = false;
+                } else if eng.flushed && super::seek_mode() != SeekMode::Segment {
+                    // Flushed but not in a mode that anchors in place: a refused native `Seek`
+                    // downgraded the session to `Reload` and the pump's reload (`reload_at`)
+                    // is on its way. The private Segment path (`sf_pipeline`'s decompile-derived
+                    // offsets, proven on webOS 4.5 only) must NEVER run here, so this keyframe
+                    // anchors nothing: drop it and leave `flushed`/`rebase_pending` set, which
+                    // keeps the audio lane holding until the reload replaces the engine.
+                    eng.pending_video = None;
+                    break;
+                } else if eng.flushed {
                     // Kodi IN-PLACE seek (exact): feed the REAL content PTS (no rebase), tell the
                     // pipeline the real decode position, then inject a fresh GStreamer SEGMENT —
                     // this re-anchors the sink WITHOUT a reload/decoder re-init. disp_base=0 +
                     // pts_shift=0 → playpos = presented real pts = content time.
                     SHARED.pts_shift.store(0, Ordering::Relaxed);
-                    let ok = unsafe { sink().set_time_to_decode(mt, pts) };
+                    let ok = unsafe { sink().set_time_to_decode(mt, super::to_sink_ns(pts)) };
                     // setTimeToDecode returns 0 on webOS<11 (it needs PausedState); fall back to
                     // the content-info path (loadSpi_getInfo + setContentInfo(ptsToDecode)), which
                     // re-anchors the decode position while Playing. Then always inject the fresh
                     // GStreamer SEGMENT so the sink re-bases instead of stalling.
                     let ci = if ok == 0 {
-                        unsafe { sink().set_content_info(mt, pts) }
+                        unsafe { sink().set_content_info(mt, super::to_sink_ns(pts)) }
                     } else {
                         1
                     };
@@ -2757,7 +4058,7 @@ fn feed_stream(mt: &MainThread, eng: &mut Engine) {
                         // silently became multi-second reloads with nothing in the event log
                         // naming the cause — only the `sendSegment=0` above, whose consequence
                         // was not stated anywhere.
-                        super::INPLACE_SEEK_OK.store(false, Ordering::Relaxed);
+                        super::set_seek_mode(SeekMode::Reload);
                         log(
                             "in-place seek DOWNGRADE: sendSegment=0 (CustomPipeline unreachable) \
                              -> reload-per-seek for the rest of this session",
@@ -2797,7 +4098,11 @@ fn feed_stream(mt: &MainThread, eng: &mut Engine) {
         // Skipped while priming (to reach PRIME_NS before Play; the per-tick slice below is waived
         // until the lane holds its prime depth, then spreads the rest). Each lane's queue is
         // pts-ordered, so if the head is over budget everything behind it is too; breaking is right.
-        let pres = eng.feed_pace.reference(SHARED.pres_fed.load(Ordering::Relaxed), super::vclock_ms());
+        let pres = eng.feed_pace.reference_at(
+            SHARED.pres_fed.load(Ordering::Relaxed),
+            super::vclock_ms(),
+            SHARED.applied_rate_permille.load(Ordering::Relaxed),
+        );
         if !eng.prime_play {
             let budget = if es == 1 {
                 MAX_FEED_AHEAD_NS
@@ -2830,11 +4135,12 @@ fn feed_stream(mt: &MainThread, eng: &mut Engine) {
         } else {
             false
         };
-        let r = plx_base::diag::spans::span("sfv", || unsafe { sink().feed(mt, data, len as u32, fp, es) });
+        let sink_pts = super::to_sink_ns(fp);
+        let r = plx_base::diag::spans::span("sfv", || unsafe { sink().feed(mt, data, len as u32, sink_pts, es) });
         if presentation_probe {
             if (r as u8) == b'O' {
                 if !SHARED.commit_native_presentation_probe(eng.native_epoch, |num| {
-                    super::sf_on_event_inner(0, num, std::ptr::null())
+                    super::sf_on_event_inner(0, num, std::ptr::null(), super::shared::EventScope::Live)
                 }) {
                     log("rebase: native presentation probe lost its epoch after accepted Feed");
                 }
@@ -2912,6 +4218,9 @@ fn feed_audio_lane(mt: &MainThread, eng: &mut Engine) {
     if eng.rebase_pending {
         return; // wait for the video lane to publish pts_shift
     }
+    if !settle_pcm_lead(eng) {
+        return; // the output's lead is not here yet: stamping with a guess would move later
+    }
     let qp = match eng.aq_audio.as_mut() {
         Some(q) => &mut **q as *mut AuQueue,
         None => return,
@@ -2920,7 +4229,11 @@ fn feed_audio_lane(mt: &MainThread, eng: &mut Engine) {
     // arm writes it, on this same thread), and one pres_fed sample per tick is plenty against the
     // multi-second audio budget.
     let shift = SHARED.pts_shift.load(Ordering::Relaxed);
-    let pres = eng.feed_pace.reference(SHARED.pres_fed.load(Ordering::Relaxed), super::vclock_ms());
+    let pres = eng.feed_pace.reference_at(
+        SHARED.pres_fed.load(Ordering::Relaxed),
+        super::vclock_ms(),
+        SHARED.applied_rate_permille.load(Ordering::Relaxed),
+    );
     let slice = FeedSlice::begin();
     let mut fed = 0;
     while fed < 120 {
@@ -2965,7 +4278,8 @@ fn feed_audio_lane(mt: &MainThread, eng: &mut Engine) {
         if slice.spent(fed, starved) {
             break;
         }
-        let r = plx_base::diag::spans::span("sfa", || unsafe { sink().feed(mt, data, len as u32, fp, es) });
+        let sink_pts = audio_sink_pts(fp, eng.pcm_sink_lead_ns);
+        let r = plx_base::diag::spans::span("sfa", || unsafe { sink().feed(mt, data, len as u32, sink_pts, es) });
         // Accepted only — see the video lane's note.
         if (r as u8) == b'O' && fp > eng.max_fed_audio_pts {
             eng.max_fed_audio_pts = fp;
@@ -2989,6 +4303,12 @@ fn feed_audio_lane(mt: &MainThread, eng: &mut Engine) {
         }
         if (r as u8) == b'O' {
             ATOT.fetch_add(1, Ordering::Relaxed); // accepted, not attempted — see feed_stream
+            let mut sizes = super::native_stall::SIZES.lock().unwrap_or_else(|e| e.into_inner());
+            if sizes.open() && crate::ff::native_audio::fed().is_some() {
+                if let Some(line) = sizes.record(len as u32) {
+                    log(&format!("native audio: packet sizes of the first AUs fed: {line}"));
+                }
+            }
         }
         if (r as u8) != b'O' {
             break; // 'B' BufferFull -> keep pending, retry next tick (AUDIO lane only)
@@ -3033,6 +4353,92 @@ pub fn feed_sample(mt: &MainThread, eng: &mut Engine) {
 /// release below 4 is refused too; `major == 0` (release unknown) defers to the Feed evidence.
 fn inplace_layout_known(major: u32, feed_abi_is_cow: bool) -> bool {
     !feed_abi_is_cow && (major == 0 || major >= 4)
+}
+
+/// **Is LG's public `Seek` device-tested where the private layout is not known?** Only on a KNOWN
+/// webOS 3 release: 80 seeks on platform release 3.9.3 (`docs/webos5-port.md`, "The public
+/// `Seek`"). It reads the release alone, not the Feed ABI: every 3.x library seen has the old
+/// (COW) one, and a release-3 set with the cxx11 Feed would get `Seek` too. webOS 2, an old-ABI
+/// 4.x build and an unknown release (`major == 0`) keep reloading, because an accepted `Seek` that
+/// anchors wrong is caught by no net ([`select_seek_mode`]).
+fn old_abi_seek_tested(major: u32) -> bool {
+    major == 3
+}
+
+/// [`select_seek_mode`] for a session that is starting: a `NativeSeek` this playback already had
+/// REFUSED stays `Reload` (the latch `feed_stream` sets, which `reload_at` preserves and a fresh
+/// play clears), instead of paying reopen + keyframe + refused `Seek` + full `Load` on every seek.
+pub(super) fn session_seek_mode(
+    layout_known: bool,
+    old_abi_seek: bool,
+    window_mode: c_int,
+    dev: Option<SeekMode>,
+) -> SeekMode {
+    match select_seek_mode(layout_known, old_abi_seek, window_mode, dev) {
+        SeekMode::NativeSeek if super::native_seek_refused() => SeekMode::Reload,
+        mode => mode,
+    }
+}
+
+/// How a direct-play seek re-anchors the pipeline in a new session (see [`SeekMode`]).
+///
+/// - `VP_EXPORTED` (webOS 5+) -> [`SeekMode::NativeSeek`]: LG's PUBLIC `StarfishMediaAPIs::Seek`.
+///   The Kodi in-place path (`Segment`) is NOT used there: it reaches LG-private C++ objects
+///   through two decompile-derived offsets (`StarfishMediaAPIs::player` at object+0x4c, then
+///   `AbstractPlayer::pipeline` at +0x04, plus `MEDIA_CUSTOM_CONTENT_INFO`'s `ptsToDecode` at
+///   +0x28) read off a webOS 4.5 binary, which nothing in a symbol table can confirm on another
+///   firmware: a field added to StarfishMediaAPIs by any 5.x build moves +0x4c and the very next
+///   seek dereferences whatever now lives there. `Seek` is an exported symbol, present on every
+///   firmware 1.2 to 11.2, so it assumes no layout at all.
+/// - A known layout without `VP_EXPORTED` (webOS 4.x) -> [`SeekMode::Segment`], unchanged.
+/// - NOT `Segment` when the library is the pre-C++11 build (`inplace_layout_known` false): its
+///   StarfishMediaAPIs is a different object from the 4.5 one, and the first fast-forward on a
+///   3.4.0 set crashed through those offsets. The old-ABI Feed (`sf_feed_abi_is_cow`) is the
+///   direct evidence, and it covers 3.9.x too. A KNOWN release below 4 is refused as well; an
+///   UNKNOWN one (`major == 0`, os_info unreadable) with the C++11 Feed keeps in-place seek, as
+///   before #578, because that Feed says the library is 4.x or later.
+/// - A layout-unknown library on the ACB plane in a KNOWN webOS 3 release
+///   ([`old_abi_seek_tested`]) -> [`SeekMode::NativeSeek`] too. `Seek` takes a `const char*`, so
+///   its symbol and calling convention are the same on both C++ ABIs; that it also behaves the
+///   same rests on the device test in `docs/webos5-port.md` ("The public `Seek`"), not on the
+///   decompile, which is of 4.5.
+///   The nets are the ones webOS 5+ has: a refused `Seek` drops the playback to `Reload`
+///   (`native_seek_refused`), and a seek that does not anchor within `SEEK_STUCK_MS` is retried,
+///   then reloaded. Neither catches a `Seek` that is accepted and then anchors wrong (the
+///   stale-segment stall, about 48 s later), which is why the release is gated to the one tested.
+/// - Any other layout-unknown library (webOS 2, an old-ABI 4.x build, an unknown release) and no
+///   video plane (`VP_NONE`) -> [`SeekMode::Reload`], as before.
+/// `dev` is the `plxnative-seekmode` dev trigger and wins when present, so a webOS 4.5 set can
+/// exercise `NativeSeek`.
+pub(super) fn select_seek_mode(
+    layout_known: bool,
+    old_abi_seek: bool,
+    window_mode: c_int,
+    dev: Option<SeekMode>,
+) -> SeekMode {
+    if let Some(forced) = dev {
+        return forced;
+    }
+    if window_mode == super::VP_EXPORTED {
+        SeekMode::NativeSeek
+    } else if layout_known {
+        SeekMode::Segment
+    } else if old_abi_seek && window_mode == super::VP_ACB {
+        SeekMode::NativeSeek
+    } else {
+        SeekMode::Reload
+    }
+}
+
+/// `/tmp/plxnative-seekmode`: `native`, `segment` or `reload`. `None` without the `devtriggers`
+/// feature (`devtrig::read` folds away), so a release build cannot be steered.
+fn dev_seek_mode() -> Option<SeekMode> {
+    match plx_base::devtrig::read("seekmode")?.trim() {
+        "native" => Some(SeekMode::NativeSeek),
+        "segment" => Some(SeekMode::Segment),
+        "reload" => Some(SeekMode::Reload),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -3096,6 +4502,25 @@ mod feed_pace_tests {
         assert_eq!(pace.reference(PRES_NONE, 100_001), PRES_NONE);
         assert_eq!(pace.reference(5_000 * MS, 100_002), 5_000 * MS, "a fresh report restarts the run-on");
     }
+
+    /// At 1.5x the playhead moves 1.5 ms of media per wall-clock ms between reports, so the
+    /// estimate runs on that much faster; capped by the same wall-clock bound.
+    #[test]
+    fn the_run_on_follows_the_pipeline_rate() {
+        let mut pace = FeedPace::default();
+        assert_eq!(pace.reference_at(5_000 * MS, 100, 1500), 5_000 * MS);
+        assert_eq!(pace.reference_at(5_000 * MS, 150, 1500), 5_075 * MS);
+        assert_eq!(pace.reference_at(5_000 * MS, 200, 500), 5_050 * MS, "half speed runs on at half");
+        assert_eq!(
+            pace.reference_at(5_000 * MS, 100_000, 2000),
+            5_000 * MS + 2 * FEED_PACE_CAP_MS as i64 * MS,
+            "the cap is wall-clock time; at 2x it covers twice the media"
+        );
+        assert_eq!(
+            FeedPace::default().reference(5_000 * MS, 100),
+            FeedPace::default().reference_at(5_000 * MS, 100, crate::player::RATE_NORMAL)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3152,7 +4577,7 @@ mod native_lifecycle_host_seam_tests {
         let first = SHARED.begin_native_session().expect("first native epoch");
         assert_eq!(unsafe { crate::player::sink().load(c"{}".as_ptr(), first) }, 1);
         assert!(unsafe { crate::player::sink().callback_intercepts(&mt) } > 0);
-        unsafe { crate::player::sink().unload(&mt) };
+        unsafe { crate::player::sink().unload(&plx_platform::tv::sink::UnloadTicket::issue(&mt)) };
         assert!(SHARED.native_unload_completed(first));
         assert_eq!(unsafe { crate::player::sink().callback_gate_retire(&mt) }, 1);
         assert!(SHARED.retire_native_session(first));
@@ -3165,7 +4590,7 @@ mod native_lifecycle_host_seam_tests {
             .expect("unproven native epoch");
         assert_eq!(unsafe { crate::player::sink().load(c"{}".as_ptr(), unproven) }, 1);
         crate::player::ffi_host::force_callback_intercepts_for_test(0);
-        unsafe { crate::player::sink().unload(&mt) };
+        unsafe { crate::player::sink().unload(&plx_platform::tv::sink::UnloadTicket::issue(&mt)) };
         assert_eq!(unsafe { crate::player::sink().callback_gate_retire(&mt) }, 0);
         assert!(SHARED.retire_native_session(unproven));
         unsafe { crate::player::sink().quarantine(&mt) };
@@ -3482,6 +4907,60 @@ mod payload_tests {
         assert!(!payload.contains("DolbyHdrInfo"), "{payload}");
     }
 
+    /// An AV1 Profile 10.1 direct play (HDR10-compatible base) on a set with confirmed Dolby Vision
+    /// support carries the node like an HEVC Profile 8 does, with the codec string left at `"AV1"`.
+    /// VP9 never does: no Dolby Vision profile rides on it.
+    #[test]
+    fn an_av1_profile_10_direct_play_declares_dolby_vision() {
+        let p10 = Dovi {
+            present: true,
+            profile: 10,
+            bl_compat: 1,
+            el_present: false,
+            ..Dovi::NONE
+        };
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        assert!(crate::route::set_stream_declaration_for_test(
+            &mut ps,
+            "av1",
+            "eac3",
+            23.976,
+            p10,
+            false,
+            plx_platform::devcaps::dv::DvCapability::Supported,
+        ));
+        assert_eq!(crate::route::stream_dovi(&ps).profile, 10);
+        let payload = build_av_payload(
+            &ps,
+            "AV1",
+            "AC3 PLUS",
+            SinkEnvelope { w: 3840, h: 2160, fps: 60 },
+        );
+        assert!(payload.contains(r#""video":"AV1""#), "{payload}");
+        assert!(
+            payload.contains(r#""DolbyHdrInfo":{"trackType":"single","encryptionType":"clear","profileId":10}"#),
+            "{payload}"
+        );
+
+        assert!(crate::route::set_stream_declaration_for_test(
+            &mut ps,
+            "vp9",
+            "eac3",
+            23.976,
+            p10,
+            false,
+            plx_platform::devcaps::dv::DvCapability::Supported,
+        ));
+        assert!(crate::route::stream_dv_presentation(&ps).declared().is_none());
+        let payload = build_av_payload(
+            &ps,
+            "VP9",
+            "AC3 PLUS",
+            SinkEnvelope { w: 3840, h: 2160, fps: 60 },
+        );
+        assert!(!payload.contains("DolbyHdrInfo"), "{payload}");
+    }
+
     #[test]
     fn late_capability_result_does_not_change_installed_decision() {
         let mut ps = crate::route::PlaybackSession::IDLE;
@@ -3652,11 +5131,32 @@ mod payload_tests {
     }
 
     /// The three ways the node is NOT sent, each of which must leave the payload byte-identical:
-    /// a file with no Dolby Vision, a Dolby Vision file we refuse (the dual-layer P7 — declaring a
-    /// layer we cannot feed is worse than refusing it), and the disarmed trigger, which is what a
-    /// `RELEASE=1` build compiles in and what every boot without `/tmp/plxnative-dv` does today.
+    /// a file with no Dolby Vision, a Dolby Vision file we refuse (a dual layer without a
+    /// cross-compatible base layer — declaring a layer we cannot feed is worse than refusing it),
+    /// and the disarmed trigger, which is what a `RELEASE=1` build compiles in and what every boot
+    /// without `/tmp/plxnative-dv` does today.
     #[test]
     fn nothing_is_spliced_unless_the_stream_is_declared() {
+        let unconvertible_p7 = Dovi {
+            present: true,
+            profile: 7,
+            bl_compat: 0,
+            el_present: true,
+            ..Dovi::NONE
+        };
+        for dv in [
+            Dovi::NONE.presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true),
+            unconvertible_p7.presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true),
+            p5().presentation(false, plx_platform::devcaps::dv::DvCapability::Supported, true),
+        ] {
+            assert_eq!(with_dolby_hdr_info(PAYLOAD_AV, "H265", dv), PAYLOAD_AV);
+        }
+    }
+
+    /// A Profile 7 with a cross-compatible base layer is fed as the 8.1 `ff::packet_to_annexb`
+    /// makes of it, and the node says so: `profileId` 8, one track — never 7, never `"dual"`.
+    #[test]
+    fn a_converted_profile_7_declares_profile_8_single() {
         let p7 = Dovi {
             present: true,
             profile: 7,
@@ -3664,13 +5164,15 @@ mod payload_tests {
             el_present: true,
             ..Dovi::NONE
         };
-        for dv in [
-            Dovi::NONE.presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true),
+        let out = with_dolby_hdr_info(
+            PAYLOAD_AV,
+            "H265",
             p7.presentation(true, plx_platform::devcaps::dv::DvCapability::Supported, true),
-            p5().presentation(false, plx_platform::devcaps::dv::DvCapability::Supported, true),
-        ] {
-            assert_eq!(with_dolby_hdr_info(PAYLOAD_AV, "H265", dv), PAYLOAD_AV);
-        }
+        );
+        const NODE: &str =
+            r#","DolbyHdrInfo":{"trackType":"single","encryptionType":"clear","profileId":8}"#;
+        assert!(out.contains(NODE), "{out}");
+        assert_eq!(out.replace(NODE, ""), PAYLOAD_AV);
     }
 
     /// **What we actually send for a Dolby Atmos track**, at the key path `libpf` reads
@@ -3861,17 +5363,20 @@ mod prime_livelock_tests {
             native_epoch: 0,
             stage: Stage::Streaming,
             video_info_sent: true,
+            bound_at_frames: None,
             placed_src: (0, 0),
             eos_pushed: false,
             rebase_pending: false,
             rebase_drops: 0,
             seek_armed_at: 0,
             seek_retries: 0,
-            flushed: false,
+                flushed: false,
             presentation_rearm_pending: false,
             max_fed_video_pts: 0,
             max_fed_audio_pts: 0,
             audio_start_fp: None,
+            pcm_sink_lead_ns: 0,
+            pcm_lead_pending: false,
             feed_pace: FeedPace::default(),
             seek_base_pts: 0,
             prime_play: true,
@@ -3887,6 +5392,8 @@ mod prime_livelock_tests {
             report_th: None,
             report_stop: None,
             preview_abandon: false,
+            foreground_follows_load: false,
+            era_watch: crate::player::era_callbacks::Watch::new(),
         }
     }
 
@@ -4119,6 +5626,10 @@ mod prime_livelock_tests {
         let lead0 = 100_000_000;
         eng.max_fed_video_pts = PRES + lead0;
         eng.max_fed_audio_pts = PRES + lead0;
+        // This fixture holds the presented position fixed. Keep FeedPace's existing anchor
+        // ahead of the real clock so host preemption cannot extrapolate that position while
+        // the simulated feed clock is testing the slice. FeedPace's run-on has its own tests.
+        eng.feed_pace.last = Some((PRES, u32::MAX));
         push_segment_at(&mut eng, PRES + lead0 + 1);
 
         tick(&mt, &mut eng);
@@ -4486,10 +5997,20 @@ mod prime_livelock_tests {
 
     /// Reproduces the device sequence: Pause, let the demux queues fill, then Resume. The user
     /// intent may reopen feeding, but it must not run the native/ACB clock until Starfish has
-    /// accepted a balanced decoder prime. The measured runway may extend into the validated queue
-    /// tails because a paused native source buffer is finite and cannot accept the whole runway.
+    /// accepted a balanced decoder prime. Historical stress runway is not a runtime Resume floor.
     #[test]
     fn pause_to_fill_resume_primes_both_lanes_before_native_play() {
+        assert_viewer_resume_primes(3_000, 3_500_000_000);
+    }
+
+    /// Issue #1216: 14.754 s of historical runway, but the paused native pipeline and
+    /// validated queues can hold only 10.8 s. Neither tail grows until Play.
+    #[test]
+    fn a_resume_prime_whose_runway_exceeds_the_queue_capacity_still_plays() {
+        assert_viewer_resume_primes(14_754, 10_800_000_000);
+    }
+
+    fn assert_viewer_resume_primes(runway_ms: i64, playable_ns: i64) {
         let _serial = plx_base::testlock::serial();
         struct Restore {
             runway: i64,
@@ -4526,13 +6047,13 @@ mod prime_livelock_tests {
         SHARED.reset_hls_clock_for_test();
         let base = 10_000_000_000;
         let _restore = Restore {
-            runway: SHARED.hls_prime_runway_ms.swap(3_000, Ordering::Relaxed),
+            runway: SHARED.hls_prime_runway_ms.swap(runway_ms, Ordering::Relaxed),
             video_tail: SHARED
                 .hls_video_tail_ns
-                .swap(base + 3_500_000_000, Ordering::Relaxed),
+                .swap(base + playable_ns, Ordering::Relaxed),
             audio_tail: SHARED
                 .hls_audio_tail_ns
-                .swap(base + 3_500_000_000, Ordering::Relaxed),
+                .swap(base + playable_ns, Ordering::Relaxed),
             audio_expected: SHARED.hls_audio_expected.swap(true, Ordering::Relaxed),
             pts_shift: SHARED.pts_shift.swap(0, Ordering::Relaxed),
             presented: SHARED.pres_fed.swap(base, Ordering::Relaxed),
@@ -4567,19 +6088,26 @@ mod prime_livelock_tests {
         );
 
         TX.commit_paused(false);
-        tick(&mt, &mut eng);
+        // Balanced decoder prime is still mandatory even when historical runway is ignored.
+        eng.max_fed_video_pts = base + PRIME_NS;
+        eng.max_fed_audio_pts = base;
+        try_prime(&mt, &mut eng);
+        assert_eq!(crate::player::ffi_host::play_calls_for_test(), before);
+        for _ in 0..600 {
+            tick(&mt, &mut eng);
+        }
 
         let accepted_video = eng.max_fed_video_pts - base;
         let accepted_audio = eng.max_fed_audio_pts - base;
         assert!(accepted_video >= PRIME_NS && accepted_audio >= PRIME_AUDIO_NS);
         assert!(
-            accepted_video < 3_000_000_000 && accepted_audio < 3_000_000_000,
+            accepted_video < runway_ms * 1_000_000 && accepted_audio < runway_ms * 1_000_000,
             "the fixture must leave part of the measured runway in the application queues",
         );
         assert_eq!(crate::player::ffi_host::play_calls_for_test(), before + 1);
         assert!(
             !eng.prime_play,
-            "balanced accepted A/V plus validated queued runway did not release ResumePrime",
+            "viewer Resume stayed fenced after a balanced decoder prime",
         );
     }
 
@@ -4721,6 +6249,577 @@ pub(super) fn streaming_engine_for_test(native_epoch: u32) -> Engine {
     eng
 }
 
+/// **BACK's frame does not pay for `Unload`** (`PendingRelease`). On the dev set
+/// `StarfishMediaAPIs::Unload` held the frame that handled BACK for 113-150 ms on every return
+/// (`teardown spans: … sf_unload:135.7`). The host sink is given a slow Unload of its own
+/// (`delay_unload_for_test`) and the contract is graded where the device's cannot be: the stop
+/// returns long before the Unload does, nothing the stopped object says reaches the state the next
+/// session owns, no native session can begin while the object is still being released, and a start
+/// issued meanwhile is queued behind the release instead of racing it — and the release still ends in a
+/// D1 with complete evidence, not a quarantine.
+#[cfg(all(test, feature = "hostsim"))]
+mod off_frame_release_tests {
+    use super::*;
+
+    const UNLOAD_MS: u64 = 400;
+
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            crate::player::ffi_host::reset_native_lifecycle_for_test();
+            crate::player::ffi_host::force_clocksink_for_test(false);
+            SHARED.test_force_native_idle();
+            SHARED.reset_session();
+            crate::route::reset_player_control_for_test(crate::route::idle_session_for_test());
+        }
+    }
+
+    fn ready_now() -> c_int {
+        unsafe { crate::player::sink().ready(&MainThread::assume()) }
+    }
+
+    /// A live Engine over a ready host object whose Load has returned: what BACK tears down.
+    fn playing_engine(pa: &mut crate::player::adapter::PlayerAdapter) -> u32 {
+        let epoch = SHARED.begin_native_session().expect("native session");
+        assert_eq!(unsafe { crate::player::sink().load(c"{}".as_ptr(), epoch) }, 1);
+        assert!(SHARED.mark_native_load_returned(epoch, None).is_some());
+        let mut eng = streaming_engine_for_test(epoch);
+        eng.load_th = None;
+        pa.install(eng);
+        assert_ne!(
+            ready_now(),
+            0,
+            "PRECONDITION FAILED: the object must be dispatchable, or the stop has nothing to Unload"
+        );
+        epoch
+    }
+
+    fn arm(ps: &crate::route::PlaybackSession) -> crate::player::adapter::PlayerAdapter {
+        SHARED.reset_session();
+        crate::route::reset_player_control_for_test(ps);
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        crate::player::adapter::PlayerAdapter::new(unsafe { MainThread::assume() })
+    }
+
+    #[test]
+    fn a_stop_returns_before_the_unload_and_the_next_start_is_deferred_until_its_tail_ran() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let epoch = playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(UNLOAD_MS);
+
+        let started = std::time::Instant::now();
+        stop_bufferfeed(&mut ps, &mut pa);
+        let stop = started.elapsed();
+        assert!(
+            stop < std::time::Duration::from_millis(UNLOAD_MS / 4),
+            "the stop held the frame for {stop:?} on a {UNLOAD_MS} ms Unload: BACK pays for it again"
+        );
+        assert!(!pa.is_live(), "the stop must still complete from the route's point of view");
+        assert!(pa.has_pending_release(), "the object must be parked for its main-thread tail");
+
+        // A callback the stopped object delivers now (a late error, say) is dropped: the session
+        // state was already reset for whatever plays next.
+        let before = SHARED.dg_cb_count.load(Ordering::Relaxed);
+        super::super::sf_on_event(epoch, 5, 0, std::ptr::null());
+        assert_eq!(
+            SHARED.dg_cb_count.load(Ordering::Relaxed),
+            before,
+            "a callback from the object being released reached the next session's state"
+        );
+        assert!(
+            SHARED.begin_native_session().is_none(),
+            "a native session began while the previous object was still inside Unload"
+        );
+        assert!(
+            !poll_release(&mut ps, &mut pa, std::time::Instant::now()),
+            "the per-frame poll must not wait for a running Unload"
+        );
+
+        // A start now (no URL, so it would end NoRoute) is deferred: it neither waits for the
+        // Unload nor runs over the object, and the frame poll starts it once the tail has run.
+        let before_start = std::time::Instant::now();
+        let outcome = start_bufferfeed_tracked(&mut ps, &mut pa);
+        assert_eq!(outcome, BufferfeedStartOutcome::Deferred);
+        assert!(
+            before_start.elapsed() < std::time::Duration::from_millis(UNLOAD_MS / 4),
+            "the start waited for the Unload"
+        );
+        assert!(pa.has_pending_release(), "the Unload is still running");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !poll_release(&mut ps, &mut pa, std::time::Instant::now()) {
+            assert!(std::time::Instant::now() < deadline, "the returned Unload was never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(UNLOAD_MS),
+            "the tail ran before the Unload returned"
+        );
+        assert!(!pa.has_pending_release(), "the tail must leave no release pending");
+        assert_eq!(ready_now(), 0, "the released object must be destroyed before a new one may load");
+        assert!(
+            !crate::player::ffi_host::lifecycle_blocked_for_test(),
+            "the off-frame release must end in a D1 with complete evidence, not a quarantine"
+        );
+        let next = SHARED.begin_native_session().expect("native sessions resume after the release");
+        assert!(SHARED.retire_native_session(next));
+    }
+
+    #[test]
+    fn the_frame_poll_finishes_a_returned_unload_and_exit_waits_for_a_running_one() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+
+        // The ordinary return: the Unload comes back while Home draws; a later frame's poll runs
+        // the tail.
+        playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(50);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_pending_release());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !poll_release(&mut ps, &mut pa, std::time::Instant::now()) {
+            assert!(std::time::Instant::now() < deadline, "the returned Unload was never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!pa.has_pending_release());
+        assert_eq!(ready_now(), 0);
+        assert!(!crate::player::ffi_host::lifecycle_blocked_for_test(), "the poll's tail must D1");
+
+        // The exit (`app::run::shutdown`): a release still running is waited for, not abandoned.
+        crate::route::reset_player_control_for_test(&ps);
+        playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(UNLOAD_MS);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_pending_release());
+        finish_release_for_test(&mut pa);
+        assert!(!pa.has_pending_release(), "finish_release must not return with the Unload running");
+        assert_eq!(ready_now(), 0);
+        assert!(!crate::player::ffi_host::lifecycle_blocked_for_test());
+    }
+
+    #[test]
+    fn the_releases_own_unloadcompleted_does_not_count_into_the_next_sessions_diagnostics() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(50);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_pending_release());
+        finish_release_for_test(&mut pa);
+        assert!(!crate::player::ffi_host::lifecycle_blocked_for_test(), "the release must still D1");
+        assert_eq!(
+            SHARED.dg_cb_count.load(Ordering::Relaxed),
+            0,
+            "the stopped object's UNLOADCOMPLETED (after reset_session) counted into the next session's callback census"
+        );
+        assert_eq!(SHARED.dg_cb_err_at.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn taking_the_token_or_splitting_never_waits_for_a_running_unload() {
+        for use_split in [false, true] {
+            let mut ps = crate::route::PlaybackSession::IDLE;
+            let _serial = plx_base::testlock::serial();
+            let mut pa = arm(&ps);
+            let _cleanup = Cleanup;
+            playing_engine(&mut pa);
+            crate::player::ffi_host::delay_unload_for_test(UNLOAD_MS);
+            let started = std::time::Instant::now();
+            stop_bufferfeed(&mut ps, &mut pa);
+            assert!(pa.has_pending_release());
+            let before = std::time::Instant::now();
+            if use_split {
+                let _ = pa.split();
+            } else {
+                let _ = pa.mt();
+            }
+            assert!(
+                before.elapsed() < std::time::Duration::from_millis(UNLOAD_MS / 4),
+                "{} waited for the running Unload (PLX-NATIVE-1Q)",
+                if use_split { "split()" } else { "mt()" }
+            );
+            // …and a verb through the fenced sink does not reach the object the worker is inside.
+            assert_eq!(
+                unsafe { crate::player::sink().pause(pa.mt()) },
+                0,
+                "a main-thread verb reached the object while it was Releasing"
+            );
+            assert!(pa.has_pending_release(), "nothing may finish the release but its own poll");
+            finish_release_for_test(&mut pa);
+            assert!(
+                started.elapsed() >= std::time::Duration::from_millis(UNLOAD_MS),
+                "the release finished before the Unload returned"
+            );
+            assert_eq!(ready_now(), 0);
+            assert!(!crate::player::ffi_host::lifecycle_blocked_for_test());
+        }
+    }
+
+    #[test]
+    fn a_refused_unload_thread_unloads_on_the_main_thread_and_still_d1s() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_UNLOAD_SPAWN_FOR_TEST.store(false, Ordering::Relaxed);
+            }
+        }
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let _reset = Reset;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(150);
+        FAIL_UNLOAD_SPAWN_FOR_TEST.store(true, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "with no thread the Unload must have run synchronously inside the stop"
+        );
+        assert!(!pa.has_pending_release(), "no worker exists, so nothing may be parked");
+        assert_eq!(ready_now(), 0, "the object must be destroyed");
+        assert!(!crate::player::ffi_host::lifecycle_blocked_for_test(), "the fallback must end in a D1");
+    }
+
+    /// Lets the held host `Unload` go when a test unwinds, so a failed assertion cannot leave
+    /// the next test's release hanging.
+    struct ReleaseUnloadOnDrop;
+    impl Drop for ReleaseUnloadOnDrop {
+        fn drop(&mut self) {
+            crate::player::ffi_host::release_unload_for_test();
+        }
+    }
+
+    /// PLX-NATIVE-1Q: a start over an `Unload` that never returns froze the UI thread in the
+    /// join. It must come back at once, deferred, and fail typed at the deadline.
+    #[test]
+    fn a_start_over_an_unload_that_never_returns_does_not_block_and_fails_typed_at_the_deadline() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let _release = ReleaseUnloadOnDrop;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::hold_unload_for_test();
+        let t_stop = std::time::Instant::now();
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_pending_release());
+        // A helper lets the hold go after 3 s, so the unfixed code ends instead of hanging.
+        let helper = std::thread::Builder::new()
+            .name("test-unload-release".into())
+            .spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                crate::player::ffi_host::release_unload_for_test();
+            })
+            .expect("spawn helper");
+
+        let started = std::time::Instant::now();
+        let outcome = start_bufferfeed_tracked(&mut ps, &mut pa);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(50),
+            "the start blocked the UI thread for {took:?} over an Unload that had not returned"
+        );
+        assert_eq!(outcome, BufferfeedStartOutcome::Deferred);
+        assert!(!pa.is_live());
+        assert!(SHARED.begin_native_session().is_none());
+        assert!(pa.has_pending_release());
+        assert_eq!(
+            crate::player::state(&ps),
+            crate::player::PlaybackState::Resolving,
+            "a deferred start must read as Connecting, not as an empty player"
+        );
+
+        // The deadline, on the machine's injected clock: the queued start fails typed.
+        let t0 = t_stop;
+        assert!(!poll_release(&mut ps, &mut pa, t0 + crate::player::release::RELEASE_DEADLINE - std::time::Duration::from_millis(1)));
+        assert_ne!(
+            crate::player::error_now(&ps).kind,
+            crate::player::FailureKind::ReleaseTimeout,
+            "the read-out appeared before the deadline"
+        );
+        assert!(!poll_release(&mut ps, &mut pa, t0 + crate::player::release::RELEASE_DEADLINE + std::time::Duration::from_secs(5)));
+        assert_eq!(crate::player::state(&ps), crate::player::PlaybackState::Error);
+        let shape = crate::player::error_now(&ps);
+        assert_eq!(shape.kind, crate::player::FailureKind::ReleaseTimeout);
+        assert_eq!(shape.kind.code(), "release_timeout");
+        let actions = crate::player::failure_actions(
+            shape.kind,
+            crate::player::FailureContext { forced: false, can_retry: true, repair_idle: true, other_copy: false },
+        );
+        assert!(actions.contains(&crate::player::FailureAction::TryAgain), "{actions:?}");
+
+        // A second start is refused with no new object; the leaked object was not D1'd.
+        assert_eq!(start_bufferfeed_tracked(&mut ps, &mut pa), BufferfeedStartOutcome::Failed);
+        assert!(!pa.is_live());
+        assert_eq!(crate::player::error_now(&ps).kind, crate::player::FailureKind::ReleaseTimeout);
+        assert_ne!(
+            unsafe { crate::player::raw_sink().ready(&MainThread::assume()) },
+            0,
+            "the overdue object was destroyed under a worker that may still be inside it"
+        );
+        assert!(pa.has_pending_release(), "the overdue release must stay parked");
+        assert!(pa.release_overdue());
+
+        // The Unload finally returns: the tail runs, nothing quarantines, the next start goes.
+        helper.join().unwrap(); // released by the helper after 3 s
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !poll_release(&mut ps, &mut pa, std::time::Instant::now()) {
+            assert!(std::time::Instant::now() < give_up, "the late Unload was never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!pa.has_pending_release());
+        assert_eq!(ready_now(), 0);
+        assert!(!crate::player::ffi_host::lifecycle_blocked_for_test(), "the late tail must D1");
+        assert_ne!(
+            start_bufferfeed_tracked(&mut ps, &mut pa),
+            BufferfeedStartOutcome::Deferred,
+            "the slot must be free again"
+        );
+        assert_ne!(crate::player::error_now(&ps).kind, crate::player::FailureKind::ReleaseTimeout);
+    }
+
+    /// A stop over a deferred start ends that playback: the queued start must not run after the tail.
+    #[test]
+    fn a_stop_over_a_deferred_start_cancels_it() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(50);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert_eq!(start_bufferfeed_tracked(&mut ps, &mut pa), BufferfeedStartOutcome::Deferred);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(!pa.release_has_queued_start());
+        assert_ne!(crate::player::state(&ps), crate::player::PlaybackState::Resolving);
+        // The frame poll (may_start = true) is what would launch a surviving queued start.
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pa.release_busy() {
+            assert!(std::time::Instant::now() < give_up, "the Unload never returned");
+            poll_release(&mut ps, &mut pa, std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!pa.is_live(), "the cancelled start ran after the tail");
+        assert_eq!(ready_now(), 0);
+    }
+
+    /// A landing replaces the whole session (`apply_plan` rebuilds it). The queued start lives in the
+    /// release machine, not in the session, so a stop after that landing still cancels it.
+    #[test]
+    fn a_stop_after_a_landing_replaced_the_session_still_cancels_the_queued_start() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(50);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert_eq!(start_bufferfeed_tracked(&mut ps, &mut pa), BufferfeedStartOutcome::Deferred);
+        assert_eq!(crate::player::state(&ps), crate::player::PlaybackState::Resolving, "derived from the machine");
+        ps = crate::route::PlaybackSession::IDLE; // the landing's rebuilt session
+        assert_eq!(crate::player::state(&ps), crate::player::PlaybackState::Resolving, "the session carries nothing");
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(!pa.release_has_queued_start());
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pa.release_busy() {
+            assert!(std::time::Instant::now() < give_up, "the Unload never returned");
+            poll_release(&mut ps, &mut pa, std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!pa.is_live(), "the queued start survived a stop and ran after the tail");
+    }
+
+    /// The foreground restore over a held `Unload` neither blocks nor loses the start: it parks, and
+    /// lands once the release goes Idle, or fails typed at the deadline.
+    #[test]
+    fn a_foreground_start_over_a_held_unload_parks_without_blocking_then_lands() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let _release = ReleaseUnloadOnDrop;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::hold_unload_for_test();
+        stop_bufferfeed(&mut ps, &mut pa);
+        let t = std::time::Instant::now();
+        assert_eq!(start_bufferfeed_tracked(&mut ps, &mut pa), BufferfeedStartOutcome::Deferred);
+        pa.watch_queued_start();
+        assert_eq!(pa.take_queued_landing(), crate::player::adapter::QueuedLanding::Waiting);
+        poll_release(&mut ps, &mut pa, std::time::Instant::now());
+        assert!(t.elapsed() < std::time::Duration::from_millis(50), "the restore blocked the frame");
+        assert_eq!(pa.take_queued_landing(), crate::player::adapter::QueuedLanding::Waiting);
+        crate::player::ffi_host::release_unload_for_test();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let landing = loop {
+            poll_release(&mut ps, &mut pa, std::time::Instant::now());
+            match pa.take_queued_landing() {
+                crate::player::adapter::QueuedLanding::Waiting => {
+                    assert!(std::time::Instant::now() < give_up, "the deferred start never ran");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                other => break other,
+            }
+        };
+        assert!(
+            !matches!(landing, crate::player::adapter::QueuedLanding::Waiting | crate::player::adapter::QueuedLanding::Stale),
+            "{landing:?}"
+        );
+    }
+
+    /// A preview whose start is queued behind the release is not admitted while queued, and a
+    /// deadline that refuses it (or a run that fails) settles the admission instead of leaving it counted.
+    /// (Admission on a SUCCESSFUL launch needs a route fixture the rig does not have.)
+    #[test]
+    fn a_deferred_preview_start_is_settled_when_it_runs_not_when_queued() {
+        use crate::player::preview::{phase_for_test, set_phase_for_test, reset_for_test, Phase};
+        for refuse in [false, true] {
+            let mut ps = crate::route::PlaybackSession::IDLE;
+            let _serial = plx_base::testlock::serial();
+            let mut pa = arm(&ps);
+            let _cleanup = Cleanup;
+            let _release = ReleaseUnloadOnDrop;
+            reset_for_test();
+            playing_engine(&mut pa);
+            crate::player::ffi_host::hold_unload_for_test();
+            stop_bufferfeed(&mut ps, &mut pa);
+            set_phase_for_test(Phase::Fetching);
+            assert_eq!(start_bufferfeed_tracked(&mut ps, &mut pa), BufferfeedStartOutcome::Deferred);
+            pa.admit_preview_at_launch(true);
+            assert_eq!(phase_for_test(), Phase::Fetching, "queued is not admitted");
+            if refuse {
+                let later = std::time::Instant::now() + crate::player::release::RELEASE_DEADLINE + std::time::Duration::from_secs(1);
+                poll_release(&mut ps, &mut pa, later);
+                assert_eq!(phase_for_test(), Phase::Idle, "a refused start gives the slot back");
+            } else {
+                crate::player::ffi_host::release_unload_for_test();
+                let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while phase_for_test() == Phase::Fetching {
+                    assert!(std::time::Instant::now() < give_up, "the queued start never launched");
+                    poll_release(&mut ps, &mut pa, std::time::Instant::now());
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                // The fixture session has no URL, so the start runs and ends NoRoute: the admission is
+                // settled when the start RUNS (here refused, the slot given back), not when queued.
+                assert_eq!(phase_for_test(), Phase::Idle, "settled at the run, not before");
+            }
+            reset_for_test();
+        }
+    }
+
+    /// …and past the deadline the parked restore fails typed (`release_timeout`), still without blocking.
+    #[test]
+    fn a_foreground_start_over_an_overdue_unload_fails_typed() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let _release = ReleaseUnloadOnDrop;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::hold_unload_for_test();
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert_eq!(start_bufferfeed_tracked(&mut ps, &mut pa), BufferfeedStartOutcome::Deferred);
+        pa.watch_queued_start();
+        let later = std::time::Instant::now() + crate::player::release::RELEASE_DEADLINE + std::time::Duration::from_secs(1);
+        poll_release(&mut ps, &mut pa, later);
+        assert_eq!(pa.take_queued_landing(), crate::player::adapter::QueuedLanding::Failed);
+        assert_eq!(crate::player::error_now(&ps).kind, crate::player::FailureKind::ReleaseTimeout);
+    }
+
+    /// The exit with an `Unload` that never returns is bounded by the deadline and says a worker
+    /// is still in firmware, so the display is not torn down under it.
+    #[test]
+    fn exit_with_an_unload_that_never_returns_is_bounded_and_reports_a_worker_in_firmware() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let _release = ReleaseUnloadOnDrop;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::hold_unload_for_test();
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_pending_release());
+        // An injected clock that jumps a second per look: no real sleep, the deadline in ~11 reads.
+        let t0 = std::time::Instant::now();
+        let mut ticks = 0u64;
+        let exit = exit_native_with(
+            &mut pa,
+            || {
+                ticks += 1;
+                t0 + std::time::Duration::from_secs(ticks)
+            },
+            || {},
+        );
+        assert_eq!(exit, NativeExit::WorkerInFirmware);
+        assert!(ticks >= 10, "the exit gave up before the deadline ({ticks} looks)");
+        // The object is still in firmware: the adapter must not own it (dropping the adapter would
+        // free the Engine under the live Unload), and its drop must never run.
+        assert!(!pa.has_pending_release(), "the overdue object must leave the adapter, leaked");
+        let dropped = ENGINES_DROPPED.load(Ordering::SeqCst);
+        drop(pa);
+        assert_eq!(ENGINES_DROPPED.load(Ordering::SeqCst), dropped, "dropping the adapter freed the Engine");
+        crate::player::ffi_host::release_unload_for_test();
+    }
+
+    /// The flake behind `exit_after_a_load_timeout_never_quits_the_display_under_a_hung_load`: a
+    /// test that ends with its `sf-unload` worker still held leaves a DETACHED thread whose
+    /// `sf_unload` later reads the process-global `ACTIVE_EPOCH` (by then the NEXT test's session)
+    /// and delivers UNLOADCOMPLETED into it. The reset every test opens and closes with must wait
+    /// the worker out, so none outlives its test.
+    #[test]
+    fn the_lifecycle_reset_waits_out_a_released_unload_worker() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let _release = ReleaseUnloadOnDrop;
+        playing_engine(&mut pa);
+        crate::player::ffi_host::hold_unload_for_test();
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert_eq!(
+            crate::player::ffi_host::unload_workers_for_test(),
+            1,
+            "PRECONDITION FAILED: the stop must have a worker inside the held Unload"
+        );
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        assert_eq!(
+            crate::player::ffi_host::unload_workers_for_test(),
+            0,
+            "the reset returned with an sf-unload worker still alive: it could fire into the next test"
+        );
+    }
+
+    #[test]
+    fn an_unloadcompleted_from_the_wrong_epoch_during_the_release_is_not_evidence() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        let mut pa = arm(&ps);
+        let _cleanup = Cleanup;
+        let epoch = playing_engine(&mut pa);
+        crate::player::ffi_host::delay_unload_for_test(UNLOAD_MS);
+        stop_bufferfeed(&mut ps, &mut pa);
+        assert!(pa.has_pending_release());
+        let before = SHARED.dg_cb_count.load(Ordering::Relaxed);
+        super::super::sf_on_event(epoch + 1, 23, 0, std::ptr::null());
+        super::super::sf_on_event(0, 23, 0, std::ptr::null());
+        assert_eq!(SHARED.dg_cb_count.load(Ordering::Relaxed), before, "a wrong-epoch event was processed");
+        assert!(
+            !SHARED.native_unload_completed(epoch),
+            "a wrong-epoch UNLOADCOMPLETED counted as the release's D1 evidence"
+        );
+        finish_release_for_test(&mut pa);
+        assert!(!crate::player::ffi_host::lifecycle_blocked_for_test());
+    }
+}
+
 /// issue #74 D.1 regression tests. Real v0.6.0 dispatches every Starfish/ACB verb through
 /// `sf_ready_object()` alone (`src/starfish.c`), which went live at `SMP_SET_READY(1)` BEFORE the
 /// real, blocking `sf_load` call (`g_load_with_context`) returned — nothing waited for that
@@ -4838,7 +6937,7 @@ mod load_in_flight_tests {
         let payload_ptr = threads::SendPtr(payload.as_ptr() as *mut c_char);
         let load_thread = std::thread::Builder::new()
             .name("test-load-thread".into())
-            .spawn(move || threads::load_thread(payload_ptr, epoch, None))
+            .spawn(move || threads::load_thread(payload_ptr, epoch, None, PcmLead::Off))
             .expect("spawn load_thread");
 
         wait_for_load_in_flight();
@@ -4927,7 +7026,7 @@ mod load_in_flight_tests {
         let payload_ptr = threads::SendPtr(payload.as_ptr() as *mut c_char);
         let load_thread = std::thread::Builder::new()
             .name("test-load-thread-2".into())
-            .spawn(move || threads::load_thread(payload_ptr, epoch, None))
+            .spawn(move || threads::load_thread(payload_ptr, epoch, None, PcmLead::Off))
             .expect("spawn load_thread");
         wait_for_load_in_flight();
 
@@ -4996,7 +7095,7 @@ mod load_in_flight_tests {
         let payload_ptr = threads::SendPtr(payload.as_ptr() as *mut c_char);
         let load_thread = std::thread::Builder::new()
             .name("test-load-thread-budget".into())
-            .spawn(move || threads::load_thread(payload_ptr, epoch, None))
+            .spawn(move || threads::load_thread(payload_ptr, epoch, None, PcmLead::Off))
             .expect("spawn load_thread");
         wait_for_load_in_flight();
 
@@ -5061,7 +7160,7 @@ mod load_in_flight_tests {
         pa.install(engine_loading(epoch));
 
         assert!(
-            SHARED.mark_native_load_returned(epoch).is_some(),
+            SHARED.mark_native_load_returned(epoch, None).is_some(),
             "PRECONDITION FAILED: Load must actually be marked Returned, or this test proves \
              nothing about the second-half budget"
         );
@@ -5164,7 +7263,7 @@ mod load_in_flight_tests {
         let other_epoch = epoch.wrapping_add(1).max(1);
         assert_ne!(other_epoch, epoch, "the test must pick a genuinely different epoch");
         assert!(
-            SHARED.mark_native_load_returned(other_epoch).is_none(),
+            SHARED.mark_native_load_returned(other_epoch, None).is_none(),
             "marking an epoch that does not own the Active phase must be a no-op"
         );
         assert!(
@@ -5219,10 +7318,10 @@ mod load_in_flight_tests {
         let old = SHARED.begin_native_session().unwrap();
         assert!(SHARED.retire_native_session(old));
         let current = SHARED.begin_native_session().unwrap();
-        threads::load_thread(threads::SendPtr(c"{}".as_ptr() as *mut c_char), old, None);
+        threads::load_thread(threads::SendPtr(c"{}".as_ptr() as *mut c_char), old, None, PcmLead::Off);
         assert!(!SHARED.load_failed.load(Ordering::Acquire), "a stale worker must not poison the newer epoch");
         assert!(!SHARED.native_load_returned(current));
-        threads::load_thread(threads::SendPtr(c"{}".as_ptr() as *mut c_char), current, None);
+        threads::load_thread(threads::SendPtr(c"{}".as_ptr() as *mut c_char), current, None, PcmLead::Off);
         assert!(SHARED.load_failed.load(Ordering::Acquire), "a current synchronous refusal must still fail");
     }
 
@@ -5274,7 +7373,7 @@ mod load_in_flight_tests {
         eng.load_th = Some(
             std::thread::Builder::new()
                 .name("test-load-thread-hung".into())
-                .spawn(move || threads::load_thread(payload_ptr, epoch, None))
+                .spawn(move || threads::load_thread(payload_ptr, epoch, None, PcmLead::Off))
                 .expect("spawn load_thread"),
         );
         pa.install(eng);
@@ -5393,7 +7492,7 @@ mod load_in_flight_tests {
         eng.load_th = Some(
             std::thread::Builder::new()
                 .name("test-load-thread-hung".into())
-                .spawn(move || threads::load_thread(payload_ptr, epoch, None))
+                .spawn(move || threads::load_thread(payload_ptr, epoch, None, PcmLead::Off))
                 .expect("spawn load_thread"),
         );
         pa.install(eng);
@@ -5407,6 +7506,35 @@ mod load_in_flight_tests {
             SHARED.load_timed_out.load(Ordering::Acquire),
             "PRECONDITION FAILED: the budget must have fired, or this test is not about a timed-out Load"
         );
+    }
+
+    /// The exit after a playback error (`load_timeout`): `app::run::shutdown` then quits SDL and
+    /// destroys the Wayland display. A Load still inside firmware on the `media` thread must make
+    /// the exit say so, so the display is left to the OS rather than torn down under it.
+    #[test]
+    fn exit_after_a_load_timeout_never_quits_the_display_under_a_hung_load() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        SHARED.reset_session();
+        crate::route::reset_player_control_for_test(&ps);
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        let _cleanup = Cleanup;
+        let _release = ReleaseLoadOnDrop;
+        let mut pa = crate::player::adapter::PlayerAdapter::new(unsafe {
+            plx_base::task::MainThread::assume()
+        });
+        install_engine_with_timed_out_load(&mut ps, &mut pa);
+        stop_bufferfeed(&mut ps, &mut pa);
+        let exit = exit_native(&mut pa);
+        assert!(
+            exit == NativeExit::WorkerInFirmware || !crate::player::ffi_host::load_in_flight_for_test(),
+            "the exit's native half returned with a Load still inside firmware: SDL_Quit would run under it"
+        );
+        assert_eq!(exit, NativeExit::WorkerInFirmware);
+        // The payload the `media` thread reads is leaked, not owned by the adapter that is dropped next.
+        assert!(!pa.has_abandoned_load(), "the parked Load must leave the adapter, leaked");
+        crate::player::ffi_host::release_load_for_test();
     }
 
     /// PLX-NATIVE-15: the Auto Original's Load passes its budget, the HLS recovery reloads while
@@ -5534,7 +7662,7 @@ mod load_in_flight_tests {
             BufferfeedStartOutcome::Failed,
             "PRECONDITION FAILED: the fresh start must be refused for the parked Load"
         );
-        assert!(ps.native_start_refused, "PRECONDITION FAILED: the refusal must be recorded");
+        assert!(ps.native_start_refused.is_some(), "PRECONDITION FAILED: the refusal must be recorded");
 
         // The parked Load returns and is reaped; the rollback's reload then starts.
         crate::player::ffi_host::release_load_for_test();
@@ -5557,6 +7685,229 @@ mod load_in_flight_tests {
              (and report::tick would send a bogus load_timeout)"
         );
         stop_bufferfeed(&mut ps, &mut pa);
+    }
+
+
+}
+
+#[cfg(test)]
+mod pcm_info_tests {
+    use super::*;
+    use crate::route::PcmFormat;
+
+    const BASE: &str = r#"{"contents":{"codec":{"audio":"PCM"},"provider":"plxnative"}}"#;
+
+    #[test]
+    fn a_pcm_load_states_the_shape_the_decoder_produces() {
+        let f = PcmFormat { sample_rate: 48_000, bits: 16, channels: 2, source_rate: 48_000 };
+        let p = with_pcm_info(BASE, "PCM", Some(f));
+        assert!(p.contains(r#""pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#), "{p}");
+        let wide = with_pcm_info(BASE, "PCM", Some(PcmFormat { sample_rate: 48_000, bits: 32, channels: 1, source_rate: 96_000 }));
+        assert!(wide.contains(r#""format":"S32LE","channelMode":"mono""#) && wide.contains(r#""bitsPerSample":32"#), "{wide}");
+        // the payload stays parseable JSON
+        serde_json::from_str::<serde_json::Value>(&p).unwrap();
+    }
+
+    /// **A hi-res track the app resamples is declared as what the decoder emits**, never as the file's own rate:
+    /// the Load is built from the format `route::pcm_format_of` returns, which names the PCM input's table
+    /// rate in S32 (a 16-bit source included), so the payload carries 48 or 44.1 kHz and 32 bits and none of 96, 192 or 88.2.
+    #[test]
+    fn a_resampled_hi_res_track_declares_the_tables_rate_and_a_32_bit_sample() {
+        let track = |rate: i64, bits: i64| crate::route::CarriedAudio {
+            sid: 7, ordinal: 4, codec: "flac".into(), channels: 2,
+            can_normalize_loudness: false, immersive: false, sample_rate: rate, bit_depth: bits,
+        };
+        for (rate, bits, khz, never) in [(96_000, 24, "48", ["96", "192", "88.2"]), (192_000, 24, "48", ["96", "192", "88.2"]), (88_200, 16, "44.1", ["96", "192", "88.2"])] {
+            let f = crate::route::pcm_format_of(Some(&track(rate, bits)), "flac").unwrap();
+            let p = with_pcm_info(BASE, "PCM", Some(f));
+            let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+            let info = &v["contents"]["pcmInfo"];
+            assert_eq!(info["format"], "S32LE", "{rate}/{bits}: {p}");
+            assert_eq!(info["bitsPerSample"], 32, "{rate}/{bits}: {p}");
+            assert_eq!(info["sampleRate"].as_f64(), khz.parse::<f64>().ok(), "{rate}/{bits}: {p}");
+            for n in never {
+                assert!(!p.contains(&format!(r#""sampleRate":{n}"#)), "{rate}/{bits}: the file's own rate {n} must not be declared: {p}");
+            }
+        }
+    }
+
+    /// The diagnostics line names the track's own rate only where the app resamples it.
+    #[test]
+    fn the_decode_log_line_names_the_source_rate_only_when_it_is_resampled() {
+        let exact = PcmFormat { sample_rate: 48_000, bits: 16, channels: 2, source_rate: 48_000 };
+        assert_eq!(pcm_decode_line("flac", &exact), "pcm: flac decoded in-app -> 48000Hz 16-bit 2ch");
+        let hires = PcmFormat { sample_rate: 48_000, bits: 32, channels: 2, source_rate: 96_000 };
+        assert_eq!(pcm_decode_line("flac", &hires), "pcm: flac decoded in-app -> 48000Hz 32-bit 2ch (resampled from 96000Hz)");
+        assert_eq!(pcm_decode_line("dca", &PcmFormat::STEREO_48K), "pcm: dca decoded in-app -> 48000Hz 16-bit 2ch");
+    }
+
+    /// Every rate the PCM path admits is declared in kilohertz, the unit libpf's table is in. In
+    /// hertz each of them played at the 44.1 kHz fallback on the B8, with no error anywhere.
+    #[test]
+    fn the_sample_rate_is_declared_in_kilohertz() {
+        let want = ["8", "12", "16", "22.05", "24", "32", "44.1", "48"];
+        for (hz, khz) in plx_platform::devcaps::PCM_SAMPLE_RATES.into_iter().zip(want) {
+            assert_eq!(pcm_rate_khz(hz), khz);
+            let p = with_pcm_info(BASE, "PCM", Some(PcmFormat { sample_rate: hz, bits: 16, channels: 2, source_rate: hz }));
+            let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+            let declared = v["contents"]["pcmInfo"]["sampleRate"].as_f64().unwrap();
+            assert!((declared * 1000.0 - f64::from(hz)).abs() < 1e-6, "{hz}: {p}");
+        }
+        assert_eq!(pcm_rate_khz(11_025), "11.025");
+    }
+
+    #[test]
+    fn a_speed_session_leaves_the_pcm_to_the_speed_decoder() {
+        let f = || Some(Ok(PcmFormat { sample_rate: 44_100, bits: 16, channels: 2, source_rate: 44_100 }));
+        assert_eq!(app_pcm_for_rate(crate::player::RATE_NORMAL, f()), f(), "1x: the FLAC decoder's shape");
+        assert!(app_pcm_for_rate(1500, f()).is_none(), "1.5x: the speed decoder declares its own");
+        // a FLAC track whose facts are missing only fails at 1x, where the FLAC decoder needs them
+        let missing = || Some(Err("unknown".to_string()));
+        assert!(app_pcm_for_rate(crate::player::RATE_NORMAL, missing()).is_some_and(|r| r.is_err()));
+        assert!(app_pcm_for_rate(750, missing()).is_none());
+    }
+
+    /// **DTS the attempt decodes in the app** is declared as PCM — stereo 48 kHz S16, one `pcmInfo` — and
+    /// where it does not is `DTS` exactly as before. The shape is the session's own
+    /// (`route::stream_pcm`), so a native DTS Load can never carry a PCM node nor the reverse.
+    #[test]
+    fn app_decoded_dts_is_declared_as_pcm_and_native_dts_as_dts() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        crate::route::set_stream_codecs(&mut ps, "h264", "dts");
+        assert_eq!(audio_declaration("dts", crate::route::stream_pcm(&ps).and_then(Result::ok).as_ref()), Some(("DTS", 4)));
+        let off = build_av_payload_at(&ps, "H264", "DTS", ENVELOPE_FHD60, crate::player::RATE_NORMAL);
+        assert!(off.contains(r#""audio":"DTS""#) && !off.contains("pcmInfo"), "{off}");
+
+        crate::route::begin_attempt_for_test(
+            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+        );
+        let shape = crate::route::stream_pcm(&ps).and_then(Result::ok);
+        assert_eq!(shape, Some(crate::route::PcmFormat::STEREO_48K));
+        assert_eq!(audio_declaration("dts", shape.as_ref()), Some(("PCM", 5)));
+        let on = build_av_payload_at(&ps, "H264", "PCM", ENVELOPE_FHD60, crate::player::RATE_NORMAL);
+        assert!(on.contains(r#""audio":"PCM""#), "{on}");
+        assert_eq!(on.matches("pcmInfo").count(), 1, "{on}");
+        assert!(on.contains(r#""format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16"#), "{on}");
+        // at a speed the speed decoder declares PCM itself, from the same codec: still one node
+        let fast = build_av_payload_at(&ps, "H264", "PCM", ENVELOPE_FHD60, 1500);
+        assert_eq!(fast.matches("pcmInfo").count(), 1, "{fast}");
+        serde_json::from_str::<serde_json::Value>(&on).unwrap();
+    }
+
+    /// **Force Direct Play on a set with no DTS row declares a STEREO DTS track as stereo 48 kHz PCM**: the
+    /// app decodes it (the table's lossy policy admits DTS, the set has no native path, and a 2.0 source
+    /// is no downmix, `Caps::app_may_mix_down`), so the Load carries one `pcmInfo` and `PCM` instead of a
+    /// `DTS` the pipeline would hang on. Under Auto the same value still declares `DTS`. The carried track
+    /// supplies the channel count the rule reads; a 5.1 one is refused before any Load
+    /// (`forced_resolve_refuses_a_surround_dts_track_instead_of_mixing_it_down`).
+    #[test]
+    fn a_forced_dts_with_no_row_is_declared_as_stereo_48k_pcm() {
+        let caps = std::sync::Arc::new(plx_platform::devcaps::Caps {
+            app_lossy: plx_platform::devcaps::AppLossy::Measured,
+            ..plx_platform::devcaps::Caps::assumed()
+        });
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        crate::route::begin_attempt_for_test(&mut ps, caps);
+        crate::route::set_stream_codecs(&mut ps, "h264", "dts");
+        crate::route::set_carried_audio_for_test(
+            &mut ps,
+            crate::route::CarriedAudio {
+                sid: 7, ordinal: 1, codec: "dts".into(), channels: 2,
+                can_normalize_loudness: false, immersive: false, sample_rate: 48_000, bit_depth: 0,
+            },
+        );
+        assert_eq!(crate::route::stream_pcm(&ps).and_then(Result::ok), None, "Auto: the native decoder's");
+        crate::route::set_direct_play_mode_for_test(&mut ps, crate::route::DirectPlayMode::Forced);
+        let shape = crate::route::stream_pcm(&ps).and_then(Result::ok);
+        assert_eq!(shape, Some(crate::route::PcmFormat::STEREO_48K));
+        assert_eq!(audio_declaration("dts", shape.as_ref()), Some(("PCM", 5)));
+        let on = build_av_payload_at(&ps, "H264", "PCM", ENVELOPE_FHD60, crate::player::RATE_NORMAL);
+        assert!(on.contains(r#""audio":"PCM""#) && !on.contains(r#""audio":"DTS""#), "{on}");
+        assert_eq!(on.matches("pcmInfo").count(), 1, "{on}");
+        serde_json::from_str::<serde_json::Value>(&on).unwrap();
+    }
+
+    /// MP3 and Vorbis in force (S4-4) are declared exactly as DTS is: `PCM`, stereo 48 kHz S16.
+    #[test]
+    fn app_decoded_mp3_and_vorbis_are_declared_as_pcm_and_native_ones_are_refused() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        for codec in ["mp3", "vorbis"] {
+            crate::route::set_stream_codecs(&mut ps, "h264", codec);
+            let off = crate::route::stream_pcm(&ps).and_then(Result::ok);
+            assert_eq!(off, None, "{codec}: gate off");
+            assert_eq!(audio_declaration(codec, off.as_ref()).map(|d| d.0).filter(|n| *n == "PCM"), None, "{codec}");
+        }
+        crate::route::begin_attempt_for_test(
+            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+        );
+        for codec in ["mp3", "vorbis"] {
+            crate::route::set_stream_codecs(&mut ps, "h264", codec);
+            let shape = crate::route::stream_pcm(&ps).and_then(Result::ok);
+            assert_eq!(shape, Some(crate::route::PcmFormat::STEREO_48K), "{codec}");
+            assert_eq!(audio_declaration(codec, shape.as_ref()), Some(("PCM", 5)), "{codec}");
+            let on = build_av_payload_at(&ps, "H264", "PCM", ENVELOPE_FHD60, crate::player::RATE_NORMAL);
+            assert_eq!(on.matches("pcmInfo").count(), 1, "{codec}: {on}");
+            // declared PCM, so planned the stack's lead like a FLAC Load (`load_audio` is the one value)
+            let planned =
+                load_audio(codec, crate::player::RATE_NORMAL, shape.as_ref(), None, AudioStack::Liblxa).unwrap();
+            assert_eq!((planned.name, planned.lead), ("PCM", PcmLead::FromOutput(AudioStack::Liblxa)), "{codec}");
+        }
+    }
+
+    /// TrueHD in force (S4-5) is declared as `PCM`, stereo 48 kHz S16, like the other lossy ones.
+    #[test]
+    fn app_decoded_truehd_is_declared_as_pcm() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        crate::route::set_stream_codecs(&mut ps, "h264", "truehd");
+        assert_eq!(crate::route::stream_pcm(&ps).and_then(Result::ok), None, "not in force");
+        crate::route::begin_attempt_for_test(
+            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+        );
+        crate::route::set_stream_codecs(&mut ps, "h264", "truehd");
+        let shape = crate::route::stream_pcm(&ps).and_then(Result::ok);
+        assert_eq!(shape, Some(crate::route::PcmFormat::STEREO_48K));
+        assert_eq!(audio_declaration("truehd", shape.as_ref()), Some(("PCM", 5)));
+        let on = build_av_payload_at(&ps, "H264", "PCM", ENVELOPE_FHD60, crate::player::RATE_NORMAL);
+        assert_eq!(on.matches("pcmInfo").count(), 1, "{on}");
+        let planned = load_audio("truehd", crate::player::RATE_NORMAL, shape.as_ref(), None, AudioStack::Liblxa).unwrap();
+        assert_eq!((planned.name, planned.lead), ("PCM", PcmLead::FromOutput(AudioStack::Liblxa)), "planned the stack's lead");
+    }
+
+    /// **An app-decoded lossy track at a playback speed still loads.** At a speed the speed decoder
+    /// declares PCM itself and the app-decoded shape is dropped ([`app_pcm_for_rate`]), so `load_audio`
+    /// is asked for a codec the pipeline has no payload name for (`mp3`, `vorbis`, `truehd`): the Load must still
+    /// declare PCM and take the stack's lead, as a speed session on any other codec does, not be
+    /// refused as an "unsupported audio codec". The `pcm` argument is derived exactly as
+    /// `start_bufferfeed_inner` derives it, so this goes through the Load's own path (the speed
+    /// assertion of `app_decoded_dts_is_declared_as_pcm_and_native_dts_as_dts` hands `"PCM"` straight
+    /// to the payload builder and cannot see this).
+    #[test]
+    fn an_app_decoded_lossy_track_loads_as_pcm_at_a_speed() {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        crate::route::begin_attempt_for_test(
+            &mut ps, std::sync::Arc::new(plx_platform::devcaps::Caps::assumed().with_app_lossy()),
+        );
+        for codec in ["mp3", "vorbis", "truehd"] {
+            crate::route::set_stream_codecs(&mut ps, "h264", codec);
+            for rate in [500, 1500, 2000] {
+                let pcm = app_pcm_for_rate(rate, crate::route::stream_pcm(&ps)).and_then(Result::ok);
+                assert_eq!(pcm, None, "{codec} at {rate}: the speed decoder declares the shape");
+                let planned = load_audio(codec, rate, pcm.as_ref(), None, AudioStack::Liblxa)
+                    .map(|a| (a.name, a.diagnostic, a.lead));
+                assert_eq!(
+                    planned,
+                    Some(("PCM", 5, PcmLead::FromOutput(AudioStack::Liblxa))),
+                    "{codec} at {rate}: a speed session declares PCM whatever the codec is called"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_pcm_load_carries_pcm_info() {
+        let f = PcmFormat { sample_rate: 48_000, bits: 16, channels: 2, source_rate: 48_000 };
+        assert_eq!(with_pcm_info(BASE, "AC3", Some(f)), BASE);
+        assert_eq!(with_pcm_info(BASE, "PCM", None), BASE);
     }
 }
 
@@ -5582,11 +7933,110 @@ mod sink_envelope_tests {
         c.hevc_row = hevc;
         c
     }
+    /// The synthesized header is byte-for-byte the CodecPrivate of a real 5.1 Opus MKV track
+    /// (`ffprobe -show_entries stream=extradata`, libopus surround layout), and stereo is the
+    /// 19-byte family-0 form; a width SMP cannot be told about is refused, not guessed.
+    #[test]
+    fn opus_head_matches_a_real_surround_track_and_refuses_unknown_widths() {
+        let real_51: [u8; 27] = [
+            0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 0x01, 0x06, 0x38, 0x01, 0x80, 0xbb,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x02, 0x00, 0x04, 0x01, 0x02, 0x03, 0x05,
+        ];
+        assert_eq!(opus_head(6).unwrap(), real_51);
+        let stereo = opus_head(2).unwrap();
+        assert_eq!(stereo.len(), 19);
+        assert_eq!(&stereo[8..10], &[1, 2]);
+        assert_eq!(stereo[18], 0, "mapping family 0");
+        for channels in 1..=8 {
+            let h = opus_head(channels).unwrap();
+            assert_eq!(h.len(), if channels <= 2 { 19 } else { 21 + channels as usize });
+        }
+        for bad in [0, -1, 9, 255] {
+            assert_eq!(opus_head(bad), None);
+        }
+    }
+
+    /// An OPUS Load declares the codec and carries exactly one `opusInfo` inside `contents`, and
+    /// the result is still one valid JSON document.
+    #[test]
+    fn an_opus_load_carries_one_opus_info_node() {
+        assert_eq!(audio_payload_codec("opus"), Some(("OPUS", 6)));
+        let ps = crate::route::PlaybackSession::IDLE;
+        let p = with_opus_info(&build_av_payload(&ps, "AV1", "OPUS", ENVELOPE_FHD60), 6).unwrap();
+        assert_eq!(p.matches(r#""opusInfo""#).count(), 1);
+        let v: serde_json::Value = serde_json::from_str(&p).expect("valid JSON");
+        let contents = &v["args"][0]["option"]["externalStreamingInfo"]["contents"];
+        assert_eq!(contents["codec"]["audio"], "OPUS");
+        assert_eq!(contents["opusInfo"]["channels"], 6);
+        assert_eq!(contents["opusInfo"]["streamHeader"], plx_base::b64::encode(&opus_head(6).unwrap()));
+        assert_eq!(with_opus_info(&p, 0), None);
+    }
+
+    /// The speed menu offers only what the Load can declare: on a set whose measured H.264 row is
+    /// 4K@30, a 24p stream at 1.5x is fed at 36 fps and the envelope clamps the declaration to 30,
+    /// so 1.5x and above are not offered. Without a measured table, for a codec the Load cannot
+    /// declare, or for a row with no rate, the flat [`SPEED_MAX_FPS`] ceiling stands.
+    #[test]
+    fn the_speed_offer_stops_at_the_measured_rows_frame_rate() {
+        let row30 = plx_platform::devcaps::Caps {
+            h264_row: (3840, 2160, 30),
+            ..plx_platform::devcaps::Caps::assumed()
+        };
+        let offered = |fps: f64, video: Option<LoadVideo>, caps: &plx_platform::devcaps::Caps, measured: bool| {
+            crate::player::speeds_within(fps, speed_fps_ceiling(video, caps, measured))
+        };
+        assert_eq!(
+            offered(24.0, Some(LoadVideo::H264), &row30, true),
+            vec![500, 750, 1000, 1250],
+            "24p at 1.5x is fed at 36 fps, past a 30 fps row"
+        );
+        assert_eq!(
+            offered(29.97, Some(LoadVideo::H264), &row30, true),
+            vec![500, 750, 1000],
+            "29.97p is within the 30 row at 1x only"
+        );
+        assert_eq!(
+            offered(24.0, Some(LoadVideo::H265), &row30, true),
+            crate::player::PLAY_RATES.to_vec(),
+            "the H.264 row bounds H.264 only"
+        );
+        for (what, video, caps, measured) in [
+            ("an unmeasured table", Some(LoadVideo::H264), &row30, false),
+            ("a codec the Load cannot declare", None, &row30, true),
+            (
+                "a row with no rate",
+                Some(LoadVideo::H264),
+                &plx_platform::devcaps::Caps { h264_row: (3840, 2160, 0), ..plx_platform::devcaps::Caps::assumed() },
+                true,
+            ),
+        ] {
+            assert_eq!(speed_fps_ceiling(video, caps, measured), crate::player::SPEED_MAX_FPS, "{what}");
+        }
+        let row120 = plx_platform::devcaps::Caps {
+            h264_row: (3840, 2160, 120),
+            ..plx_platform::devcaps::Caps::assumed()
+        };
+        assert_eq!(
+            speed_fps_ceiling(Some(LoadVideo::H264), &row120, true),
+            crate::player::SPEED_MAX_FPS,
+            "a faster row never raises the ceiling"
+        );
+    }
     #[test]
     fn audio_payload_names_dts_and_refuses_unsupported_formats() {
         assert_eq!(audio_payload_codec("dts"), Some(("DTS", 4)));
         assert_eq!(audio_payload_codec("eac3"), Some(("AC3 PLUS", 2)));
-        for codec in ["truehd", "flac", "", "unknown"] {
+        // PMS's own spelling of DTS, and the other spellings the shared canonicaliser folds.
+        assert_eq!(audio_payload_codec("dca"), Some(("DTS", 4)));
+        assert_eq!(audio_payload_codec("DCA"), Some(("DTS", 4)));
+        assert_eq!(audio_payload_codec("ec-3"), Some(("AC3 PLUS", 2)));
+        assert_eq!(audio_payload_codec("flac"), Some(("PCM", 5)));
+        assert_eq!(audio_payload_codec("FLAC"), Some(("PCM", 5)));
+        // ALAC and every LPCM flavour the bundled FFmpeg decodes are fed as the same PCM
+        for codec in ["alac", "ALAC", "pcm", "lpcm", "pcm_s16le", "pcm_s24le", "pcm_s32be"] {
+            assert_eq!(audio_payload_codec(codec), Some(("PCM", 5)), "{codec}");
+        }
+        for codec in ["truehd", "", "unknown", "pcm_f32le", "pcm_bluray", "pcm_u8"] {
             assert_eq!(audio_payload_codec(codec), None);
         }
         let ps = crate::route::PlaybackSession::IDLE;
@@ -5659,6 +8109,27 @@ mod sink_envelope_tests {
         assert_eq!(sink_envelope(LoadVideo::H264, (3840, 2160), 30.0, &slow, true).fps, 25);
     }
 
+    /// Issue #665: an MKV's 1 ms timebase stores a 30p frame as 33 ms, so PMS reports 30.303 and
+    /// the strict class rounded it up to 50, which a 4K@30 H.264 decoder refuses. A rate within
+    /// the timebase rounding error above a class snaps to it; a genuinely higher one still rounds up.
+    #[test]
+    fn a_millisecond_timebase_rate_snaps_to_its_class() {
+        let c = caps(DEV_SET.0, DEV_SET.1);
+        for (fps, want) in [
+            (30.303, 30), (24.39, 24), (23.81, 24), (25.0, 25), (50.0, 50), (58.82, 60), (59.94, 60),
+            (31.0, 50), (26.0, 30),
+        ] {
+            assert_eq!(sink_envelope(LoadVideo::H264, (3840, 2160), fps, &c, false).fps, want, "h264 {fps}");
+        }
+    }
+
+    /// Issue #665: the re-encode of a 4K source at 480p declares FHD60 for H.264.
+    #[test]
+    fn a_480p_ceiling_on_a_4k_source_declares_fhd60_for_h264() {
+        let c = caps(DEV_SET.0, DEV_SET.1);
+        assert_eq!(sink_envelope(LoadVideo::H264, (854, 480), 0.0, &c, false), ENVELOPE_FHD60);
+    }
+
     #[test]
     fn the_payload_carries_all_three_envelope_numbers() {
         let ps = crate::route::PlaybackSession::IDLE;
@@ -5669,6 +8140,98 @@ mod sink_envelope_tests {
         let p = build_av_payload(&ps, "H265", "AC3 PLUS", ENVELOPE_UHD60);
         assert!(p.contains(r#""maxWidth":3840"#) && p.contains(r#""maxHeight":2160"#), "{p}");
         assert!(!p.contains(r#""maxFrameRate":30"#), "the template's 30 must be replaced: {p}");
+    }
+
+    /// A playback-speed Load declares PCM with its format, the sample rate in KILOHERTZ (libpf
+    /// matches `48`; `48000` silently became 44.1 on the 3.9.3 set). Compressed audio carries no
+    /// `pcmInfo` at all, so every playback without a speed is byte-for-byte what it was.
+    #[test]
+    fn a_pcm_load_declares_its_format_and_compressed_audio_does_not() {
+        let ps = crate::route::PlaybackSession::IDLE;
+        let p = build_av_payload(&ps, "H264", "PCM", ENVELOPE_FHD60);
+        assert!(p.contains(r#""audio":"PCM""#), "{p}");
+        assert!(
+            p.contains(r#""pcmInfo":{"bitsPerSample":16,"sampleRate":48,"channelMode":"stereo"},"esInfo":"#),
+            "{p}"
+        );
+        assert_eq!(p.matches("pcmInfo").count(), 1);
+        for audio in ["AAC", "AC3", "AC3 PLUS", "DTS"] {
+            assert!(!build_av_payload(&ps, "H264", audio, ENVELOPE_FHD60).contains("pcmInfo"), "{audio}");
+        }
+    }
+
+    /// A real session playing 44.1 kHz / 16-bit stereo FLAC, as the route carries it.
+    fn flac_session() -> crate::route::PlaybackSession {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        assert!(crate::route::set_stream_declaration_for_test(
+            &mut ps,
+            "h264",
+            "flac",
+            0.0,
+            plx_data::metadata::Dovi::NONE,
+            false,
+            plx_platform::devcaps::dv::DvCapability::Supported,
+        ));
+        crate::route::set_carried_audio_for_test(
+            &mut ps,
+            crate::route::CarriedAudio {
+                sid: 7, ordinal: 1, codec: "flac".into(), channels: 2,
+                can_normalize_loudness: false, immersive: false, sample_rate: 44_100, bit_depth: 16,
+            },
+        );
+        ps
+    }
+
+    /// The Load carries EXACTLY ONE `pcmInfo`. At 1x a FLAC session declares `audio:"PCM"` too
+    /// (`audio_payload_codec`), and the speed decoder's fixed kilohertz node used to be inserted
+    /// as well, so the Load held two nodes that disagreed on the rate's unit and the bit depth.
+    #[test]
+    fn a_flac_load_at_1x_carries_only_its_own_pcm_info() {
+        let p = build_av_payload_at(&flac_session(), "H264", "PCM", ENVELOPE_FHD60, crate::player::RATE_NORMAL);
+        assert_eq!(p.matches("pcmInfo").count(), 1, "{p}");
+        assert!(
+            p.contains(r#""pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":44.1,"bitsPerSample":16}"#),
+            "{p}"
+        );
+        assert!(!p.contains(r#""sampleRate":48,"#), "the speed decoder's node must be absent: {p}");
+        serde_json::from_str::<serde_json::Value>(&p).unwrap();
+    }
+
+    /// At a speed the speed decoder owns the PCM, FLAC included: main's fixed node, and only it.
+    #[test]
+    fn a_flac_load_at_a_speed_carries_the_speed_decoders_pcm_info() {
+        for rate in [500, 1500, 2000] {
+            let p = build_av_payload_at(&flac_session(), "H264", "PCM", ENVELOPE_FHD60, rate);
+            assert_eq!(p.matches("pcmInfo").count(), 1, "{rate}: {p}");
+            assert!(
+                p.contains(r#""pcmInfo":{"bitsPerSample":16,"sampleRate":48,"channelMode":"stereo"},"esInfo":"#),
+                "{rate}: {p}"
+            );
+            assert!(!p.contains("S16LE"), "{rate}: {p}");
+        }
+    }
+
+    /// Compressed audio carries no `pcmInfo`, whatever the session's own track is.
+    #[test]
+    fn compressed_audio_carries_no_pcm_info_even_on_a_flac_session() {
+        for rate in [crate::player::RATE_NORMAL, 1500] {
+            for audio in ["AAC", "AC3", "AC3 PLUS", "DTS"] {
+                let p = build_av_payload_at(&flac_session(), "H264", audio, ENVELOPE_FHD60, rate);
+                assert!(!p.contains("pcmInfo"), "{rate} {audio}: {p}");
+            }
+        }
+    }
+
+    /// At a speed the Load declares the rate actually fed, exactly: 23.976 at 1.5x is 36000/1001,
+    /// and at 1x every declaration is what it was.
+    #[test]
+    fn a_speed_declares_the_fed_frame_rate() {
+        assert_eq!(super::fed_fps_rational(23.976, 1000), Some((24000, 1001)));
+        assert_eq!(super::fed_fps_rational(23.976, 1500), Some((36000, 1001)));
+        assert_eq!(super::fed_fps_rational(25.0, 2000), Some((50, 1)));
+        assert_eq!(super::fed_fps_rational(29.97, 500), Some((15000, 1001)));
+        assert_eq!(super::fed_fps_rational(0.0, 1500), None);
+        assert!((super::fed_fps(30.0, 2000) - 60.0).abs() < 1e-9);
     }
 
     /// The static payloads' declared envelopes, read out of the strings that are actually sent.
@@ -5988,5 +8551,851 @@ mod late_audio_start_tests {
         assert!(eng.max_fed_video_pts > 0, "PRECONDITION FAILED: the host sink fed no video");
         assert_eq!(eng.max_fed_audio_pts, 0, "stale audio must not reach the sink");
         assert_eq!(eng.audio_start_fp, None);
+    }
+}
+
+/// **Issue #568: on webOS 5+ (`VP_EXPORTED`) every direct-play seek was a full fresh Starfish
+/// `Load` (black screen, the DV/HDR badge re-popping).** `scrub: tap commit 905s` was followed by
+/// `reload_at: fresh Load at 905s`, because the Kodi in-place path reaches LG-private objects and
+/// was switched off there. The seek now goes through LG's public `StarfishMediaAPIs::Seek`.
+///
+/// These drive the real mode selection, the pump's reload-or-in-place decision and the real
+/// [`feed_stream`] re-anchor against the host sink with the clock sink armed, which reports
+/// `VP_EXPORTED` exactly as a webOS 5+ set does.
+#[cfg(all(test, feature = "hostsim"))]
+mod native_seek_tests {
+    use super::*;
+    use crate::player::ffi_host;
+
+    const V_STEP_NS: i64 = 41_708_333;
+    const TARGET_NS: i64 = 905_000_000_000;
+
+    /// Process-wide state these tests set, restored on the way out, panic or not.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ffi_host::force_clocksink_for_test(false);
+            ffi_host::reset_seek_probe_for_test(None);
+            crate::player::set_seek_mode(SeekMode::Segment);
+            SHARED.pts_shift.store(0, Ordering::Relaxed);
+            SHARED.seek_target_ns.store(-1, Ordering::Relaxed);
+            SHARED.pres_fed.store(0, Ordering::Relaxed);
+            TX.seek_to_ns.store(-1, Ordering::Relaxed);
+            TX.seek_reqs.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn arm(force_seek: Option<c_int>) -> Restore {
+        ffi_host::force_clocksink_for_test(true);
+        ffi_host::reset_seek_probe_for_test(force_seek);
+        SHARED.pres_fed.store(PRES_NONE, Ordering::Relaxed);
+        TX.seek_to_ns.store(-1, Ordering::Relaxed);
+        TX.seek_reqs.store(0, Ordering::Relaxed);
+        Restore
+    }
+
+    /// An engine that has applied a direct-play seek and is waiting for the keyframe: flushed,
+    /// rebase pending, the video queue holding a keyframe at `TARGET_NS` and the AUs after it.
+    fn engine_seeking() -> Engine {
+        let mut eng = super::prime_livelock_tests::engine_after_reload();
+        eng.flushed = true;
+        eng.rebase_pending = true;
+        SHARED.seek_target_ns.store(TARGET_NS, Ordering::Relaxed);
+        let au = [0u8; 64];
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut crate::aq::AuQueue;
+        for i in 0..60 {
+            crate::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, TARGET_NS + i * V_STEP_NS, c_int::from(i == 0), 1);
+        }
+        eng
+    }
+
+    fn tick(eng: &mut Engine) {
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        feed_both_lanes(&mt, eng);
+    }
+
+    /// The mode a set on release `major` (old-ABI Feed when `cow`) gets from a window of kind
+    /// `window_mode`, composed from the same facts `start_bufferfeed_inner` composes.
+    fn mode_for(major: u32, cow: bool, window_mode: c_int) -> SeekMode {
+        select_seek_mode(inplace_layout_known(major, cow), old_abi_seek_tested(major), window_mode, None)
+    }
+
+    #[test]
+    fn a_webos5_session_seeks_natively_and_never_reloads() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm(None);
+        let sink_mode = sink().window_mode();
+        assert_eq!(sink_mode, crate::player::VP_EXPORTED, "PRECONDITION: the armed host sink is the webOS 5+ one");
+        let mode = mode_for(5, false, sink_mode);
+        assert_eq!(mode, SeekMode::NativeSeek, "VP_EXPORTED selects LG's public Seek");
+        assert!(
+            !crate::player::pump::seek_reloads(mode),
+            "a mid-play direct-play seek on VP_EXPORTED must NOT be a fresh Load (#568)"
+        );
+    }
+
+    #[test]
+    fn each_firmware_gets_its_seek_mode() {
+        use crate::player::{VP_ACB, VP_EXPORTED, VP_NONE};
+        assert_eq!(mode_for(4, false, VP_ACB), SeekMode::Segment, "webOS 4.x is unchanged");
+        assert_eq!(mode_for(5, false, VP_EXPORTED), SeekMode::NativeSeek, "webOS 5+ is unchanged");
+        assert_eq!(mode_for(3, true, VP_ACB), SeekMode::NativeSeek, "webOS 3 (a 3.9.3 set: COW Feed) uses LG's public Seek");
+        assert_eq!(mode_for(2, true, VP_ACB), SeekMode::Reload, "webOS 2 is untested and reloads, as before");
+        assert_eq!(mode_for(4, true, VP_ACB), SeekMode::Reload, "an old-ABI 4.x build is untested and reloads");
+        assert_eq!(mode_for(0, true, VP_ACB), SeekMode::Reload, "an unknown release with the old ABI reloads");
+        assert_eq!(mode_for(3, true, VP_NONE), SeekMode::Reload, "no video plane, nothing to seek in place");
+        assert_eq!(select_seek_mode(true, false, VP_ACB, Some(SeekMode::NativeSeek)), SeekMode::NativeSeek, "the dev trigger wins");
+        assert!(crate::player::pump::seek_reloads(SeekMode::Reload));
+        assert!(!crate::player::pump::seek_reloads(SeekMode::Segment));
+        assert!(!crate::player::pump::seek_reloads(SeekMode::NativeSeek));
+    }
+
+    /// A webOS 3 playback whose `Seek` was refused stays on the reload path across the reload's
+    /// fresh session, as a webOS 5+ one does (`pump`'s refused-Seek test); a fresh play clears it.
+    #[test]
+    fn a_refused_seek_on_webos3_keeps_the_playback_on_reload() {
+        let _serial = plx_base::testlock::serial();
+        let webos3 = || session_seek_mode(inplace_layout_known(3, true), old_abi_seek_tested(3), crate::player::VP_ACB, None);
+        crate::player::set_native_seek_refused(true);
+        assert_eq!(webos3(), SeekMode::Reload, "the downgrade survives reload_at");
+        crate::player::set_native_seek_refused(false);
+        assert_eq!(webos3(), SeekMode::NativeSeek, "a fresh play offers Seek again");
+    }
+
+    /// A speed is applied only to a freshly loaded pipeline, so a seek that carries a speed
+    /// change, and every seek while the speed is not 1x, reloads in EVERY mode; at 1x with no
+    /// change pending each mode keeps its own answer.
+    #[test]
+    fn a_speed_makes_every_direct_play_seek_a_reload() {
+        use crate::player::pump::seek_must_reload;
+        let normal = crate::player::RATE_NORMAL;
+        for mode in [SeekMode::Reload, SeekMode::Segment, SeekMode::NativeSeek] {
+            assert!(seek_must_reload(mode, 1500, false), "{mode:?} at 1.5x");
+            assert!(seek_must_reload(mode, 500, false), "{mode:?} at 0.5x");
+            assert!(seek_must_reload(mode, normal, true), "{mode:?}: the change back to 1x reloads too");
+            assert_eq!(seek_must_reload(mode, normal, false), crate::player::pump::seek_reloads(mode), "{mode:?} at 1x");
+        }
+    }
+
+    #[test]
+    fn the_landed_keyframe_is_the_native_seek_and_nothing_flushes() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm(None);
+        crate::player::set_seek_mode(SeekMode::NativeSeek);
+        let mut eng = engine_seeking();
+        tick(&mut eng);
+
+        assert_eq!(ffi_host::seek_log_for_test(), vec![TARGET_NS / 1_000_000], "Seek(<keyframe ms>), once");
+        assert_eq!(ffi_host::flush_calls_for_test(), 0, "Seek flushes itself; a flush after it re-anchors at 0");
+        assert!(!eng.flushed && !eng.rebase_pending, "the seek is applied");
+        assert_eq!(SHARED.pts_shift.load(Ordering::Relaxed), 0, "content time, no rebase");
+        assert!(eng.max_fed_video_pts >= TARGET_NS, "the keyframe and the AUs after it were fed on the Seek's timeline");
+        assert_eq!(crate::player::seek_mode(), SeekMode::NativeSeek);
+    }
+
+    #[test]
+    fn a_pre_zero_keyframe_seeks_to_zero_not_negative() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm(None);
+        crate::player::set_seek_mode(SeekMode::NativeSeek);
+        let mut eng = super::prime_livelock_tests::engine_after_reload();
+        eng.flushed = true;
+        eng.rebase_pending = true;
+        SHARED.seek_target_ns.store(0, Ordering::Relaxed);
+        let au = [0u8; 64];
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut crate::aq::AuQueue;
+        crate::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, -80_000_000, 1, 1);
+        tick(&mut eng);
+        assert_eq!(ffi_host::seek_log_for_test(), vec![0], "Seek refuses a negative millis");
+    }
+
+    #[test]
+    fn a_refused_seek_reloads_this_one_and_every_later_one() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm(Some(0));
+        crate::player::set_seek_mode(SeekMode::NativeSeek);
+        let mut eng = engine_seeking();
+        tick(&mut eng);
+
+        assert_eq!(crate::player::seek_mode(), SeekMode::Reload, "native seek is off for the rest of the session");
+        assert!(crate::player::pump::seek_reloads(crate::player::seek_mode()));
+        assert_eq!(
+            TX.seek_to_ns.load(Ordering::Acquire),
+            TARGET_NS,
+            "this seek is re-posted at the user's target for the pump's reload"
+        );
+        assert_eq!(eng.max_fed_video_pts, 0, "nothing is fed into a pipeline that refused the seek");
+        assert!(eng.pending_video.is_none());
+        assert_eq!(ffi_host::flush_calls_for_test(), 0);
+    }
+}
+
+/// **App-decoded (PCM) audio must reach the sink later than the picture it belongs with** (#1086,
+/// #1088): the set renders a PCM Load through a mixer channel that lacks the lip sync its own
+/// decoder gets (400 ms, less the active output's own delay: [`PCM_SINK_LEAD_NS`]). The correction
+/// is the audio lane's sink pts and nothing else.
+#[cfg(test)]
+mod pcm_sink_lead_pure_tests {
+    use super::*;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SHARED.applied_rate_permille.store(crate::player::RATE_NORMAL, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn no_lead_is_the_pipeline_timeline_and_a_lead_is_real_time_after_the_speed_division() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = Restore;
+        SHARED.applied_rate_permille.store(crate::player::RATE_NORMAL, Ordering::Relaxed);
+        assert_eq!(audio_sink_pts(7_000_000_000, 0), crate::player::to_sink_ns(7_000_000_000));
+        assert_eq!(audio_sink_pts(7_000_000_000, PCM_SINK_LEAD_NS), 7_000_000_000 + PCM_SINK_LEAD_NS);
+
+        SHARED.applied_rate_permille.store(1500, Ordering::Relaxed);
+        assert_eq!(audio_sink_pts(3_000_000_000, 0), crate::player::to_sink_ns(3_000_000_000));
+        assert_eq!(
+            audio_sink_pts(3_000_000_000, 400_000_000),
+            2_000_000_000 + 400_000_000,
+            "film time is divided by the speed, the set's 400 ms is not"
+        );
+        SHARED.applied_rate_permille.store(500, Ordering::Relaxed);
+        assert_eq!(audio_sink_pts(3_000_000_000, 400_000_000), 6_000_000_000 + 400_000_000);
+    }
+
+    #[test]
+    fn a_sink_pts_never_goes_below_zero_or_overflows() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = Restore;
+        SHARED.applied_rate_permille.store(crate::player::RATE_NORMAL, Ordering::Relaxed);
+        assert_eq!(audio_sink_pts(0, 0), 0);
+        assert_eq!(audio_sink_pts(-500_000_000, 400_000_000), 0, "a unit before the origin is not sent negative");
+        assert_eq!(audio_sink_pts(100_000_000, -400_000_000), 0, "a negative dev override clamps too");
+        assert_eq!(audio_sink_pts(i64::MAX - 1, PCM_SINK_LEAD_NS), i64::MAX);
+    }
+
+    /// The stacks with no lead at all: 2016/2017's `adecsink`, Realtek and MStar (`Other`), and a set
+    /// nobody probed.
+    const NO_LEAD_STACKS: [AudioStack; 3] = [AudioStack::AdecSink, AudioStack::Other, AudioStack::Unknown];
+    /// The stacks whose lead follows the sound output (so it is read on the Load thread).
+    const OUTPUT_STACKS: [AudioStack; 2] = [AudioStack::Liblxa, AudioStack::AudioSinkNew];
+    const ALL_STACKS: [AudioStack; 6] = [
+        AudioStack::Liblxa,
+        AudioStack::LgAudioSink,
+        AudioStack::AudioSinkNew,
+        AudioStack::AdecSink,
+        AudioStack::Other,
+        AudioStack::Unknown,
+    ];
+
+    #[test]
+    fn only_a_pcm_load_gets_a_lead_and_the_dev_override_moves_only_that() {
+        let liblxa = AudioStack::Liblxa;
+        assert_eq!(PCM_SINK_LEAD_NS, 400_000_000);
+        assert_eq!(pcm_lead_plan("PCM", None, liblxa), PcmLead::FromOutput(liblxa));
+        assert_eq!(pcm_lead_plan("PCM", Some("0"), liblxa), PcmLead::Override(0, liblxa));
+        assert_eq!(pcm_lead_plan("PCM", Some(" 200\n"), liblxa), PcmLead::Override(200_000_000, liblxa));
+        assert_eq!(pcm_lead_plan("PCM", Some("-50"), liblxa), PcmLead::Override(-50_000_000, liblxa), "an experiment may go the other way");
+        assert_eq!(pcm_lead_plan("PCM", Some("loud"), liblxa), PcmLead::FromOutput(liblxa), "garbage is no override: the output decides");
+        assert_eq!(pcm_lead_plan("PCM", Some(""), liblxa), PcmLead::FromOutput(liblxa));
+        let new2018 = AudioStack::AudioSinkNew;
+        assert_eq!(pcm_lead_plan("PCM", None, new2018), PcmLead::FromOutput(new2018), "2018 follows the output and carries its own stack");
+        assert_eq!(pcm_lead_plan("PCM", Some("150"), new2018), PcmLead::Override(150_000_000, new2018));
+        assert_eq!(pcm_lead_plan("PCM", Some("loud"), new2018), PcmLead::FromOutput(new2018));
+        let adec = AudioStack::AdecSink;
+        assert_eq!(pcm_lead_plan("PCM", None, adec), PcmLead::NoLead(adec), "2016/2017: no lead");
+        assert_eq!(pcm_lead_plan("PCM", Some("300"), adec), PcmLead::Override(300_000_000, adec), "pcmavoffset is how it gets measured");
+        let sink = AudioStack::LgAudioSink;
+        assert_eq!(pcm_lead_plan("PCM", None, sink), PcmLead::Fixed(sink), "the output does not change the lead there: no read");
+        assert_eq!(pcm_lead_plan("PCM", Some("0"), sink), PcmLead::Override(0, sink), "the override wins on every stack");
+        assert_eq!(pcm_lead_plan("PCM", Some("loud"), sink), PcmLead::Fixed(sink));
+        for stack in ALL_STACKS {
+            for compressed in ["DTS", "AC3", "AC3 PLUS", "AAC", "OPUS", "-"] {
+                assert_eq!(pcm_lead_plan(compressed, None, stack), PcmLead::Off, "{compressed} on {stack:?}");
+                assert_eq!(pcm_lead_plan(compressed, Some("400"), stack), PcmLead::Off, "{compressed} on {stack:?}: the override is PCM-only");
+            }
+        }
+    }
+
+    /// The table, one cell per stack x output: the filmed outputs of the `liblxa` stack, one nobody
+    /// filmed, no answer; 2018's the same figures, none of them measured; every output of the LG audio
+    /// sink (one lead); every output of a stack with no lead.
+    #[test]
+    fn the_lead_follows_the_stack_and_then_the_sound_output() {
+        let liblxa = AudioStack::Liblxa;
+        assert_eq!(pcm_output_lead(liblxa, Some("tv_speaker")), (400_000_000, true), "filmed: -0.03 to +0.08 s");
+        assert_eq!(pcm_output_lead(liblxa, Some("bt_soundbar")), (250_000_000, true), "filmed: +0.017 s at 250 ms, +0.13 to +0.19 s at 400");
+        for unmeasured in ["external_optical", "external_arc", "headphone", "lg_sound_sync_optical", "other"] {
+            assert_eq!(pcm_output_lead(liblxa, Some(unmeasured)), (PCM_SINK_LEAD_NS, false), "liblxa + {unmeasured}");
+        }
+        assert_eq!(pcm_output_lead(liblxa, None), (PCM_SINK_LEAD_NS, false), "no answer keeps the liblxa default");
+
+        let y2018 = AudioStack::AudioSinkNew;
+        assert_eq!(pcm_output_lead(y2018, Some("tv_speaker")), (400_000_000, false), "2018: 475 less the +75 bias, read from firmware");
+        assert_eq!(pcm_output_lead(y2018, Some("bt_soundbar")), (250_000_000, false), "2018: the decoder's -150 for a wireless output, decompile only");
+        for unmeasured in ["external_optical", "external_arc", "headphone", "lg_sound_sync_optical", "other"] {
+            assert_eq!(pcm_output_lead(y2018, Some(unmeasured)), (PCM_SINK_LEAD_NS, false), "2018 + {unmeasured}");
+        }
+        assert_eq!(pcm_output_lead(y2018, None), (PCM_SINK_LEAD_NS, false), "2018 + no answer");
+
+        for output in [Some("tv_speaker"), Some("bt_soundbar"), Some("external_arc"), None] {
+            assert_eq!(
+                pcm_output_lead(AudioStack::LgAudioSink, output),
+                (PCM_SINK_LEAD_NS, false),
+                "lgaudiosink + {output:?}: 400 ms on every output, Bluetooth included, never measured"
+            );
+        }
+        for stack in NO_LEAD_STACKS {
+            for output in [Some("tv_speaker"), Some("bt_soundbar"), Some("external_arc"), None] {
+                assert_eq!(pcm_output_lead(stack, output), (0, false), "{stack:?} + {output:?}: the behaviour before #1087");
+            }
+        }
+        assert_eq!(PCM_LEAD_BY_OUTPUT.iter().filter(|(name, _)| *name == "tv_speaker").count(), 1);
+    }
+
+    /// Resolution is where the output is read, and the only place: the read is a closure, so what
+    /// asks for it is countable.
+    #[test]
+    fn the_output_is_read_only_for_a_load_that_needs_it() {
+        let reads = std::cell::Cell::new(0);
+        let read = |answer: Option<&str>| {
+            let reads = &reads;
+            let answer = answer.map(str::to_string);
+            move || {
+                reads.set(reads.get() + 1);
+                answer
+            }
+        };
+        let off = PcmLead::Off.resolve(read(Some("bt_soundbar")));
+        assert_eq!((off.ns, off.output), (0, None));
+        assert_eq!(reads.get(), 0, "a compressed Load never asks");
+
+        for stack in ALL_STACKS {
+            let overridden = PcmLead::Override(330_000_000, stack).resolve(read(Some("bt_soundbar")));
+            assert_eq!((overridden.ns, overridden.output), (330_000_000, None), "{stack:?}: the override wins on any stack");
+        }
+        assert_eq!(reads.get(), 0, "the dev override wins over the table without asking");
+
+        for stack in NO_LEAD_STACKS {
+            let unmeasured = PcmLead::NoLead(stack).resolve(read(Some("bt_soundbar")));
+            assert_eq!((unmeasured.ns, unmeasured.output), (0, None), "{stack:?}");
+        }
+        assert_eq!(reads.get(), 0, "a stack with no lead does not pay for the bus read");
+
+        let sink = PcmLead::Fixed(AudioStack::LgAudioSink).resolve(|| panic!("the LG audio sink's lead does not depend on the output"));
+        assert_eq!((sink.ns, sink.output), (PCM_SINK_LEAD_NS, None));
+
+        for stack in OUTPUT_STACKS {
+            let before = reads.get();
+            let bt = PcmLead::FromOutput(stack).resolve(read(Some("bt_soundbar")));
+            assert_eq!((bt.ns, bt.output.as_deref()), (250_000_000, Some("bt_soundbar")), "{stack:?}");
+            assert_eq!(reads.get(), before + 1, "a PCM Load on {stack:?} asks once");
+            let speaker = PcmLead::FromOutput(stack).resolve(read(Some("tv_speaker")));
+            assert_eq!(speaker.ns, 400_000_000, "{stack:?}");
+            let optical = PcmLead::FromOutput(stack).resolve(read(Some("external_optical")));
+            assert_eq!((optical.ns, optical.output.as_deref()), (PCM_SINK_LEAD_NS, Some("external_optical")), "{stack:?}");
+            let none = PcmLead::FromOutput(stack).resolve(read(None));
+            assert_eq!((none.ns, none.output), (PCM_SINK_LEAD_NS, None), "{stack:?}");
+            assert_eq!(reads.get(), before + 4, "{stack:?}");
+        }
+    }
+
+    /// The same, from the declaration: the plan a PCM Load gets on each stack, resolved with a read
+    /// that counts, asks only on a stack whose lead follows the output (`liblxa`, 2018); the LG audio
+    /// sink settles 400 ms without asking, and the stacks with no lead never ask.
+    #[test]
+    fn a_pcm_load_asks_for_the_output_only_on_a_stack_whose_lead_follows_it() {
+        for stack in ALL_STACKS {
+            let reads = std::cell::Cell::new(0);
+            let lead = load_audio("flac", crate::player::RATE_NORMAL, None, None, stack).unwrap().lead;
+            let resolved = lead.resolve(|| {
+                reads.set(reads.get() + 1);
+                Some("bt_soundbar".to_string())
+            });
+            if OUTPUT_STACKS.contains(&stack) {
+                assert_eq!((reads.get(), resolved.ns), (1, 250_000_000), "{stack:?}");
+            } else if stack == AudioStack::LgAudioSink {
+                assert_eq!((reads.get(), resolved.ns), (0, PCM_SINK_LEAD_NS), "{stack:?}");
+            } else {
+                assert_eq!((reads.get(), resolved.ns), (0, 0), "{stack:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_resolved_lead_says_what_it_decided_and_whether_it_was_measured() {
+        let line = |plan: PcmLead, answer: Option<&str>| {
+            plan.resolve(|| answer.map(str::to_string)).log_line()
+        };
+        let said = |text: &str| Some(text.to_string());
+        let liblxa = AudioStack::Liblxa;
+        assert_eq!(line(PcmLead::FromOutput(liblxa), Some("tv_speaker")), said("pcm: audio sink pts +400ms (stack liblxa, output tv_speaker, default 400ms)"));
+        assert_eq!(line(PcmLead::FromOutput(liblxa), Some("bt_soundbar")), said("pcm: audio sink pts +250ms (stack liblxa, output bt_soundbar, default 400ms)"));
+        assert_eq!(line(PcmLead::FromOutput(liblxa), Some("external_arc")), said("pcm: audio sink pts +400ms (stack liblxa, output external_arc, default 400ms, not measured)"));
+        assert_eq!(line(PcmLead::FromOutput(liblxa), None), said("pcm: audio sink pts +400ms (stack liblxa, output unknown, default 400ms, not measured)"));
+        let y2018 = PcmLead::FromOutput(AudioStack::AudioSinkNew);
+        assert_eq!(line(y2018, Some("tv_speaker")), said("pcm: audio sink pts +400ms (stack audiosink_new, output tv_speaker, default 400ms, not measured)"));
+        assert_eq!(line(y2018, Some("bt_soundbar")), said("pcm: audio sink pts +250ms (stack audiosink_new, output bt_soundbar, default 400ms, not measured)"));
+        assert_eq!(line(y2018, None), said("pcm: audio sink pts +400ms (stack audiosink_new, output unknown, default 400ms, not measured)"));
+        assert_eq!(line(PcmLead::NoLead(AudioStack::AdecSink), None), said("pcm: audio sink pts +0ms (stack adecsink, not measured on this chip)"));
+        assert_eq!(line(PcmLead::Override(330_000_000, AudioStack::AudioSinkNew), None), said("pcm: audio sink pts +330ms (pcmavoffset override, stack audiosink_new)"));
+        assert_eq!(
+            line(PcmLead::Fixed(AudioStack::LgAudioSink), None),
+            said("pcm: audio sink pts +400ms (stack lgaudiosink, every output, not measured)")
+        );
+        assert_eq!(line(PcmLead::NoLead(AudioStack::Other), None), said("pcm: audio sink pts +0ms (stack other, not measured on this chip)"));
+        assert_eq!(line(PcmLead::NoLead(AudioStack::Unknown), None), said("pcm: audio sink pts +0ms (stack unknown, not measured on this chip)"));
+        assert_eq!(line(PcmLead::Override(330_000_000, AudioStack::Other), None), said("pcm: audio sink pts +330ms (pcmavoffset override, stack other)"));
+        assert_eq!(line(PcmLead::Override(330_000_000, AudioStack::Liblxa), None), said("pcm: audio sink pts +330ms (pcmavoffset override, stack liblxa)"));
+        assert_eq!(line(PcmLead::Off, None), None, "a compressed Load says nothing");
+        assert_eq!(
+            PcmLead::Override(330_000_000, AudioStack::Other).start_log_line(),
+            said("pcm: audio sink pts +330ms (pcmavoffset override, stack other)")
+        );
+        assert_eq!(
+            PcmLead::NoLead(AudioStack::Other).start_log_line(),
+            said("pcm: audio sink pts +0ms (stack other, not measured on this chip)"),
+            "the frame thread settles it, so it says so now"
+        );
+        assert_eq!(
+            PcmLead::Fixed(AudioStack::LgAudioSink).start_log_line(),
+            said("pcm: audio sink pts +400ms (stack lgaudiosink, every output, not measured)"),
+            "settled on the frame thread, so it says so now, once"
+        );
+        assert_eq!(
+            PcmLead::NoLead(AudioStack::AdecSink).start_log_line(),
+            said("pcm: audio sink pts +0ms (stack adecsink, not measured on this chip)")
+        );
+        for stack in OUTPUT_STACKS {
+            assert_eq!(PcmLead::FromOutput(stack).start_log_line(), None, "{stack:?}: the Load thread logs it, with the output it read");
+        }
+        assert_eq!(PcmLead::Off.start_log_line(), None);
+    }
+
+    /// The Load's declared audio and the plan for its lead come out of ONE value ([`load_audio`], the
+    /// pair `start_bufferfeed_inner` puts in the payload and on the Engine), speed override included:
+    /// a 1.5x session on an AC3 track declares PCM and takes the lead, a 1x AC3 session does not, a
+    /// 1x FLAC session does. Only the shape of the plan follows the stack: a lead that follows the
+    /// output, the LG audio sink's one lead, or no lead at all.
+    #[test]
+    fn the_engines_lead_follows_the_declared_audio_the_speed_override_and_the_stack() {
+        use crate::player::RATE_NORMAL;
+        let plan = |codec: &str, rate: i32| load_audio(codec, rate, None, None, AudioStack::Liblxa).map(|a| (a.name, a.lead));
+        let from_output = PcmLead::FromOutput(AudioStack::Liblxa);
+        assert_eq!(plan("flac", RATE_NORMAL), Some(("PCM", from_output)));
+        assert_eq!(plan("alac", RATE_NORMAL), Some(("PCM", from_output)));
+        assert_eq!(plan("ac3", RATE_NORMAL), Some(("AC3", PcmLead::Off)));
+        assert_eq!(plan("dca", RATE_NORMAL), Some(("DTS", PcmLead::Off)), "the set's own DTS decoder keeps its own compensation");
+        assert_eq!(plan("eac3", RATE_NORMAL), Some(("AC3 PLUS", PcmLead::Off)));
+        assert_eq!(plan("ac3", 1500), Some(("PCM", from_output)), "a speed session declares PCM, so it takes the lead");
+        assert_eq!(plan("dca", 500), Some(("PCM", from_output)));
+        assert_eq!(plan("flac", 1500), Some(("PCM", from_output)));
+        assert_eq!(plan("not-a-codec", RATE_NORMAL), None, "an undeclarable codec still refuses the Load");
+        // At a speed the codec's name is not declared at all, so it cannot refuse: the guard is upstream,
+        // at every Load (`player::session_rate_for` -> `speed_offer` -> `ff::speed_decoder_available`).
+        assert_eq!(plan("not-a-codec", 1500), Some(("PCM", from_output)), "a speed session declares PCM whatever the codec is called");
+        let sink = AudioStack::LgAudioSink;
+        let on_sink = |codec: &str, rate: i32| load_audio(codec, rate, None, None, sink).map(|a| (a.name, a.lead));
+        assert_eq!(on_sink("flac", RATE_NORMAL), Some(("PCM", PcmLead::Fixed(sink))));
+        assert_eq!(on_sink("ac3", 1500), Some(("PCM", PcmLead::Fixed(sink))), "a speed session declares PCM on this stack too");
+        assert_eq!(on_sink("ac3", RATE_NORMAL), Some(("AC3", PcmLead::Off)), "a compressed Load keeps the set's own decoder");
+        let y2018 = AudioStack::AudioSinkNew;
+        let on_2018 = |codec: &str, rate: i32| load_audio(codec, rate, None, None, y2018).map(|a| (a.name, a.lead));
+        assert_eq!(on_2018("flac", RATE_NORMAL), Some(("PCM", PcmLead::FromOutput(y2018))));
+        assert_eq!(on_2018("ac3", 1500), Some(("PCM", PcmLead::FromOutput(y2018))));
+        assert_eq!(on_2018("ac3", RATE_NORMAL), Some(("AC3", PcmLead::Off)));
+        for stack in NO_LEAD_STACKS {
+            let on = |codec: &str, rate: i32| load_audio(codec, rate, None, None, stack).map(|a| (a.name, a.lead));
+            assert_eq!(on("flac", RATE_NORMAL), Some(("PCM", PcmLead::NoLead(stack))), "{stack:?}");
+            assert_eq!(on("ac3", 1500), Some(("PCM", PcmLead::NoLead(stack))), "{stack:?}");
+            assert_eq!(on("ac3", RATE_NORMAL), Some(("AC3", PcmLead::Off)), "{stack:?}");
+        }
+    }
+
+    /// **App-decoded DTS** (S4, the lossy gate on) declares `"audio":"PCM"` and so takes the lead of the
+    /// set's stack exactly like FLAC; the same track left to the set's own decoder (`a="DTS"`) gets none.
+    /// `load_audio` is given the shape the session declared (`route::stream_pcm`), so the name the
+    /// payload carries and the lead plan cannot disagree.
+    #[test]
+    fn app_decoded_dts_takes_the_stacks_lead_and_native_dts_none() {
+        use crate::player::RATE_NORMAL;
+        let shape = crate::route::PcmFormat::STEREO_48K;
+        for stack in ALL_STACKS {
+            let app = load_audio("dts", RATE_NORMAL, Some(&shape), None, stack).unwrap();
+            let like_flac = load_audio("flac", RATE_NORMAL, Some(&shape), None, stack).unwrap();
+            assert_eq!((app.name, app.diagnostic), ("PCM", 5), "{stack:?}");
+            assert_eq!(app.lead, like_flac.lead, "{stack:?}: the same plan as a FLAC Load");
+            assert_eq!(app.lead, pcm_lead_plan("PCM", None, stack), "{stack:?}");
+            let native = load_audio("dts", RATE_NORMAL, None, None, stack).unwrap();
+            assert_eq!((native.name, native.lead), ("DTS", PcmLead::Off), "{stack:?}: a compressed Load gets none");
+        }
+        assert_eq!(
+            load_audio("dts", RATE_NORMAL, Some(&shape), None, AudioStack::Liblxa).unwrap().lead,
+            PcmLead::FromOutput(AudioStack::Liblxa)
+        );
+    }
+
+    /// The per-Load override reaches the Engine's lead through the same value, for a PCM Load only,
+    /// and on every stack (it is how another chip gets measured).
+    #[test]
+    fn the_dev_override_reaches_the_engines_lead_through_the_declaration() {
+        use crate::player::RATE_NORMAL;
+        for stack in ALL_STACKS {
+            assert_eq!(load_audio("flac", RATE_NORMAL, None, Some("330"), stack).unwrap().lead, PcmLead::Override(330_000_000, stack));
+            assert_eq!(load_audio("ac3", 1500, None, Some("0"), stack).unwrap().lead, PcmLead::Override(0, stack));
+            assert_eq!(load_audio("ac3", RATE_NORMAL, None, Some("330"), stack).unwrap().lead, PcmLead::Off);
+        }
+        let flac = load_audio("flac", RATE_NORMAL, None, None, AudioStack::Liblxa).unwrap();
+        assert_eq!(flac.diagnostic, 5, "the diagnostics code is the same pair's");
+    }
+
+    /// What the frame thread can settle itself and what has to wait for the Load thread's read.
+    #[test]
+    fn only_a_lead_that_follows_the_output_waits_for_the_load_thread() {
+        assert_eq!(PcmLead::Off.at_engine_start(), (0, false));
+        assert_eq!(PcmLead::Override(330_000_000, AudioStack::Other).at_engine_start(), (330_000_000, false));
+        assert_eq!(PcmLead::NoLead(AudioStack::Other).at_engine_start(), (0, false), "nothing to wait for: no lead");
+        assert_eq!(
+            PcmLead::Fixed(AudioStack::LgAudioSink).at_engine_start(),
+            (PCM_SINK_LEAD_NS, false),
+            "the lead is there from the start and nothing is pending"
+        );
+        for stack in OUTPUT_STACKS {
+            assert_eq!(PcmLead::FromOutput(stack).at_engine_start(), (0, true), "{stack:?}: the audio waits for the Load thread's read");
+        }
+        for stack in NO_LEAD_STACKS {
+            assert_eq!(PcmLead::NoLead(stack).at_engine_start(), (0, false), "{stack:?}");
+        }
+    }
+}
+
+/// The line from the set's audio stack to the Engine's lead, through the production start itself:
+/// `start_bufferfeed_inner` reads `devcaps::audio_stack()` and hands it to `load_audio`. A start that
+/// stopped passing it on (or passed a fixed one) leaves every other test green, because they all
+/// build the plan or the Engine by hand.
+#[cfg(all(test, feature = "hostsim"))]
+mod pcm_stack_wiring_tests {
+    use super::*;
+    use plx_platform::devcaps::{audio_stack_on_this_thread_for_test, AudioStack};
+
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            crate::player::ffi_host::reset_native_lifecycle_for_test();
+            crate::player::ffi_host::force_clocksink_for_test(false);
+            SHARED.test_force_native_idle();
+            SHARED.reset_session();
+            crate::route::reset_player_control_for_test(crate::route::idle_session_for_test());
+        }
+    }
+
+    /// Start a FLAC Load (declares `"audio":"PCM"`) on a set whose stack is `stack`, let its Load
+    /// thread return, take what the Engine took from it, and give back `(pending before the take,
+    /// lead after it)`. `unload_ms` is how long the host `Unload` of this start's stop takes, and
+    /// `linger_ms` how long the Load is left returned before the stop (a late thread of an earlier
+    /// start has that long to reach it).
+    fn lead_of_a_flac_start_on(stack: AudioStack, unload_ms: u64, linger_ms: u64) -> (bool, i64) {
+        let mut ps = crate::route::PlaybackSession::IDLE;
+        let _serial = plx_base::testlock::serial();
+        SHARED.reset_session();
+        crate::route::reset_player_control_for_test(&ps);
+        crate::player::ffi_host::reset_native_lifecycle_for_test();
+        crate::player::ffi_host::force_clocksink_for_test(true);
+        let _cleanup = Cleanup;
+        let _stack = audio_stack_on_this_thread_for_test(stack);
+        let mut pa = crate::player::adapter::PlayerAdapter::new(unsafe { plx_base::task::MainThread::assume() });
+        crate::route::set_url(&mut ps, "http://127.0.0.1:1/track.flac");
+        crate::route::set_stream_acodec(&mut ps, "flac");
+        crate::route::set_carried_audio_for_test(
+            &mut ps,
+            crate::route::CarriedAudio {
+                sid: 7, ordinal: 1, codec: "flac".into(), channels: 2,
+                can_normalize_loudness: false, immersive: false, sample_rate: 48_000, bit_depth: 16,
+            },
+        );
+
+        let started = start_bufferfeed_tracked(&mut ps, &mut pa);
+        assert!(
+            matches!(started, BufferfeedStartOutcome::Launched(_)),
+            "PRECONDITION FAILED: the FLAC start must launch ({started:?})"
+        );
+        let eng = pa.engine().expect("a launched start installs its Engine");
+        assert!(
+            eng.payload.to_string_lossy().contains("PCM"),
+            "PRECONDITION FAILED: a FLAC Load must declare PCM: {:?}",
+            eng.payload
+        );
+        let pending = eng.pcm_lead_pending;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !SHARED.native_load_returned(eng.native_epoch) {
+            assert!(std::time::Instant::now() < deadline, "the Load never returned");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(settle_pcm_lead(eng), "a returned Load has settled its lead");
+        let lead = eng.pcm_sink_lead_ns;
+        std::thread::sleep(std::time::Duration::from_millis(linger_ms));
+        assert!(
+            SHARED.native_load_returned(eng.native_epoch),
+            "a Load that returned stays returned until its stop: another session's Unload reached this one"
+        );
+        crate::player::ffi_host::delay_unload_for_test(unload_ms);
+        stop_bufferfeed(&mut ps, &mut pa);
+        finish_release_for_test(&mut pa);
+        (pending, lead)
+    }
+
+    /// `liblxa` and 2018's stack yield a lead for a PCM Load once the Load thread has read the output
+    /// (the hostsim bus has no answer, so the 400 ms default), pending until then; the LG audio sink
+    /// has its 400 ms from the start with nothing pending; 2016/2017's `adecsink`, any other stack and
+    /// one nobody probed yield none and have nothing to wait for.
+    #[test]
+    fn a_pcm_start_gets_the_lead_its_audio_stack_has_and_none_where_it_has_none() {
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::Liblxa, 0, 0), (true, PCM_SINK_LEAD_NS));
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::AudioSinkNew, 0, 0), (true, PCM_SINK_LEAD_NS));
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::LgAudioSink, 0, 0), (false, PCM_SINK_LEAD_NS));
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::AdecSink, 0, 0), (false, 0));
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::Other, 0, 0), (false, 0));
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::Unknown, 0, 0), (false, 0));
+    }
+
+    /// A stop hands its object to an `sf-unload` worker, and the host `Unload` names the object by
+    /// the process-global active epoch. The worker of one start that runs late (a loaded CI runner)
+    /// therefore unloads whichever session is active when it gets there: the next start's. This
+    /// makes the worker late on purpose: the next start's Load returns, and must still be returned
+    /// after the earlier worker's `Unload` has had its time. (The start helper used to drop its
+    /// adapter, and with it the handle of the parked release, without `finish_release`.)
+    #[test]
+    fn an_earlier_starts_late_unload_never_reaches_the_next_start() {
+        const UNLOAD_MS: u64 = 150;
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::Liblxa, UNLOAD_MS, 0), (true, PCM_SINK_LEAD_NS));
+        assert_eq!(lead_of_a_flac_start_on(AudioStack::Other, 0, 2 * UNLOAD_MS), (false, 0));
+    }
+}
+
+#[cfg(all(test, feature = "hostsim"))]
+mod pcm_sink_lead_tests {
+    use super::*;
+    use crate::player::ffi_host;
+
+    const V_STEP_NS: i64 = 41_708_333; // 23.976 fps
+    const A_STEP_NS: i64 = 32_000_000;
+    const VIDEO_AUS: i64 = 30;
+    const AUDIO_AUS: i64 = 40;
+    /// Where the in-place seek and the reload land, in content time.
+    const T_NS: i64 = 905_000_000_000;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ffi_host::force_clocksink_for_test(false);
+            ffi_host::reset_seek_probe_for_test(None);
+            crate::player::set_seek_mode(SeekMode::Segment);
+            SHARED.pts_shift.store(0, Ordering::Relaxed);
+            SHARED.seek_target_ns.store(-1, Ordering::Relaxed);
+            SHARED.pres_fed.store(0, Ordering::Relaxed);
+            SHARED.first_audio_pts.store(i64::MIN, Ordering::Relaxed);
+            SHARED.applied_rate_permille.store(crate::player::RATE_NORMAL, Ordering::Relaxed);
+        }
+    }
+
+    fn arm() -> Restore {
+        ffi_host::force_clocksink_for_test(true);
+        ffi_host::reset_seek_probe_for_test(None);
+        crate::player::set_seek_mode(SeekMode::Segment);
+        SHARED.pres_fed.store(PRES_NONE, Ordering::Relaxed);
+        SHARED.seek_to_ns.store(-1, Ordering::Relaxed);
+        SHARED.pts_shift.store(0, Ordering::Relaxed);
+        SHARED.first_audio_pts.store(i64::MIN, Ordering::Relaxed);
+        Restore
+    }
+
+    /// A started engine (`lead` as the Load chose it) holding a keyframe at `at_ns` and the AUs
+    /// after it, and audio from the same instant.
+    fn engine_at(at_ns: i64, lead: i64) -> Engine {
+        let mut eng = super::prime_livelock_tests::engine_after_reload();
+        eng.prime_play = false;
+        eng.pcm_sink_lead_ns = lead;
+        let au = [0u8; 64];
+        let qv = &mut **eng.aq_video.as_mut().unwrap() as *mut crate::aq::AuQueue;
+        for i in 0..VIDEO_AUS {
+            crate::aq::aq_push(qv, au.as_ptr(), au.len() as c_int, at_ns + i * V_STEP_NS, c_int::from(i == 0), 1);
+        }
+        let qa = &mut **eng.aq_audio.as_mut().unwrap() as *mut crate::aq::AuQueue;
+        for i in 0..AUDIO_AUS {
+            crate::aq::aq_push(qa, au.as_ptr(), au.len() as c_int, at_ns + i * A_STEP_NS, 1, 2);
+        }
+        eng
+    }
+
+    fn tick(eng: &mut Engine) {
+        let mt = unsafe { plx_base::task::MainThread::assume() };
+        feed_both_lanes(&mt, eng);
+    }
+
+    /// What the sink saw, with the preconditions asserted so a refused feed cannot pass for a pass.
+    fn first_feeds() -> (i64, i64, Vec<i64>) {
+        let v = ffi_host::feed_log_for_test(1);
+        let a = ffi_host::feed_log_for_test(2);
+        assert!(
+            !v.is_empty() && !a.is_empty(),
+            "PRECONDITION FAILED, not the defect: the host sink saw v={} a={} feeds, so it is not armed",
+            v.len(),
+            a.len()
+        );
+        (v[0], a[0], a)
+    }
+
+    /// Audio minus video at the first Feed of each, within the 1 ns the video lane's nudge moves it.
+    fn assert_lead(eng: &Engine, lead: i64, what: &str) {
+        let (v0, a0, audio) = first_feeds();
+        let gap = a0 - v0;
+        assert!((gap - lead).abs() <= 1, "{what}: audio is {gap} ns after the picture, want {lead} ns");
+        assert!(
+            audio.windows(2).all(|w| w[1] - w[0] > 0),
+            "{what}: the lead is one constant, so audio sink pts still ascend: {audio:?}"
+        );
+        // Bookkeeping stays in content time: the sink saw the lead, the high-water mark did not.
+        assert_eq!(
+            eng.max_fed_audio_pts,
+            audio.last().unwrap() - lead,
+            "{what}: max_fed_audio_pts is content time, without the lead"
+        );
+    }
+
+    fn pcm_first_load(lead: i64) -> Engine {
+        let mut eng = engine_at(0, lead);
+        tick(&mut eng);
+        eng
+    }
+
+    #[test]
+    fn a_pcm_load_plays_its_first_audio_a_lead_after_the_picture_on_a_first_load() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        let eng = pcm_first_load(PCM_SINK_LEAD_NS);
+        assert_lead(&eng, PCM_SINK_LEAD_NS, "first Load");
+    }
+
+    #[test]
+    fn a_pcm_load_keeps_the_lead_after_a_reload_rebase() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        let mut eng = engine_at(T_NS, PCM_SINK_LEAD_NS);
+        eng.rebase_pending = true;
+        tick(&mut eng);
+        assert_eq!(SHARED.pts_shift.load(Ordering::Relaxed), -T_NS, "PRECONDITION: the reload rebased the keyframe to 0");
+        assert_lead(&eng, PCM_SINK_LEAD_NS, "reload rebase");
+    }
+
+    #[test]
+    fn a_pcm_load_keeps_the_lead_after_an_in_place_segment_seek() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        crate::player::set_seek_mode(SeekMode::Segment);
+        let mut eng = engine_at(T_NS, PCM_SINK_LEAD_NS);
+        eng.flushed = true;
+        eng.rebase_pending = true;
+        SHARED.seek_target_ns.store(T_NS, Ordering::Relaxed);
+        tick(&mut eng);
+        assert!(!eng.rebase_pending, "PRECONDITION: the seek's keyframe was accepted");
+        assert_eq!(SHARED.pts_shift.load(Ordering::Relaxed), 0, "PRECONDITION: content time, no rebase");
+        assert_lead(&eng, PCM_SINK_LEAD_NS, "in-place Segment seek");
+    }
+
+    #[test]
+    fn a_compressed_load_gets_no_lead_anywhere() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        assert_lead(&pcm_first_load(0), 0, "first Load");
+        ffi_host::reset_seek_probe_for_test(None);
+
+        let mut eng = engine_at(T_NS, 0);
+        eng.rebase_pending = true;
+        tick(&mut eng);
+        assert_lead(&eng, 0, "reload rebase");
+        ffi_host::reset_seek_probe_for_test(None);
+
+        let mut eng = engine_at(T_NS, 0);
+        eng.flushed = true;
+        eng.rebase_pending = true;
+        SHARED.seek_target_ns.store(T_NS, Ordering::Relaxed);
+        tick(&mut eng);
+        assert_lead(&eng, 0, "in-place Segment seek");
+    }
+
+    /// A lead that follows the sound output is read on the Load thread (the frame thread may not
+    /// block on the bus) and handed over WITH the Load's return. Until then the Engine feeds the
+    /// picture and holds the audio back: stamping it with a guessed lead and moving it afterwards
+    /// would jump the audio timeline inside one Load.
+    #[test]
+    fn audio_waits_for_the_output_lead_then_takes_exactly_that() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        SHARED.reset_session();
+        let epoch = SHARED.begin_native_session().expect("native session");
+        let mut eng = engine_at(0, 0);
+        eng.native_epoch = epoch;
+        eng.pcm_lead_pending = true;
+        tick(&mut eng);
+        assert!(!ffi_host::feed_log_for_test(1).is_empty(), "PRECONDITION: the picture is fed");
+        assert!(ffi_host::feed_log_for_test(2).is_empty(), "no audio before the Load thread's lead is published");
+        assert!(eng.pcm_lead_pending);
+
+        assert!(SHARED.mark_native_load_returned(epoch, Some(250_000_000)).is_some());
+        tick(&mut eng);
+        assert!(!eng.pcm_lead_pending, "taken once, at the first feed after the Load returned");
+        assert_eq!(eng.pcm_sink_lead_ns, 250_000_000);
+        assert_lead(&eng, 250_000_000, "a Bluetooth Load");
+        SHARED.reset_session();
+    }
+
+    #[test]
+    fn the_load_thread_publishes_the_lead_it_resolved_with_the_loads_return() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        SHARED.reset_session();
+        ffi_host::reset_native_lifecycle_for_test();
+        let load = |lead: PcmLead| {
+            let epoch = SHARED.begin_native_session().expect("native session");
+            assert_eq!(SHARED.native_load_pcm_lead(epoch), None, "nothing before the Load returns");
+            threads::load_thread(threads::SendPtr(c"{}".as_ptr() as *mut c_char), epoch, None, lead);
+            assert!(SHARED.native_load_returned(epoch), "PRECONDITION: the Load returned");
+            let published = SHARED.native_load_pcm_lead(epoch);
+            SHARED.reset_session();
+            ffi_host::reset_native_lifecycle_for_test();
+            published
+        };
+        // A host has no platform to ask, so "no answer" is what a PCM Load resolves to here.
+        assert_eq!(load(PcmLead::FromOutput(AudioStack::Liblxa)), Some(PCM_SINK_LEAD_NS));
+        assert_eq!(load(PcmLead::FromOutput(AudioStack::AudioSinkNew)), Some(PCM_SINK_LEAD_NS));
+        assert_eq!(load(PcmLead::Off), None, "a Load that needs no read publishes none");
+        assert_eq!(load(PcmLead::Override(330_000_000, AudioStack::Liblxa)), None, "an override is settled before the thread starts");
+        assert_eq!(load(PcmLead::NoLead(AudioStack::Other)), None, "a stack with no lead is settled before the thread starts");
+        assert_eq!(load(PcmLead::NoLead(AudioStack::AdecSink)), None, "2016/2017: no lead, no read");
+        assert_eq!(load(PcmLead::Fixed(AudioStack::LgAudioSink)), None, "a lead that ignores the output is settled before the thread starts");
+    }
+
+    /// At 1.5x the picture's pts and the audio's both run on the divided timeline, and the lead on
+    /// top of it is still the output's, not scaled.
+    #[test]
+    fn the_lead_is_not_scaled_at_a_speed() {
+        let _serial = plx_base::testlock::serial();
+        let _restore = arm();
+        SHARED.applied_rate_permille.store(1500, Ordering::Relaxed);
+        let mut eng = engine_at(T_NS, PCM_SINK_LEAD_NS);
+        eng.flushed = true;
+        eng.rebase_pending = true;
+        SHARED.seek_target_ns.store(T_NS, Ordering::Relaxed);
+        tick(&mut eng);
+        let (v0, a0, audio) = first_feeds();
+        assert_eq!(a0, crate::player::to_sink_ns(T_NS) + PCM_SINK_LEAD_NS);
+        assert!((a0 - v0 - PCM_SINK_LEAD_NS).abs() <= 1, "audio is {} ns after the picture", a0 - v0);
+        let last_content = crate::player::from_sink_ns(audio.last().unwrap() - PCM_SINK_LEAD_NS);
+        assert!(
+            (eng.max_fed_audio_pts - last_content).abs() <= 2,
+            "max_fed_audio_pts {} is content time, the sink's last audio gives {last_content}",
+            eng.max_fed_audio_pts
+        );
     }
 }

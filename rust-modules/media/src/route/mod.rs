@@ -5,14 +5,17 @@
 //! [`plan::build_stream`] run on the resolve worker; [`decision`] holds everything else — the
 //! main-thread `Session`, the synchronized `PlayerControl`, and every PMS/native effect. Every
 //! item this module re-exports keeps its old `route::` path, so nothing outside `route/` had to
-//! change. `ci/check-deps.sh`'s `wall` gate holds `plan.rs` to zero
+//! change. `ci/check-deps.sh`'s `wall` gate holds `plan.rs` (and `plan_memory.rs`, its child) to zero
 //! `Instant::now`/`SystemTime::now`/`.elapsed()`; `decision.rs` is not scanned by that gate (a
 //! network/adapter effect is allowed to read wall time) but as of this split carries none either.
 
 mod decision;
+mod queue_navigation;
+pub use queue_navigation::{QueueContinuation, QueueStep, previous_restarts, queue_neighbor, queue_neighbors};
 mod flight;
 mod plan;
 mod prefs;
+mod track_memory;
 
 pub use decision::*;
 pub use flight::{
@@ -21,3 +24,4 @@ pub use flight::{
 };
 pub use plan::*;
 pub use prefs::*;
+pub use track_memory::{forced_only_language, forced_only_pick, memo_of_audio, memo_of_subtitle, subtitle_pick_changed, SubMode, TrackContext};

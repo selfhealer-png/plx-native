@@ -12,6 +12,36 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
 use std::sync::{Condvar, Mutex};
+
+/// How the pipeline refused a Load, for the `playback.failed` event: the Load call itself returned
+/// 0 (`Sync`, `threads::load_thread` via `publish_native_load_failure`), or the call returned and
+/// a `type=18` error callback arrived before any picture (`Async`, `sf_on_event`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum RefusalPath {
+    None = 0,
+    Sync = 1,
+    Async = 2,
+}
+
+impl RefusalPath {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Sync,
+            2 => Self::Async,
+            _ => Self::None,
+        }
+    }
+
+    /// The stable wire code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
 use std::time::{Duration, Instant};
 
 /// Exact conservation certificate accumulated while the native media clock is held.
@@ -218,6 +248,10 @@ enum LoadCall {
     /// whatever was left of the first one.
     Returned {
         at: Instant,
+        /// The audio lead the Load thread resolved from the sound output before it called `Load`
+        /// (`engine::PcmLead::FromOutput`, on a stack whose lead follows the output); `None` for a Load whose lead the frame thread settled.
+        /// Published WITH the return, so no reader can see the Load returned without it.
+        pcm_lead_ns: Option<i64>,
     },
 }
 
@@ -259,6 +293,17 @@ enum NativeSessionPhase {
     /// session may begin, because the C seam still owns exactly this one object.
     Abandoned {
         epoch: u32,
+    },
+    /// A real stop handed this epoch's ready object to the OFF-FRAME release (`engine`'s
+    /// `PendingRelease`): its `Unload` is running on a worker while the main thread has already
+    /// reset the session for whatever comes next. The admission rule is `Abandoned`'s — only the
+    /// firmware's UNLOADCOMPLETED is admitted, recorded in `unload_completed` rather than as a move
+    /// to `Unloaded` so that [`Shared::reset_session`] (which preserves this phase) cannot erase the
+    /// evidence the release then reads — and no new native session may begin until the release has
+    /// retired it.
+    Releasing {
+        epoch: u32,
+        unload_completed: bool,
     },
 }
 
@@ -307,6 +352,13 @@ pub enum NativeEventClass {
     Other,
 }
 
+/// Whose state a native callback may write; see [`Shared::with_native_session_scoped`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventScope {
+    Live,
+    Release,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HlsPauseCompletion {
     Accepted,
@@ -344,17 +396,6 @@ pub enum HlsPlayCompletion {
 struct AbrSeed {
     estimate: crate::abr::CapacityEstimate,
     observed_at: Instant,
-}
-
-/// one client-rendered subtitle cue (content-time ns). `track` is the 0-based subtitle-stream
-/// index it belongs to; the demuxer pushes cues for ALL text tracks and the render filters by
-/// the selected `desired_sub_idx`, so switching tracks is instant (no re-demux of the buffered
-/// region). Content-time ns matches the fed video PTS timeline (see active_subtitle).
-pub struct SubCue {
-    pub track: i32,
-    pub start_ns: i64,
-    pub end_ns: i64,
-    pub text: String,
 }
 
 /// one rect of a decoded image-subtitle display set: `w`×`h` at position (`x`,`y`) **in the
@@ -425,11 +466,13 @@ impl SubBitmap {
 ///
 /// This replaces the old single `seeking` boolean, which was only ever set by `request_seek` —
 /// so `player::loading()` was **false for the whole initial load** and the `Spinner` that has sat
-/// in `player_hud.rs` all along never fired on first play. The HUD drew a live-looking transport
-/// at 0:00 / -0:00 instead, which is the half of the frozen-HUD report that is not blocking I/O.
+/// in `appkit/player_hud/classic.rs` all along never fired on first play. The HUD drew a
+/// live-looking transport at 0:00 / -0:00 instead, which is the half of the frozen-HUD report that
+/// is not blocking I/O.
 ///
 /// Derived once per frame in `pump::set_state` from signals the workers already publish; no
-/// new cross-thread plumbing. Ordered so `>= Playing` reads as "actually on screen".
+/// new cross-thread plumbing. `Playing` alone means "a frame is on the panel"; `Paused` (a paused
+/// player with no picture and nothing in flight) is neither busy nor playing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum PlaybackState {
@@ -448,6 +491,11 @@ pub enum PlaybackState {
     Playing = 5,
     /// the producer died (a failed open / no video stream). Terminal until teardown.
     Error = 6,
+    /// the viewer is paused on a session that has no picture yet and the pump has no work in
+    /// flight for one (`pump::paused_and_idle`): not `Buffering` (nothing is being waited on, so
+    /// no spinner) and not `Playing` (no frame is on the panel, so no `is_playing`, no
+    /// `PlaybackStarted`). The HUD draws its ordinary paused transport.
+    Paused = 7,
 }
 
 /// How long a viewer's audio pick may stand as "the reason for the next rebuild" before the
@@ -485,6 +533,7 @@ impl PlaybackState {
             4 => PlaybackState::Seeking,
             5 => PlaybackState::Playing,
             6 => PlaybackState::Error,
+            7 => PlaybackState::Paused,
             _ => PlaybackState::Idle,
         }
     }
@@ -584,6 +633,25 @@ pub struct Shared {
     // The synchronized route controller owns whether a reload is pending; keeping a second atomic
     // mailbox here used to let reset_session erase the request halfway through that reload.
     pub desired_audio_idx: AtomicI32,
+    // The viewer's playback speed in thousandths (1000 = 1x), from `player::set_play_rate`. Like
+    // desired_audio_idx it PERSISTS across seeks/reloads (each fresh Load re-applies it) and is
+    // reset only on a new item (`player::reset_play_rate`).
+    pub play_rate_permille: AtomicI32,
+    // The speed THIS session's Load plays at (`player::session_rate_for`, published by
+    // `start_bufferfeed` before the demuxer spawns): what the timeline conversion
+    // (`player::to_sink_ns`) and the demuxer's audio decode read. Per session: reset_session puts
+    // it back to 1x.
+    pub applied_rate_permille: AtomicI32,
+    // One-shot: the next direct-play seek must be a full reload even in an in-place seek mode,
+    // because it exists to carry a speed change (`player::set_play_rate`), and a speed is fixed
+    // per Load.
+    pub rate_reload: AtomicBool,
+    // This process's television did not take a speed session's PCM (`player::fall_back_from_speed`):
+    // speed stays off until the app restarts. Never reset by a session.
+    pub speed_unsupported: AtomicBool,
+    // What the pipeline reported setting up for THIS speed session's audio
+    // (`player::note_speed_audio_report`); per session.
+    pub speed_audio_verdict: AtomicU8,
     // the derived UI state (a `PlaybackState`), published by the pump once a frame and read by
     // the HUD. Written only on the main thread; atomic because it is read from the draw path.
     pub pb_state: AtomicU8,
@@ -617,6 +685,23 @@ pub struct Shared {
     /// `error_shape` tell a k5lp-style hang apart from an ordinary firmware refusal on the wire,
     /// as `FailureKind::LoadTimeout` rather than the generic `FailureKind::TvPipeline`.
     pub load_timed_out: AtomicBool,
+    /// A native start is queued behind the previous object's still-running `Unload`. Written ONLY
+    /// by the `PlayerAdapter` after each release-machine step (it publishes the machine's
+    /// `has_queued`), never by a session; `state()` derives `Resolving` from it. Not part of
+    /// `reset_session`: the queue outlives a session reset exactly as the machine does.
+    pub start_queued: AtomicBool,
+    /// The pipeline took the video decoder back from an ESTABLISHED session: `type=18 num=600`
+    /// (`"VDEC resource is released by policy action"`) after a picture. Measured on the dev set
+    /// (webOS 4, 2026-10-13): a direct play left paused until the screensaver came on got this
+    /// with NO `LIFECYCLE: background`, and every later Play was refused for good. Set on the
+    /// callback thread, taken once by the app loop ([`super::take_decoder_revoked`]), which parks
+    /// the session exactly as an app switch does and rebuilds it on the viewer's next press.
+    pub decoder_revoked: AtomicBool,
+    /// The pipeline refused the Load with `type=18 num=200` (`Audio Codec Not Supported`) before any
+    /// picture while the session fed its audio natively (`ff::native_audio::fed`). Set on the
+    /// callback thread; the pump turns it into a learned refusal and a recovery flight that has the
+    /// server convert that audio (the machine's `ConfirmRefusal`, run by [`super::pump`]'s `confirm_refusal`).
+    pub native_audio_refused: AtomicBool,
     /// issue #74 D.1: the epoch this session last logged "native: loadCompleted while Load in
     /// flight — deferring" for — 0 = never. `epoch` is monotonic and never 0 for a real session
     /// ([`NativeSessionState::next`] skips 0 on wraparound), so comparing against this is enough
@@ -650,7 +735,6 @@ pub struct Shared {
     /// picker's rows are the only place this reaches, and only on DIRECT PLAY: a transcode is a
     /// remux the server built, and its tags are whatever the server put there.
     pub track_names: Mutex<TrackNames>,
-    pub sub_cues: Mutex<Vec<SubCue>>,
     pub ass_sources: Mutex<super::ass_source::Store>,
     pub ass_renderer: super::ass::Runtime,
     pub sub_bitmaps: Mutex<Vec<SubBitmap>>, // image-sub cues (every image track while subs are on)
@@ -696,8 +780,8 @@ pub struct Shared {
     /// Whether the active HLS segment declared an audio stream that this session feeds. The prime
     /// gate must not reinterpret a temporarily empty audio lane as a genuinely video-only file.
     pub hls_audio_expected: AtomicBool,
-    /// Retrospective replay reserve used at a fresh HLS Load/seek boundary and when a viewer
-    /// resumes a queue-backed stream. Automatic runtime rebuffer uses the pause-local
+    /// Retrospective replay reserve used only at a fresh HLS Load/seek boundary. Viewer Resume
+    /// requires the balanced decoder prime; automatic runtime rebuffer uses the pause-local
     /// `hls_recovery` certificate below; carrying this history into every controller-created hold
     /// was the source of repeated freeze/catch-up on an otherwise stable stream. Zero leaves the
     /// decoder's ordinary prime threshold in charge.
@@ -736,6 +820,13 @@ pub struct Shared {
     // set once the pipeline has drained to true end-of-stream (EOS pushed AND the last fed frame
     // has been presented). app.rs polls player::ended() to tear the player down at the credits.
     pub ended: AtomicBool,
+    /// The pipeline reported end-of-stream: `type=28` (0x1c, `STATE_UPDATE__ENDOFSTREAM`, the same
+    /// number on every webOS since the renumbering starts above it), `str=true`, after a picture.
+    /// It is the pipeline's own word that it presented the last of what it was given, which the
+    /// `ended` arithmetic cannot always reach: on the C1 (2026-10-20) a film whose audio ran 3 s
+    /// past its last video frame stopped its clock at 5894 s of 5897 s, refused the audio after
+    /// the EOS, and sat on the last frame for good. Cleared with the session and by a seek.
+    pub pipeline_eos: AtomicBool,
 
     // close-to-interrupt handle: raw ptr to the Engine-owned HttpStream box, so
     // the pump/teardown can close(fd) to unblock a blocked recv. The box outlives
@@ -761,6 +852,12 @@ pub struct Shared {
     /// displayed type would be a confident lie on the firmware we cannot test. `dg_cb_err` latches
     /// the one type that means the same on both.
     pub dg_cb_count: AtomicU32,
+    /// What [`crate::player::era_callbacks`] reads, all per session: position ticks (`type=0`),
+    /// callbacks `sink_counter_kind` named as the displayed-frame counter, and callbacks numbered
+    /// 46 to 49 that it did not name (the other era's numbers). Unlike `frames`, a seek leaves them.
+    pub dg_pos_ticks: AtomicU32,
+    pub dg_sink_displayed_cb: AtomicU32,
+    pub dg_sink_other_cb: AtomicU32,
     /// Why the VIDEO feeder is where it is, taken at each of `feed_stream`'s exit points.
     /// 0 none yet · 1 accepting · 2 BufferFull · 3 refused · 4 waiting for a frame (feed-ahead
     /// throttle) · 5 queue empty.
@@ -785,6 +882,12 @@ pub struct Shared {
     /// success flag, and the other refusals inside `sf_load` are the seam's own lifecycle gates —
     /// so a session that failed that way leaves this at 0 ("none recorded").
     pub dg_cb_err_num: AtomicI32,
+    /// HOW the Load was refused, as a [`RefusalPath`] code: written by [`Self::publish_native_load_failure`]
+    /// (`Sync`) and by `sf_on_event`'s refusal-before-any-picture arm (`Async`), first writer wins,
+    /// cleared by [`Self::reset_session`] with the other per-play failure state. Read by the
+    /// `playback.failed` event, which `dg_cb_err_num` alone cannot serve: a synchronous refusal
+    /// leaves that at 0 and so does a session that never failed.
+    pub refusal_path: AtomicU8,
     /// The media GET's HTTP status and the bytes actually delivered to the demuxer. Written by the
     /// DEMUX thread — the third writer of this block. 0/0 = no connection was ever made, which is
     /// a different failure from a connection that answered 401.
@@ -798,6 +901,11 @@ pub struct Shared {
     pub dg_transport_rc: AtomicI32,
     pub dg_transport_age_ms: AtomicI64,
     pub dg_transport_reopen_failed: AtomicBool,
+    /// WHICH demuxer exit failed the session (`DemuxExitClass::latch`; 0 = none recorded). Written
+    /// by `note_demux_exit` / `fail_demux`, FIRST WINS: the first cause is the real one, and the
+    /// teardown cascade that follows it must not overwrite it. Read by the handled playback error
+    /// as a class. Cleared per session beside the other `dg_*` latches.
+    pub dg_demux_exit: AtomicU8,
     /// SDL ticks when `loadCompleted` landed, and when `frames` last CHANGED. A photograph has no
     /// time axis: "Load completed, 0 frames" is innocent at 2 s and damning at 4 minutes, and the
     /// panel cannot tell the difference without these. Stamped in the pump, never in `app::diagnostics` —
@@ -917,19 +1025,47 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// Record WHICH demuxer exit failed the session, without raising `demux_failed` (an exit that
+    /// reaches the shared "produced no access units" tail through a plain `break`). FIRST WINS: a
+    /// compare-exchange from 0, so the real cause is kept and any later cascade is ignored.
+    pub fn note_demux_exit(&self, exit: plx_telemetry::telemetry::classes::DemuxExitClass) {
+        let _ = self
+            .dg_demux_exit
+            .compare_exchange(0, exit.latch(), Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// Raise `demux_failed` AND name the exit that raised it (first wins, see `note_demux_exit`).
+    /// The one way the demuxer or the Load builder fails the session through that flag.
+    pub fn fail_demux(&self, exit: plx_telemetry::telemetry::classes::DemuxExitClass) {
+        self.note_demux_exit(exit);
+        self.demux_failed.store(true, Ordering::Release);
+    }
+
+    /// The container's track names ([`Shared::track_names`]) for a READER on the main thread. A
+    /// panicked writer cannot leave the names half-built (they are replaced whole), so a poisoned
+    /// lock still holds a usable value and the reader takes it rather than panic.
+    pub fn track_names_lenient(&self) -> std::sync::MutexGuard<'_, TrackNames> {
+        self.track_names.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub const fn new() -> Self {
         Shared {
             native_session: Mutex::new(NativeSessionState::new()),
             dg_stage: AtomicU8::new(0),
             dg_cb_count: AtomicU32::new(0),
+            dg_pos_ticks: AtomicU32::new(0),
+            dg_sink_displayed_cb: AtomicU32::new(0),
+            dg_sink_other_cb: AtomicU32::new(0),
             dg_feed_state: AtomicU8::new(0),
             dg_cb_err: AtomicI32::new(0),
             dg_cb_err_at: AtomicU32::new(0),
             dg_cb_err_num: AtomicI32::new(0),
+            refusal_path: AtomicU8::new(RefusalPath::None as u8),
             dg_http_status: AtomicI32::new(0),
             dg_transport_rc: AtomicI32::new(0),
             dg_transport_age_ms: AtomicI64::new(-1),
             dg_transport_reopen_failed: AtomicBool::new(false),
+            dg_demux_exit: AtomicU8::new(0),
             dg_net_rx: AtomicI64::new(0),
             side_anchor: Mutex::new(None),
             side_subs_owner: AtomicBool::new(false),
@@ -987,18 +1123,25 @@ impl Shared {
             seeking: AtomicBool::new(false),
             seek_display_ns: AtomicI64::new(-1),
             desired_audio_idx: AtomicI32::new(-1),
+            play_rate_permille: AtomicI32::new(super::RATE_NORMAL),
+            applied_rate_permille: AtomicI32::new(super::RATE_NORMAL),
+            rate_reload: AtomicBool::new(false),
+            speed_unsupported: AtomicBool::new(false),
+            speed_audio_verdict: AtomicU8::new(0),
             pb_state: AtomicU8::new(PlaybackState::Idle as u8),
             demux_failed: AtomicBool::new(false),
             demux_io_failed: AtomicBool::new(false),
             demux_no_video: AtomicBool::new(false),
             load_failed: AtomicBool::new(false),
             load_timed_out: AtomicBool::new(false),
+            start_queued: AtomicBool::new(false),
+            decoder_revoked: AtomicBool::new(false),
+            native_audio_refused: AtomicBool::new(false),
             native_load_deferred_logged_epoch: AtomicU32::new(0),
             native_load_elapsed_ms: AtomicU64::new(0),
             playback_trace: Mutex::new(super::report::PlaybackTrace::new()),
             desired_sub_idx: AtomicI32::new(-1),
             track_names: Mutex::new(TrackNames::new()),
-            sub_cues: Mutex::new(Vec::new()),
             ass_sources: Mutex::new(super::ass_source::Store::new()),
             ass_renderer: super::ass::Runtime::new(),
             sub_bitmaps: Mutex::new(Vec::new()),
@@ -1022,6 +1165,7 @@ impl Shared {
             hls_trial_reserve_ms: AtomicI64::new(-1),
             hls_candidate_generation: AtomicU64::new(0),
             ended: AtomicBool::new(false),
+            pipeline_eos: AtomicBool::new(false),
             hs_ptr: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
@@ -1055,7 +1199,7 @@ impl Shared {
     /// must never depend on the reducer's verdict). Returns the elapsed time since the session's
     /// Load was issued, for the "native: Load returned after Nms" log — `None` when `epoch` no
     /// longer owns the `Active` phase (a superseded/already-retired session; nothing to mark).
-    pub fn mark_native_load_returned(&self, epoch: u32) -> Option<Duration> {
+    pub fn mark_native_load_returned(&self, epoch: u32, pcm_lead_ns: Option<i64>) -> Option<Duration> {
         let mut state = self
             .native_session
             .lock()
@@ -1069,6 +1213,7 @@ impl Shared {
             } if epoch != 0 && *active == epoch => {
                 *load_call = LoadCall::Returned {
                     at: Instant::now(),
+                    pcm_lead_ns,
                 };
                 Some(load_issued_at.elapsed())
             }
@@ -1083,8 +1228,25 @@ impl Shared {
         if !matches!(state.phase, NativeSessionPhase::Active { epoch: active, .. } if epoch != 0 && active == epoch) {
             return false;
         }
+        self.note_refusal_path(RefusalPath::Sync);
         self.load_failed.store(true, Ordering::Release);
         true
+    }
+
+    /// Record how this session's Load was refused. The first path wins: a later callback must not
+    /// rewrite the account of the refusal that ended the open.
+    pub fn note_refusal_path(&self, path: RefusalPath) {
+        let _ = self.refusal_path.compare_exchange(
+            RefusalPath::None as u8,
+            path as u8,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The refusal path recorded for this session, [`RefusalPath::None`] when there is none.
+    pub fn refusal_path(&self) -> RefusalPath {
+        RefusalPath::from_u8(self.refusal_path.load(Ordering::Relaxed))
     }
 
     /// Whether `epoch`'s Starfish `Load` call has returned yet. Required by `pump.rs`'s
@@ -1108,6 +1270,23 @@ impl Shared {
         )
     }
 
+    /// The audio lead `epoch`'s Load thread resolved from the sound output, once its Load has
+    /// returned: `None` while it is in flight, for another epoch, and for a Load that resolved none.
+    pub fn native_load_pcm_lead(&self, epoch: u32) -> Option<i64> {
+        let state = self
+            .native_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match state.phase {
+            NativeSessionPhase::Active {
+                epoch: active,
+                load_call: LoadCall::Returned { pcm_lead_ns, .. },
+                ..
+            } if epoch != 0 && active == epoch => pcm_lead_ns,
+            _ => None,
+        }
+    }
+
     /// How long ago `epoch`'s Starfish `Load` call returned — `None` when `epoch` no longer owns
     /// the `Active` phase, OR when its Load has not returned yet (still `LoadCall::InFlight`,
     /// which the OTHER budget window — [`native_load_elapsed`] — covers).
@@ -1126,7 +1305,7 @@ impl Shared {
         match state.phase {
             NativeSessionPhase::Active {
                 epoch: active,
-                load_call: LoadCall::Returned { at },
+                load_call: LoadCall::Returned { at, .. },
                 ..
             } if epoch != 0 && active == epoch => Some(at.elapsed()),
             _ => None,
@@ -1191,7 +1370,7 @@ impl Shared {
         match &mut state.phase {
             NativeSessionPhase::Active {
                 epoch: active,
-                load_call: LoadCall::Returned { at },
+                load_call: LoadCall::Returned { at, .. },
                 ..
             } if epoch != 0 && *active == epoch => {
                 *at = at.checked_sub(by).unwrap_or(*at);
@@ -1219,6 +1398,7 @@ impl Shared {
             NativeSessionPhase::Active { epoch: active, .. }
                 | NativeSessionPhase::Unloaded { epoch: active }
                 | NativeSessionPhase::Abandoned { epoch: active }
+                | NativeSessionPhase::Releasing { epoch: active, .. }
                 if epoch != 0 && active == epoch
         );
         if !owns {
@@ -1228,9 +1408,22 @@ impl Shared {
         true
     }
 
+    /// Hand `epoch`'s ready object to the off-frame release (see
+    /// [`NativeSessionPhase::Releasing`]). Taking the lock is the drain barrier for a callback
+    /// already inside the session; from here only UNLOADCOMPLETED is admitted. `false` when `epoch`
+    /// does not own the `Active` phase (the caller then releases synchronously, as before).
+    pub fn begin_native_release(&self, epoch: u32) -> bool {
+        self.leave_active(epoch, NativeSessionPhase::Releasing { epoch, unload_completed: false })
+    }
+
     /// Hand `epoch`'s still-in-flight Load to the abandoned-Load release (see
     /// [`NativeSessionPhase::Abandoned`]). `false` when `epoch` does not own the `Active` phase.
     pub fn abandon_native_session(&self, epoch: u32) -> bool {
+        self.leave_active(epoch, NativeSessionPhase::Abandoned { epoch })
+    }
+
+    /// Move `epoch`'s `Active` phase to `to`; `false` (nothing changed) when `epoch` does not own it.
+    fn leave_active(&self, epoch: u32, to: NativeSessionPhase) -> bool {
         let mut state = self
             .native_session
             .lock()
@@ -1239,8 +1432,20 @@ impl Shared {
         {
             return false;
         }
-        state.phase = NativeSessionPhase::Abandoned { epoch };
+        state.phase = to;
         true
+    }
+
+    /// Whether an off-frame `Unload` owns the native object ([`NativeSessionPhase::Releasing`]):
+    /// `player::sink()` answers the fenced sink for the main thread while this holds.
+    pub fn native_releasing(&self) -> bool {
+        matches!(
+            self.native_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phase,
+            NativeSessionPhase::Releasing { .. }
+        )
     }
 
     /// Whether a timed-out Load is parked ([`NativeSessionPhase::Abandoned`]): the native object
@@ -1269,11 +1474,15 @@ impl Shared {
     /// This is one mandatory lifecycle assertion, separate from the native interposer's admission
     /// and in-flight proof. A missing/renumbered callback quarantines the object rather than D1.
     pub fn native_unload_completed(&self, epoch: u32) -> bool {
-        self.native_session
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .phase
-            == NativeSessionPhase::Unloaded { epoch }
+        matches!(
+            self.native_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .phase,
+            NativeSessionPhase::Unloaded { epoch: e }
+                | NativeSessionPhase::Releasing { epoch: e, unload_completed: true }
+                if e == epoch
+        )
     }
 
     /// Fence pre-seek presentations while retaining non-frame Load/error callbacks. Locking is a
@@ -1399,6 +1608,20 @@ impl Shared {
         num: i64,
         event: impl FnOnce() -> R,
     ) -> Option<R> {
+        self.with_native_session_scoped(epoch, class, num, |_| event())
+    }
+
+    /// [`with_native_session`](Self::with_native_session), telling the event whose state it may
+    /// write: [`EventScope::Live`] for the session that owns the process-long diagnostics,
+    /// [`EventScope::Release`] for the lifecycle evidence of an object already handed to a release
+    /// (the main thread reset that state for the NEXT session before this callback arrived).
+    pub fn with_native_session_scoped<R>(
+        &self,
+        epoch: u32,
+        class: NativeEventClass,
+        num: i64,
+        event: impl FnOnce(EventScope) -> R,
+    ) -> Option<R> {
         let mut state = self
             .native_session
             .lock()
@@ -1409,8 +1632,19 @@ impl Shared {
             if epoch == 0 || abandoned != epoch || class != NativeEventClass::UnloadCompleted {
                 return None;
             }
-            let result = event();
+            let result = event(EventScope::Release);
             state.phase = NativeSessionPhase::Unloaded { epoch };
+            return Some(result);
+        }
+        if let NativeSessionPhase::Releasing { epoch: releasing, unload_completed } = &mut state.phase {
+            // The same rule for an object a real stop handed to the off-frame release: the main
+            // thread has already reset the state this callback would write into for the NEXT
+            // session, so only the release's own lifecycle evidence gets through.
+            if epoch == 0 || *releasing != epoch || class != NativeEventClass::UnloadCompleted {
+                return None;
+            }
+            let result = event(EventScope::Release);
+            *unload_completed = true;
             return Some(result);
         }
         let NativeSessionPhase::Active {
@@ -1434,7 +1668,7 @@ impl Shared {
                 }
             }
         }
-        let result = event();
+        let result = event(EventScope::Live);
         if class == NativeEventClass::UnloadCompleted {
             state.phase = NativeSessionPhase::Unloaded { epoch };
         }
@@ -1521,23 +1755,33 @@ impl Shared {
         // An ABANDONED native object is not this engine's session: it outlives the engine by
         // design until its `Load` returns and `engine::reap_abandoned_load` releases it. Clearing
         // it here would let the next session begin while the C seam still owns that object.
-        if !matches!(native.phase, NativeSessionPhase::Abandoned { .. }) {
+        // The same holds for an object handed to the off-frame release: its Unload is still running
+        // and the release retires the phase itself once it has the evidence.
+        if !matches!(
+            native.phase,
+            NativeSessionPhase::Abandoned { .. } | NativeSessionPhase::Releasing { .. }
+        ) {
             native.phase = NativeSessionPhase::Idle;
         }
         // the diagnostics mirror is per-session too — a stale bind outcome from the last item is
         // exactly the misleading answer the read-out exists to avoid
         self.dg_stage.store(0, Ordering::Relaxed);
         self.dg_cb_count.store(0, Ordering::Relaxed);
+        self.dg_pos_ticks.store(0, Ordering::Relaxed);
+        self.dg_sink_displayed_cb.store(0, Ordering::Relaxed);
+        self.dg_sink_other_cb.store(0, Ordering::Relaxed);
         self.dg_feed_state.store(0, Ordering::Relaxed);
         // A latched error MUST be cleared here, or one bad session paints every later healthy
         // playback red for the life of the process.
         self.dg_cb_err.store(0, Ordering::Relaxed);
         self.dg_cb_err_at.store(0, Ordering::Relaxed);
         self.dg_cb_err_num.store(0, Ordering::Relaxed);
+        self.refusal_path.store(RefusalPath::None as u8, Ordering::Relaxed);
         self.dg_http_status.store(0, Ordering::Relaxed);
         self.dg_transport_rc.store(0, Ordering::Relaxed);
         self.dg_transport_age_ms.store(-1, Ordering::Relaxed);
         self.dg_transport_reopen_failed.store(false, Ordering::Relaxed);
+        self.dg_demux_exit.store(0, Ordering::Relaxed);
         self.dg_net_rx.store(0, Ordering::Relaxed);
         self.dg_load_at.store(0, Ordering::Relaxed);
         self.dg_frame_at.store(0, Ordering::Relaxed);
@@ -1608,6 +1852,9 @@ impl Shared {
         self.seek_display_ns.store(-1, Ordering::Relaxed);
         // NB: desired_audio_idx is NOT reset here — it persists across seeks/reloads so a
         // native audio-track choice survives seeking. It is reset on a new item (route).
+        // play_rate_permille likewise; the APPLIED rate is the pipeline's, and a fresh one is 1x.
+        self.applied_rate_permille.store(super::RATE_NORMAL, Ordering::Relaxed);
+        self.speed_audio_verdict.store(super::SPEED_AUDIO_UNKNOWN, Ordering::Relaxed);
         self.pb_state
             .store(PlaybackState::Idle as u8, Ordering::Relaxed);
         self.demux_failed.store(false, Ordering::Relaxed);
@@ -1615,6 +1862,8 @@ impl Shared {
         self.demux_no_video.store(false, Ordering::Relaxed);
         self.load_failed.store(false, Ordering::Relaxed);
         self.load_timed_out.store(false, Ordering::Relaxed);
+        self.decoder_revoked.store(false, Ordering::Relaxed);
+        self.native_audio_refused.store(false, Ordering::Relaxed);
         // NB: desired_sub_idx is NOT reset here — like desired_audio_idx it persists across
         // seeks/reloads so a reload-based seek keeps the chosen subtitle. It is reset on a new
         // item (player::reset_subtitle). ASS packets are immutable file facts, not
@@ -1624,8 +1873,7 @@ impl Shared {
             let mut sources = self.ass_sources.lock().unwrap_or_else(|e| e.into_inner());
             if for_reload { sources.retain_for_reload(); } else { sources.reset(); }
         }
-        // These decoded cue/bitmap stores are transient render state and refill on read.
-        self.sub_cues.lock().unwrap().clear();
+        // The decoded bitmap store is transient render state and refills on read.
         self.sub_bitmaps.lock().unwrap().clear();
         // Cleared with them, and for the same reason: they describe the FILE the last demuxer had
         // open. A reload-based seek re-opens the same part and re-publishes the same names, but a
@@ -1648,6 +1896,7 @@ impl Shared {
             .store(-1, Ordering::Relaxed);
         self.reset_hls_clock();
         self.ended.store(false, Ordering::Relaxed);
+        self.pipeline_eos.store(false, Ordering::Relaxed);
         self.hs_ptr.store(std::ptr::null_mut(), Ordering::Release);
     }
 
@@ -1735,6 +1984,13 @@ impl Shared {
     /// the same item cannot inherit `Held` forever.
     pub fn cancel_clock_session_start(&self) {
         self.reset_hls_clock();
+    }
+
+    /// Whether the native clock is held for the VIEWER's pause, which fences the start's first
+    /// Play behind a prime (`reserve_hls_prime_play`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clock_user_held_for_test(&self) -> bool {
+        self.hls_clock.lock().unwrap_or_else(|e| e.into_inner()).user_held
     }
 
     #[cfg(all(any(test, feature = "test-support"), feature = "hostsim"))]
@@ -1890,6 +2146,28 @@ impl Shared {
             | HlsClockPhase::PlayIssuing { .. }
             | HlsClockPhase::Stopping => None,
         }
+    }
+
+    /// A viewer Pause that lands on a clock a seek or an Initial hold already owns marks it
+    /// `user_held`, and `reserve_hls_prime_play` refuses a Play on a user-held clock: the keyframe
+    /// would be fed through the preroll's open gate and never be allowed to present. When the pump
+    /// opens a preroll for such a Pause it hands the hold back to the seek prime exactly as
+    /// [`Self::prepare_seek_pause`] does for a seek dispatched from a user hold. `false` when the
+    /// clock is not held (transitioning, running, rebuffering): the caller tries again next tick.
+    pub fn hand_hold_to_seek_prime(&self) -> bool {
+        let mut clock = self.hls_clock.lock().unwrap_or_else(|e| e.into_inner());
+        let HlsClockPhase::Held {
+            hold: ClockHold::User | ClockHold::Initial | ClockHold::Seek | ClockHold::ResumePrime,
+        } = clock.phase
+        else {
+            return false;
+        };
+        if clock.user_held {
+            clock.user_held = false;
+            clock.resume_acb_pending = true;
+        }
+        clock.phase = HlsClockPhase::Held { hold: ClockHold::Seek };
+        true
     }
 
     pub fn complete_seek_pause(&self, token: u64, accepted: bool) -> HlsPauseCompletion {
@@ -2347,9 +2625,13 @@ impl Shared {
     }
 }
 
+/// `Transport::preroll_volume` while the sink is not muted (a saved volume is 0..=100).
+const PREROLL_VOLUME_NONE: i32 = i32::MIN;
+
 /// UI-facing transport state. Main-thread-only in practice (plex_run + pump +
-/// player_hud all run on M), but exposed as atomics so app.rs / player_hud.rs read
-/// it with plain .load()/.store(). Replaces the #[no_mangle] transport globals.
+/// player_hud all run on M), but exposed as atomics so the app's per-frame loop reads it
+/// with plain .load()/.store(); the HUD's draw path sees it only through the `HudModel` that
+/// loop fills. Replaces the #[no_mangle] transport globals.
 pub struct Transport {
     pub started: AtomicBool, // bf_started
     pub paused: AtomicBool,  // pl_paused
@@ -2361,6 +2643,17 @@ pub struct Transport {
     /// The viewer remains logically paused while a seek is allowed to feed, Play one landed frame,
     /// then re-pause. Keeping this separate prevents the UI/user intent from lying during preroll.
     seek_preroll: AtomicBool,
+    /// The seek preroll above was opened by the PUMP, not by a caller, and the pump closes it: the
+    /// target (ns) the seek was dispatched at, `-1` when the preroll is absent or a caller's.
+    /// Transport-wide on purpose: a reload (`reset_for_reload`) replaces the Engine but keeps the
+    /// viewer's Pause and this ownership, so the landing is settled on whichever Engine is live.
+    seek_preroll_owned: AtomicI64,
+    /// The sink volume the paused preroll's Play window muted (`player::mute_for_preroll`) saved for
+    /// its restore, `PREROLL_VOLUME_NONE` when the pipeline is not muted. The volume is PER PIPELINE:
+    /// a stop unloads it (`reset` forgets this with it) and a reload's fresh Load starts at the
+    /// default again, so only a still-live pipeline ever needs the restore
+    /// (`player::restore_preroll_volume`: resume, the accepted re-pause, and the pump's per-tick sweep).
+    preroll_volume: AtomicI32,
     pub hud_until: AtomicU32,  // pl_hud_until (SDL ticks)
     pub scrub_ns: AtomicI64,   // pl_scrub_ns (-1 = not scrubbing)
     pub seek_to_ns: AtomicI64, // g_seek_to_ns (UI seek request, -1 = none)
@@ -2481,6 +2774,8 @@ impl Transport {
             pause_clock: Mutex::new(UserPauseClock::new()),
             resume_pend: AtomicBool::new(false),
             seek_preroll: AtomicBool::new(false),
+            seek_preroll_owned: AtomicI64::new(-1),
+            preroll_volume: AtomicI32::new(PREROLL_VOLUME_NONE),
             hud_until: AtomicU32::new(0),
             scrub_ns: AtomicI64::new(-1),
             seek_to_ns: AtomicI64::new(-1),
@@ -2557,9 +2852,62 @@ impl Transport {
         !self.paused.load(Ordering::Acquire) || self.seek_preroll_active()
     }
 
+    /// Open the paused-seek preroll for a seek the PUMP dispatched under a viewer Pause, and take
+    /// ownership of closing it (`pump::settle_paused_seek`). A preroll a caller already opened (the
+    /// foreground restore) stays the caller's: `false`. Re-opening an owned one just retargets it
+    /// (a coalesced tap). Not paused: nothing to hold, `false`.
+    pub fn own_paused_seek(&self, target_ns: i64) -> bool {
+        if self.seek_preroll_owned.load(Ordering::Acquire) >= 0 {
+            self.seek_preroll_owned.store(target_ns.max(0), Ordering::Release);
+            return true;
+        }
+        if self.seek_preroll_active() || !self.begin_paused_seek() {
+            return false;
+        }
+        self.seek_preroll_owned.store(target_ns.max(0), Ordering::Release);
+        true
+    }
+
+    /// The target of the preroll the pump owns, if it owns one.
+    pub fn owned_paused_seek(&self) -> Option<i64> {
+        let target = self.seek_preroll_owned.load(Ordering::Acquire);
+        (target >= 0 && self.seek_preroll_active()).then_some(target)
+    }
+
+    /// Closing the preroll ends any ownership of it, so a failed re-pause (which leaves the preroll
+    /// open) keeps the pump retrying, and every other closer (Resume, an abandoned seek, a stop)
+    /// drops it without the pump re-pausing a film the viewer has since released.
     pub fn finish_seek_preroll(&self) {
         self.seek_preroll.store(false, Ordering::Release);
+        self.seek_preroll_owned.store(-1, Ordering::Release);
         self.resume_pend.store(false, Ordering::Release);
+    }
+
+    /// The paused preroll muted the sink; `saved` (0..=100) is what [`take_preroll_volume`]
+    /// returns. A second mute (a reload's fresh pipeline inside one open preroll) keeps the first
+    /// saved value (always the pipeline default today: the volume is never read back).
+    ///
+    /// [`take_preroll_volume`]: Transport::take_preroll_volume
+    pub fn note_preroll_muted(&self, saved: i32) {
+        let _ = self.preroll_volume.compare_exchange(
+            PREROLL_VOLUME_NONE,
+            saved.clamp(0, 100),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Whether a mute is outstanding.
+    pub fn preroll_muted(&self) -> bool {
+        self.preroll_volume.load(Ordering::Acquire) != PREROLL_VOLUME_NONE
+    }
+
+    /// Take the volume to restore, clearing the mute. `None` when nothing is muted.
+    pub fn take_preroll_volume(&self) -> Option<i32> {
+        match self.preroll_volume.swap(PREROLL_VOLUME_NONE, Ordering::AcqRel) {
+            PREROLL_VOLUME_NONE => None,
+            v => Some(v),
+        }
     }
 
     /// An engine reload is not a new playback and must not erase viewer Pause or the paused-seek
@@ -2586,6 +2934,9 @@ impl Transport {
         self.paused.store(false, Ordering::Release);
         self.resume_pend.store(false, Ordering::Relaxed);
         self.seek_preroll.store(false, Ordering::Relaxed);
+        self.seek_preroll_owned.store(-1, Ordering::Relaxed);
+        // The pipeline a mute belonged to is unloaded with the stop; the next one starts unmuted.
+        self.preroll_volume.store(PREROLL_VOLUME_NONE, Ordering::Relaxed);
         // …and not `scrub_ns`, for `reset_for_reload`'s reason: a new session is a fresh
         // `PlayerScreen` (or, on an auto-advance chain, `start_playback`'s in-place reset of the
         // live one), and both publish `Scrub::IDLE` themselves.
@@ -3313,10 +3664,15 @@ mod tests {
             .iter()
             .map(|src| src.chars().filter(|c| !c.is_whitespace()).collect())
             .collect();
+        // A first-wins latch is written by a compare-exchange inside a `Shared` method (the
+        // demuxer calls the method), so that spelling counts, but only where it is declared: the
+        // reset's plain `.store(0)` in this file must not satisfy the plain-store rule.
+        let shared_src: String = SHARED_SRC.chars().filter(|c| !c.is_whitespace()).collect();
         for f in declared {
-            let written = writers.iter().any(|src| {
-                src.contains(&format!("dg_{f}.store(")) || src.contains(&format!("dg_{f}.fetch_"))
-            });
+            let written = shared_src.contains(&format!("dg_{f}.compare_exchange("))
+                || writers.iter().any(|src| {
+                    src.contains(&format!("dg_{f}.store(")) || src.contains(&format!("dg_{f}.fetch_"))
+                });
             assert!(written, "dg_{f} is declared and read but NOTHING writes it — the panel would print its sentinel as fact");
         }
     }

@@ -17,8 +17,8 @@
 //!
 //! | mark | label | sub-line | read-out | badge |
 //! |---|---|---|---|---|
-//! | ✓ | `Movies`    | `This account` | `1 hr 57 min` | `1080p` |
-//! |   | `Film Club` | `friend`       | `1 hr 57 min` | `4K`    |
+//! | ✓ | `Movies`    | `This account` | `1h 57m` | `1080p` |
+//! |   | `Film Club` | `friend`       | `1h 57m` | `4K`    |
 //!
 //! # The four calls this module implements, and why each is not the obvious thing
 //!
@@ -86,7 +86,6 @@ use std::convert::Infallible;
 use plx_data::metadata::AltCopy;
 use plx_plex::plex::ServerId;
 use crate::registry::{AppLike, AppMsg, ContentArg, PageMemory};
-use plx_ui::consts::{SCR_H, SCR_W};
 use plx_ui::frame::Budget;
 use plx_machine::machine::{
     Canon, Cx, Delivery, Edge, Effects, EntryId, FocusKey, Fx, GroupId, Handled, InputKind,
@@ -98,7 +97,7 @@ use plx_ui::screen::{
     Stop,
 };
 use plx_ui::form::{Form, FormSection, FormTable, RowKey, RowKind};
-use plx_ui::table::{Badge, Row, TableView, MENU_MAX_W, MENU_MIN_W};
+use plx_ui::table::{Badge, Row, TableView};
 use plx_ui::{theme, Rect};
 
 /// The fields [`AltSourcesScreen::write`] canonicalises, for the recorder's shape pin (§5.4). The
@@ -141,37 +140,11 @@ impl LogicalState for AltSourcesArg {
 
 /// The pinned ~20px corner radius, the item menu's.
 const PANEL_RAD: f32 = 20.0;
-/// Air between the button that opened the panel and the panel itself — one `space` rung.
-const BTN_GAP: f32 = theme::space::MD;
-/// Keep-out from the screen edges, so a panel opened low on the page is still whole.
-///
-/// Per AXIS, for `item_menu::EDGE`'s reason: `space::XL` 64 clears `MARGIN_Y` vertically and misses
-/// `MARGIN_X` horizontally by 32px.
-const EDGE: f32 = theme::space::XL;
-const EDGE_X: f32 = plx_ui::consts::MARGIN_X;
 /// How far the panel rises into place, matching those same chip menus. The container's appear
 /// spring drives it now (`DrawFrame::page_alpha` IS `Surface::motion.appear`), so the translate is
 /// applied here rather than by `Popover::painter`; at rest it contributes nothing, which is what
 /// makes a settled capture of this panel byte-identical across the conversion.
 const RISE: f32 = plx_ui::popover::Popover::RISE;
-
-/// Under the button when there is room, above it when there is not — never over it, so the control
-/// that opened the panel stays readable beside its own list. Horizontally it hangs off the
-/// button's left edge (the list and the label it came from share a margin), pulled inside the
-/// screen's keep-out. Pure (anchor + measured height in, rect out), so the placement rules are
-/// host-testable without mounting anything.
-pub fn panel_at(a: Rect, content_w: f32, content_h: f32) -> Rect {
-    let width = content_w.clamp(MENU_MIN_W, MENU_MAX_W);
-    let h = content_h.clamp(120.0, SCR_H - 2.0 * EDGE);
-    let below = a.y + a.h + BTN_GAP;
-    let y = if below + h <= SCR_H - EDGE {
-        below
-    } else {
-        (a.y - BTN_GAP - h).max(EDGE)
-    };
-    let x = a.x.clamp(EDGE_X, (SCR_W - EDGE_X - width).max(EDGE_X));
-    Rect::new(x, y, width, h)
-}
 
 // ---- the model (pure) ------------------------------------------------------------------------
 
@@ -211,7 +184,7 @@ pub struct AltRow {
     /// user text) — which of the two the sub-line's text-fit check may hold to account.
     pub own_detail: bool,
     /// the runtime, for the row's trailing read-out — `None` for a copy the server sent no
-    /// duration for, which then says nothing rather than "0 min"
+    /// duration for, which then says nothing rather than "0m"
     pub value: Option<String>,
     /// the resolution class, or `None` for a copy the server described no video for
     pub badge: Option<String>,
@@ -271,9 +244,9 @@ pub fn rows(list: &[AltCopy], here_sid: ServerId, here_rk: &str) -> Vec<AltRow> 
                 detail: who.to_string(),
                 own_detail: c.owner.is_none(),
                 // a copy the server sent no duration for leaves the read-out slot EMPTY rather
-                // than claiming "0 min" — the same rule the sub-line's dangling separator followed
+                // than claiming "0m" — the same rule the sub-line's dangling separator followed
                 // while the runtime was part of it
-                value: (c.dur_ms > 0).then(|| plx_ui::fmt::dur_long(c.dur_ms)),
+                value: (c.dur_ms > 0).then(|| plx_ui::fmt::duration(c.dur_ms)),
                 badge: plx_ui::fmt::resolution(&c.res, c.width, c.height),
                 checked: here == Some(i),
                 sid: c.sid,
@@ -434,7 +407,7 @@ impl AltSourcesScreen {
 
     pub fn frame(&self, measure: &dyn plx_machine::machine::Measure) -> Rect {
         let [x, y, w, h] = self.arg.anchor.map(f32::from_bits);
-        panel_at(Rect::new(x, y, w, h), self.form.table.measured_width(measure), self.form.table.measured_height())
+        plx_ui::popover::under_or_above(Rect::new(x, y, w, h), self.form.table.measured_width(measure), self.form.table.measured_height())
     }
 
     fn dismiss<H: AppLike>(&self, fx: &mut Effects<'_, H>) {
@@ -647,7 +620,7 @@ impl<H: AppLike<Memory = PageMemory> + crate::registry::MetadataLike> Screen<H> 
     ///
     /// **The ordering this replaces was load-bearing and is now the container's** (§16.3): the
     /// panel's ground once sampled the framebuffer (`Glass::CACHED`), so the dim had to be down
-    /// before the backdrop was taken; the ground is the latched underlay field now, latched at the
+    /// before the backdrop was taken; the ground is the latched underlay field (a sheet is never glass; DS6 glass is for menus), latched at the
     /// head of the dims from the undimmed page. `ModalStack::draw_scrims` draws it at the end of the PAGE pass,
     /// which is strictly earlier than the surface pass this `draw` runs in, and multiplies by the
     /// appear spring and by `nav::page_alpha` — the second of which the in-`draw` version could
@@ -666,7 +639,7 @@ impl<H: AppLike<Memory = PageMemory> + crate::registry::MetadataLike> Screen<H> 
         // this panel is up can be read as the PANEL or as the host under it.
         let field = f.underlay;
         plx_ui::profile::phase("dt.alt", || {
-            plx_ui::widgets::panel_ground(p, r, PANEL_RAD, field);
+            plx_ui::widgets::panel_ground(p, r, PANEL_RAD, field, plx_ui::widgets::Ground::Sheet);
             self.form.table.draw(p, r, measure);
         });
         // The hit map's stops are registered against the SETTLED geometry (`self.frame()`, what

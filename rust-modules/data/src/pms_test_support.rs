@@ -80,15 +80,18 @@ pub(super) fn sid(slot: u16) -> ServerId {
 
 /// One source of the table, seeded directly. `handle` empty = a server of our own.
 pub(super) fn src(slot: u16, handle: &str, state: HubState, last: Option<SourceBuild>) -> Src {
-    let mut s = Src::new(sid(slot), handle.into());
+    let mut s = Src::new(sid(slot), handle.into(), &registry_keys_for_test());
     s.state = state;
     s.last = last;
+    // a Ready fixture is a source that answered
+    if state == HubState::Ready { s.deck_read = DeckRead::Answered; }
     s
 }
 
 /// Install a source table and the merge of it — the state a run of landings would have reached.
 /// Bypasses the roster, because a host test has no server registry to derive one from.
-pub(super) fn seed(state: &mut PmsState, srcs: Vec<Src>) {
+pub(super) fn seed(state: &mut PmsState, mut srcs: Vec<Src>) {
+    for s in &mut srcs { s.ledger = state.ledger.clone(); s.feed_copies(); }
     let build = merge(&srcs);
     state.srcs = srcs;
     // leave `sync_roster` idle — both halves, see `seed_for_test`

@@ -12,19 +12,35 @@
 //! that was `engine::ENGINE`. The seam still takes `&MainThread` (reached through the adapter),
 //! the slot takes `&mut PlayerAdapter`, and the token is `!Send`, so a closure that captured
 //! either cannot be handed to `task::spawn`. The exceptions are the honest ones: the two callbacks
-//! above are `extern "C"` entry points *from* the library thread and touch only `SHARED`, and
-//! `threads::load_thread` calls `sf_load` off-main by design (see `ffi`).
+//! above are `extern "C"` entry points *from* the library thread and touch only `SHARED`,
+//! `threads::load_thread` calls `sf_load` off-main by design (see `ffi`), and a real stop's
+//! `sf_unload` runs on the `sf-unload` worker on an `UnloadTicket` (`engine::PendingRelease`): the
+//! rest of that release (gate, retire, ACB UNLOADED, D1, `destroy_window`) stays on the main thread,
+//! and `sink()` answers a no-op sink to every other main-thread verb until it is done.
 #![allow(non_upper_case_globals)]
 pub mod adapter;
 pub mod claim_hold;
 pub mod ass; // pinned libass worker and immutable rendered frames
+pub mod ass_perf; // per-second libass cost line (`assperf:`)
+pub mod ass_timing; // libass clock reading and the validity window of a rendered frame
 pub mod ass_script; // a sidecar script fed in windows around the playhead
 pub mod ass_source; // bounded embedded scripts and subtitle presentation clock
 pub mod engine;
+pub mod foreground;
 pub mod lifecycle;
 pub mod machine;
 pub mod playurl; // the `plxnative-playurl` dev trigger: a stream and its Load declaration, parsed beside the engine that acts on it
 pub mod preview;
+pub mod recovery; // the failed-open ladder (pure machine); `pump` drives it
+pub mod release; // the native object's off-frame release lifecycle (pure machine); `engine` runs it
+#[cfg(feature = "devtriggers")]
+pub mod uri_protocol;
+#[cfg(feature = "devtriggers")]
+pub mod uri_lifecycle;
+#[cfg(feature = "devtriggers")]
+pub mod uriprobe; // the URI-mode probe (issue #1064, dev trigger `plxnative-uriprobe`): what to say to com.webos.media (pure machine); `uriprobe_drive` runs it
+#[cfg(feature = "devtriggers")]
+pub mod uriprobe_drive; // runs the probe: the transport, the window verbs and the route-start settle the machine leaves to a driver
 // `test` here is THIS crate's own test build only, not `any(test, feature = "test-support")`: the
 // application crate's `port.rs` names `StarfishSink` in every build of its library that is not its
 // own test build, and `cargo check --lib --tests` builds that library with this crate's
@@ -34,6 +50,8 @@ pub mod preview;
 pub mod ffi;
 #[cfg(feature = "hostsim")]
 pub mod ffi_host;
+mod era_callbacks; // the one diagnostic line for an era-chosen sink counter that never arrives (pure state)
+mod native_stall; // the surround native-audio stall watchdog (pure state) and the AU size evidence line
 mod pump;
 pub mod report;
 #[cfg(all(test, feature = "hostsim"))]
@@ -42,10 +60,14 @@ mod foreground_flight_tests;
 mod resume_tests;
 mod shared;
 pub mod sidecar;
+pub mod sub_charset; // legacy-encoding text subtitles (GBK, Big5, Shift_JIS, ...) read as UTF-8; decided once per track
 pub mod subside; // the side subtitle reader's thread and state (dev trigger `plxnative-subside`)
 #[cfg(feature = "hostsim")]
 pub mod sim_video; // the simulator's decoded picture, for screenshots (see its doc)
+pub mod text_ass; // text subtitles to ASS: dialect converter, synthesized header, sidecar scripts (pure)
+pub mod text_style; // the viewer's size/position picks as the numbers that converter and the screen's lift use (pure)
 pub mod threads;
+pub mod transport;
 pub mod video_geometry;
 pub mod vp9_hdr; // HDR10 for a VP9 stream: the container's PQ tag, written into the sourceInfo envelope ACB is sent
 
@@ -59,7 +81,7 @@ pub use shared::SubRect;
 pub use plx_data::metadata::track_names::TrackNames;
 pub use shared::UserPauseCursor;
 use shared::{
-    HlsPauseCompletion, HlsPlayCompletion, HlsUserPause, HlsUserResume, Shared, SubBitmap, SubCue,
+    HlsPauseCompletion, HlsPlayCompletion, HlsUserPause, HlsUserResume, Shared, SubBitmap,
     Transport,
 };
 
@@ -67,12 +89,32 @@ use shared::{
 /// (`player::ffi::StarfishSink`) or the simulator's (`player::ffi_host::HostSink`) once at boot; a
 /// hostsim test binary reads the host sink directly, so it needs no port. Everything in `player/`
 /// reaches the seam as `sink().<verb>(mt, ..)`, and nothing branches on which platform it is.
-#[cfg(not(all(any(test, feature = "test-support"), feature = "hostsim")))]
+///
+/// **While an off-frame `Unload` owns the native object this answers [`FENCE`]**, so the
+/// main thread cannot reach the object the worker is inside (the fence `PlayerAdapter::mt` used to
+/// provide by joining the worker, without a bound: PLX-NATIVE-1Q). The release itself, which has
+/// to reach the real seam, uses [`raw_sink`].
 fn sink() -> &'static dyn plx_platform::tv::sink::VideoSink {
+    if SHARED.native_releasing() {
+        &FENCE
+    } else {
+        raw_sink()
+    }
+}
+
+/// What a main-thread verb gets while the object is inside its off-frame `Unload`: nothing happens
+/// (every verb refused, `NoSink`'s answers), except the memoized queries that say nothing about the
+/// object, which keep the real answer.
+static FENCE: plx_platform::tv::sink::RefusingSink = plx_platform::tv::sink::RefusingSink(raw_sink);
+
+/// The seam itself, unfenced: only the native release (the `Unload` worker and its main-thread
+/// tail) may use it while the object is `Releasing`.
+#[cfg(not(all(any(test, feature = "test-support"), feature = "hostsim")))]
+fn raw_sink() -> &'static dyn plx_platform::tv::sink::VideoSink {
     plx_platform::tv::sink::installed()
 }
 #[cfg(all(any(test, feature = "test-support"), feature = "hostsim"))]
-fn sink() -> &'static dyn plx_platform::tv::sink::VideoSink {
+fn raw_sink() -> &'static dyn plx_platform::tv::sink::VideoSink {
     &ffi_host::HostSink
 }
 
@@ -136,7 +178,7 @@ pub fn seed_dev_track_names() {
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_long, c_uint};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering::Relaxed};
 
 pub static SHARED: Shared = Shared::new();
 pub static TX: Transport = Transport::new();
@@ -229,33 +271,93 @@ pub const ABR_WHY_RESPONSE_LIMITED: u8 = 13;
 /// less than the interruption. Decays on its own (`AbrPolicy::visible_switch_decay_ms`), so it is
 /// never a terminal state.
 pub const ABR_WHY_SWITCH_COST: u8 = 14;
-// Kodi in-place seek (flush + reopen + re-anchor the decode position + sendSegmentEvent, NO
-// reload/decoder re-init → no HDR-mode popup, no A/V-resync glitch). On webOS<11 (this 4.5)
-// setTimeToDecode returns 0, so feed_stream falls back to the content-info path
-// (loadSpi_getInfo + setContentInfo(ptsToDecode) — the same path the official app uses).
-// Cleared to false if the pipeline can't be reached (sf_send_segment == 0), which drops seeks
-// back to the robust reload-per-seek path.
-//
-// SCOPE: this is a **per-session probe, not a device-capability latch**, and
-// `engine::start_bufferfeed` re-arms it to true for every new session. What `sf_send_segment`
-// reports is whether `sf_pipeline()` could reach the CustomPipeline behind the CURRENT
-// StarfishMediaAPIs object: `SMP_READY()` (dispatch admission set after construction, and cleared
-// by destruction or quarantine) plus two non-null shared_ptr hops, `object+0x4c` -> `player+0x04`
-// (src/starfish.c). A cleared ready bit does not prove that object storage is unconstructed: the
-// safety path retains a quarantined object forever. Every one of these tests is a property of the
-// current dispatchable object, not a device capability. `sendSegmentEvent` itself returns
-// void, so a 0 here NEVER means "the segment event was rejected", only "there was nothing to
-// call it on" — a liveness/timing condition by construction.
-// Latching it for the process was therefore a bug with a very long tail: one teardown-window
-// race downgraded every later seek of every later item to a ~1 s reload until the app was
-// restarted. Re-arming per session is self-healing rather than oscillating, too: the fallback
-// the clear selects (`reload_at`) builds a fresh Starfish object, so the exact condition that
-// produced the 0 cannot survive into the session that re-arms — and if a fresh session really
-// can't reach its pipeline either, it re-clears after one seek and stays on the reload path.
-// It remains a static rather than an `Engine` field only because `pump.rs` reads it without an
-// Engine borrow at hand; its LIFETIME is the Engine's, since `start_bufferfeed` is the sole
-// constructor and the flag is only ever read while a session is live.
-pub static INPLACE_SEEK_OK: AtomicBool = AtomicBool::new(true);
+/// How a direct-play seek re-anchors the pipeline for THIS session (issue #568).
+///
+/// - [`Segment`](SeekMode::Segment) — Kodi's in-place seek: flush + reopen + `av_seek`, then on the
+///   first post-seek keyframe `setTimeToDecode` / `setContentInfo` + the private `sendSegmentEvent`.
+///   No reload, no decoder re-init, so no HDR-mode popup and no A/V-resync glitch. It reaches
+///   LG-private C++ objects through decompile-derived offsets (`src/starfish.c`'s `sf_pipeline`:
+///   object+0x4c, then player+0x04, plus `MEDIA_CUSTOM_CONTENT_INFO`'s `ptsToDecode`), proven on
+///   webOS 4.5 only, so it is used only where `inplace_layout_known` holds and the window is not
+///   `VP_EXPORTED`. On webOS<11 (this 4.5) `setTimeToDecode` returns 0, so `feed_stream` falls
+///   back to the content-info path (`loadSpi_getInfo` + `setContentInfo(ptsToDecode)`).
+/// - [`NativeSeek`](SeekMode::NativeSeek) — LG's PUBLIC `StarfishMediaAPIs::Seek(const char*)`
+///   (`_ZN17StarfishMediaAPIs4SeekEPKc`, present on every firmware 1.2 to 11.2): a flushing
+///   `gst_element_seek` whose segment starts at the millis passed. No private offset, no
+///   `flush()` (Seek flushes itself, and a `flush()` after it re-anchors the segment at 0 — the
+///   stale-segment stall), no decoder re-init. This is what `VP_EXPORTED` (webOS 5+) uses, and
+///   a known webOS 3 release on the ACB plane, whose old-ABI library `Segment` cannot assume
+///   (`engine::old_abi_seek_tested`).
+/// - [`Reload`](SeekMode::Reload) — a full fresh Starfish `Load` per seek (`engine::reload_at`),
+///   built out of Load/Play alone and assuming no layout at all: the fallback both of the others
+///   drop to, and every layout-unknown library `NativeSeek` is not tested on (webOS 2, an old-ABI
+///   4.x build, an unknown release) or a set with no video plane.
+///
+/// SCOPE: this is a **per-session mode, not a device-capability latch**, and
+/// `engine::start_bufferfeed` re-selects it for every new session. The one exception is a refused
+/// native `Seek`: that is remembered for the rest of the SAME playback (`native_seek_refused`,
+/// preserved across `reload_at`, cleared by a fresh play), so a firmware or file that refuses
+/// does not pay a refused `Seek` plus a full `Load` on every seek. A downgrade to `Reload` (a
+/// `sendSegment` that found no pipeline, a refused `Seek`) is a fact about the StarfishMediaAPIs
+/// object, which `sf_load` constructs and teardown's `sf_destroy` destructs once per session — not
+/// about the TV. `sendSegmentEvent` itself returns void, so its 0 NEVER means "the segment event
+/// was rejected", only "there was nothing to call it on": a liveness/timing condition by
+/// construction. Latching it for the process was a bug with a very long tail (one teardown-window
+/// race downgraded every later seek of every later item to a ~1 s reload until restart).
+/// Re-selecting per session is self-healing rather than oscillating, too: `reload_at` builds a
+/// fresh Starfish object, so the condition that produced the downgrade cannot survive into the
+/// session that re-selects. It remains a static rather than an `Engine` field only because
+/// `pump.rs` reads it without an Engine borrow at hand; its LIFETIME is the Engine's, since
+/// `start_bufferfeed` is the sole constructor and the mode is only read while a session is live.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeekMode {
+    Segment,
+    NativeSeek,
+    Reload,
+}
+
+impl SeekMode {
+    const fn to_u8(self) -> u8 {
+        match self {
+            SeekMode::Segment => 0,
+            SeekMode::NativeSeek => 1,
+            SeekMode::Reload => 2,
+        }
+    }
+    const fn from_u8(v: u8) -> SeekMode {
+        match v {
+            0 => SeekMode::Segment,
+            1 => SeekMode::NativeSeek,
+            _ => SeekMode::Reload,
+        }
+    }
+}
+
+static SEEK_MODE: AtomicU8 = AtomicU8::new(SeekMode::Segment.to_u8());
+
+/// Set once a native `Seek` was REFUSED during the current playback, and preserved by `reload_at`
+/// (whose fresh session would otherwise re-select `NativeSeek` and pay a refused `Seek` plus a full
+/// `Load` on every seek). A fresh play (`start_bufferfeed_tracked` with no live Engine) clears it.
+static NATIVE_SEEK_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this playback's native `Seek` was refused (see [`NATIVE_SEEK_REFUSED`]).
+pub(crate) fn native_seek_refused() -> bool {
+    NATIVE_SEEK_REFUSED.load(Relaxed)
+}
+
+pub(crate) fn set_native_seek_refused(refused: bool) {
+    NATIVE_SEEK_REFUSED.store(refused, Relaxed);
+}
+
+/// This session's direct-play seek mode.
+pub fn seek_mode() -> SeekMode {
+    SeekMode::from_u8(SEEK_MODE.load(Relaxed))
+}
+
+/// Set this session's direct-play seek mode (`start_bufferfeed` selects it, `feed_stream` downgrades it).
+pub(crate) fn set_seek_mode(mode: SeekMode) {
+    SEEK_MODE.store(mode.to_u8(), Relaxed);
+}
 static PTYPE: AtomicI32 = AtomicI32::new(10); // g_ptype (PLAYER_TYPE_MSE)
 
 // ---- API app.rs calls (were extern "C" fns in playback.h) ----
@@ -269,8 +371,40 @@ static PTYPE: AtomicI32 = AtomicI32::new(10); // g_ptype (PLAYER_TYPE_MSE)
 // `crate::route::cancel_play`'s `clear_play_verdict` (the same ritual that retires a `/decision`
 // refusal on leaving the player, called from `app.rs`'s `exit_player`) retires it precisely the
 // same way. See `engine.rs`'s `start_bufferfeed`/`start_bufferfeed_tracked` for the gate itself.
+/// `type=18`'s `num` when the pipeline releases the video decoder from an established session
+/// (`"VDEC resource is released by policy action"`). See `Shared::decoder_revoked`.
+const DECODER_REVOKED_BY_POLICY: i64 = 600;
+
+/// `type=18`'s `num` for `"Audio Codec Not Supported"`: libpf's `handleBusWarningMessage` raises it
+/// when a gst stream warning (`GST_STREAM_ERROR_CODEC_NOT_FOUND`) names audio. Every native Vorbis
+/// Load on a C1 ended in it (2026-10-21).
+const AUDIO_CODEC_NOT_SUPPORTED: i64 = 200;
+
+/// `PF_EVENT_TYPE_STR_STATE_UPDATE__ENDOFSTREAM` (0x1c): the last numbered type before the
+/// renumbering between webOS 4 and 5+, so the same on both. See `Shared::pipeline_eos`.
+const PIPELINE_END_OF_STREAM: c_int = 28;
+
+/// Did the pipeline take this session's video decoder back since the last ask? Consumes the
+/// answer: the app loop parks the session once per release.
+pub fn take_decoder_revoked() -> bool {
+    SHARED.decoder_revoked.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// The pipeline's decoder release as the app loop sees it, for a test with no native session.
+#[cfg(any(test, feature = "test-support"))]
+pub fn note_decoder_revoked_for_test() {
+    SHARED.decoder_revoked.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether the session's native clock is held for the viewer's pause, for a test with no native
+/// session to observe the fenced first Play on.
+#[cfg(any(test, feature = "test-support"))]
+pub fn clock_user_held_for_test() -> bool {
+    SHARED.clock_user_held_for_test()
+}
+
 pub use engine::{
-    acb_init, begin_resume, land_resume, start_bufferfeed, start_bufferfeed_tracked, stop_bufferfeed,
+    acb_init, begin_resume, foreground_follows_load, land_resume, start_bufferfeed, start_bufferfeed_tracked, stop_bufferfeed,
     suspend_bufferfeed, suspend_bufferfeed_if_attempt, BufferfeedStartOutcome, ResumeOutcome, ResumeStart,
 };
 
@@ -354,7 +488,33 @@ pub fn pause(pa: &mut adapter::PlayerAdapter) -> bool {
     acb_mirror_playstate(pa, false);
     true
 } // playback_pause
+/// Mute the sink for a paused preroll's Play window (`engine::try_prime`, immediately before that
+/// Play): the preroll plays ONE picture for a viewer who is paused, and the ~0.2-0.3 s until the
+/// plane binds is audible. The mute is the pipeline's own `setVolume` (per pipeline: the next Load
+/// starts at the default); [`restore_preroll_volume`] sets that default back. The volume is never
+/// read: `getVolume` is not bound (it returns an int on 4.5 where the NDK header says a string, and
+/// the wrong guess killed the app), so the log says what was SET, not what the pipeline reports.
+pub(crate) fn mute_for_preroll(mt: &plx_base::task::MainThread) {
+    unsafe { sink().set_volume(mt, 0) };
+    let default = plx_platform::tv::sink::PIPELINE_DEFAULT_VOLUME;
+    TX.note_preroll_muted(default);
+    log(&format!("preroll: volume set 0 (pipeline default {default} is restored later; no readback)"));
+}
+
+/// Give back the volume [`mute_for_preroll`] took. Idempotent (nothing muted: nothing happens), so
+/// every path that ends or abandons the preroll can call it: `resume`, the accepted re-pause, and
+/// the pump's per-tick sweep, which catches a preroll closed by a path with no adapter in hand
+/// (`abandon_seek`). A stop or reload needs no restore: the volume belonged to the pipeline that
+/// went with it (`Transport::reset` forgets the mute).
+pub(crate) fn restore_preroll_volume(mt: &plx_base::task::MainThread) {
+    let Some(volume) = TX.take_preroll_volume() else { return };
+    unsafe { sink().set_volume(mt, volume) };
+    log(&format!("preroll: volume set {volume} (restored; no readback)"));
+}
+
 pub fn resume(pa: &mut adapter::PlayerAdapter) -> bool {
+    // First, whichever branch follows: the viewer asked for sound, and a Play below must not run muted.
+    restore_preroll_volume(pa.mt());
     let queued_stream = pa.engine().is_some_and(|eng| eng.uses_stream_queues());
     match SHARED.prepare_hls_user_resume(queued_stream) {
         Some(HlsUserResume::Deferred) => {
@@ -435,6 +595,7 @@ pub fn finish_paused_seek(pa: &mut adapter::PlayerAdapter) -> bool {
         return false;
     }
     TX.finish_seek_preroll();
+    restore_preroll_volume(pa.mt());
     // One receipt after the accepted pause, never per frame: device scrub checks pair this
     // boundary with stationary playhead samples rather than assuming CommitSeek held the pause.
     log(&format!("seek: paused frame restored ns={}", SHARED.playpos_ns.load(Relaxed)));
@@ -494,8 +655,15 @@ fn acb_playstate_ready(stage: shared::Stage) -> bool {
 /// `Stage::Streaming` is the FIRST stage at which the ordered ACB bind transaction has finished:
 /// `setMediaId` → LOADED → `setMediaVideoData` → `setDisplayWindow` → PLAYING. It is the same
 /// predicate [`acb_mirror_playstate`] uses to decide whether the sink can take a PLAYSTATE at all,
-/// deliberately — one definition of "the plane is really ours", not two. No engine means no sink,
-/// so the bit clears on teardown without teardown having to remember to say so.
+/// deliberately — one definition of "the plane is really ours", not two. Buffer-feed ownership
+/// clears when its Engine is removed.
+///
+/// A URI-mode probe session (`uriprobe_drive`, dev trigger `plxnative-uriprobe`) has no Engine and
+/// so no Engine ACB stage: its observation starts with service `playing`, or with the controlled
+/// ACB experiment's first bind call. It remains latched through logical stop until release is
+/// acknowledged. The ACB experiment retains plane ownership through bus release until app exit,
+/// because asynchronous ACB completion is unproven. `drive` steps ownership before this call,
+/// including frames after the player screen has gone.
 ///
 /// This is an OBSERVATION of the adapter, not a second owner: it hands the answer to
 /// [`machine::Player::set_video_plane_bound`], which is the only writer and the only publisher.
@@ -504,10 +672,12 @@ pub fn observe_video_plane(
     pa: &mut adapter::PlayerAdapter,
 ) -> Option<bool> {
     let bound = pa.engine().is_some_and(|e| acb_playstate_ready(e.stage));
+    #[cfg(feature = "devtriggers")]
+    let bound = bound || pa.uri_plane_open();
     pl.set_video_plane_bound(bound)
 }
 
-// ---- transport accessors app.rs / player_hud.rs call ----
+// ---- transport accessors the app's per-frame loop and `HudMotion`'s tick call ----
 pub fn is_started() -> bool {
     TX.started.load(Relaxed)
 }
@@ -554,6 +724,7 @@ pub fn request_seek(ns: i64) {
     report::note_seek_for(crate::route::playback_trace_generation());
     crate::route::note_user_seek_intent(ns);
     SHARED.ended.store(false, Relaxed); // seeking back from the end un-ends the stream
+    SHARED.pipeline_eos.store(false, Relaxed);
     SHARED.seeking.store(true, Relaxed); // HUD: spinner + freeze the playhead until it lands
     SHARED.seek_display_ns.store(ns, Relaxed);
     TX.seek_to_ns.store(ns, Relaxed);
@@ -595,6 +766,10 @@ pub fn abandon_seek() {
 pub fn loading(ps: &crate::route::PlaybackSession) -> bool {
     state(ps).is_busy()
 }
+/// Runtime rebuffering, distinct from the brief Buffering state after seek priming.
+pub fn rebuffering() -> bool {
+    SHARED.hls_rebuffering.load(Relaxed)
+}
 /// true only while the pipeline is actually presenting frames — not resolving, connecting,
 /// buffering or seeking. app.rs gates the heartbeat's `pos=` field on this: on a **direct-play**
 /// resume `begin_resume` only arms the seek (it does not seed `playpos_ns`, unlike the transcode
@@ -615,7 +790,7 @@ pub fn state(ps: &crate::route::PlaybackSession) -> shared::PlaybackState {
     // the Resolving spinner until it lands. So does every recovery no Engine waits on (the
     // foreground restore's resume, a rollback after a Load that failed before its Engine
     // existed): `route::engineless_flight_outstanding`.
-    if crate::route::play_pending() || crate::route::engineless_flight_outstanding() {
+    if crate::route::play_pending() || crate::route::engineless_flight_outstanding() || SHARED.start_queued.load(Relaxed) {
         return shared::PlaybackState::Resolving;
     }
     // …and so is the PRE-FLIGHT refusal, for exactly the same reason: `/decision` answers before a
@@ -623,13 +798,14 @@ pub fn state(ps: &crate::route::PlaybackSession) -> shared::PlaybackState {
     // that owns `pb_state` never runs. Deriving it in the one reader keeps a single writer — the
     // alternative is poking `Error` into the player's state from the frame loop. It sits BELOW the
     // resolve check because a fresh resolve is the thing that retires the last verdict.
-    // A start refused because a timed-out Load is still parked (`ps.native_start_refused`) is the
-    // same kind of fact: no Engine was built, so the pump that owns `pb_state` never runs and
+    // A start refused because a timed-out Load is still parked, or because the previous object's
+    // off-frame Unload outlived `RELEASE_DEADLINE` (`ps.native_start_refused`) is the same kind of fact: no Engine was built, so the pump that owns `pb_state` never runs and
     // nothing else could say why the player is empty.
     if ps.jail_load_blocked
-        || ps.native_start_refused
+        || ps.native_start_refused.is_some()
         || crate::route::play_refused(ps)
         || crate::route::play_resolution_failed(ps)
+        || crate::route::engine_failure(ps).is_some()
     {
         return shared::PlaybackState::Error;
     }
@@ -749,6 +925,18 @@ pub enum FailureKind {
     /// reported: this is a HANG, and conflating the two made a k5lp-style stall indistinguishable
     /// from an ordinary rejection on the wire.
     LoadTimeout,
+    /// The previous native object's off-frame `Unload` had not returned after
+    /// [`release::RELEASE_DEADLINE`], so a new start was refused rather than handed a second object
+    /// (PLX-NATIVE-1Q). A hang like [`LoadTimeout`](Self::LoadTimeout), on the other side of the session.
+    ReleaseTimeout,
+    /// The resolve produced no playable plan and no verdict: no URL, no refusal, so no Engine
+    /// ever ran. A resolve with no client or whose worker never spawned ends here.
+    ResolveFailed,
+    /// A hero/trailer preview whose route was not a direct play, which a muted preview never
+    /// takes (Sentry PLX-NATIVE-1G): the plan carried [`PlayVerdict::PreviewNeedsDirectPlay`]. The
+    /// same item resolves the same way again, so unlike [`ResolveFailed`](Self::ResolveFailed) it
+    /// is not transient.
+    PreviewNotDirect,
     /// Everything else. Honest rather than tidy — see the type's doc.
     Unspecified,
 }
@@ -769,6 +957,9 @@ impl FailureKind {
             FailureKind::TvPipeline => C::TvPipeline,
             FailureKind::JailMissingRtkmem => C::JailMissingRtkmem,
             FailureKind::LoadTimeout => C::LoadTimeout,
+            FailureKind::ReleaseTimeout => C::ReleaseTimeout,
+            FailureKind::ResolveFailed => C::ResolveFailed,
+            FailureKind::PreviewNotDirect => C::PreviewNotDirect,
             FailureKind::Unspecified => C::Unspecified,
         }
     }
@@ -843,9 +1034,12 @@ pub fn failure_actions(kind: FailureKind, cx: FailureContext) -> Vec<FailureActi
     use FailureAction as A;
     use FailureKind as K;
     let transient = matches!(kind, K::MediaSource | K::PlaybackInterrupted | K::LoadTimeout
-        | K::Unspecified);
+        | K::ReleaseTimeout | K::ResolveFailed | K::Unspecified);
     let mut v = Vec::with_capacity(4);
     match kind {
+        // A preview refused for not being a direct play: the same item resolves the same way, and
+        // a preview has no rung to pick.
+        K::PreviewNotDirect => {}
         // A device finding: nothing about the request changes it; only the repair can.
         K::JailMissingRtkmem => {
             if cx.repair_idle {
@@ -931,7 +1125,7 @@ pub struct ErrorShape {
 /// variant is backed by a distinct signal the worker already publishes, so the HUD never parses
 /// log strings or guesses from elapsed time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RuntimeFailure {
+pub(crate) enum RuntimeFailure {
     /// No worker supplied a cause. Say that honestly rather than leaving the reason slot blank.
     Unknown,
     /// The producer never opened a usable media stream or produced a video access unit.
@@ -944,6 +1138,10 @@ enum RuntimeFailure {
     /// Issue #74 D.1.4's `NATIVE_LOAD_BUDGET` fired — a hang, not a firmware refusal. See
     /// [`FailureKind::LoadTimeout`].
     LoadTimeout,
+    /// The previous object's `Unload` is overdue. See [`FailureKind::ReleaseTimeout`].
+    ReleaseTimeout,
+    /// The resolve landed no plan and no verdict ([`FailureKind::ResolveFailed`]).
+    ResolveFailed,
 }
 
 /// PURE: turn the four terminal worker signals into one cause. More specific downstream evidence
@@ -969,6 +1167,26 @@ fn runtime_failure(
     } else {
         RuntimeFailure::Unknown
     }
+}
+
+/// The cause the worker signals publish right now: what [`error_now`] reads while an Engine is up,
+/// and what a failed Engine freezes into the session as it is released.
+fn live_runtime_failure(ps: &crate::route::PlaybackSession) -> RuntimeFailure {
+    if ps.native_start_refused == Some(crate::route::StartRefusal::ReleaseTimeout) {
+        return RuntimeFailure::ReleaseTimeout;
+    }
+    // FIRST: a resolve that landed no plan built no Engine, so any worker signal still set is a
+    // previous playback's, not this one's.
+    if crate::route::play_resolution_failed(ps) {
+        return RuntimeFailure::ResolveFailed;
+    }
+    runtime_failure(
+        SHARED.demux_failed.load(std::sync::atomic::Ordering::Acquire),
+        SHARED.demux_io_failed.load(std::sync::atomic::Ordering::Acquire),
+        SHARED.load_failed.load(Relaxed),
+        // The refused start's cause: an abandoned Load exists only after the budget fired.
+        SHARED.load_timed_out.load(Relaxed) || ps.native_start_refused == Some(crate::route::StartRefusal::LoadTimeout),
+    )
 }
 
 /// The read-out for [`FailureKind::JailMissingRtkmem`] — the one `ErrorShape` not produced by
@@ -1088,6 +1306,26 @@ fn error_shape(
             detail: std::borrow::Cow::Borrowed(""),
             no_pass: false,
         },
+        // The read-out reuses the load-timeout wording: both are "the television did not answer in
+        // time", and a new sentence needs every language (the catalog is not extended here).
+        RuntimeFailure::ReleaseTimeout => ErrorShape {
+            kind: FailureKind::ReleaseTimeout,
+            caption: plx_platform::i18n::msg::widgets_failure_load_timeout_c(),
+            panel: plx_platform::i18n::msg::widgets_panel_load_timeout(),
+            readout: plx_platform::i18n::msg::widgets_reason_load_timeout(),
+            detail: std::borrow::Cow::Borrowed(""),
+            no_pass: false,
+        },
+        // The wording is the open failure's: the app never got as far as a stream to open, and the
+        // reader's remedy (try again) is the same.
+        RuntimeFailure::ResolveFailed => ErrorShape {
+            kind: FailureKind::ResolveFailed,
+            caption: plx_platform::i18n::msg::widgets_failure_open_c(),
+            panel: plx_platform::i18n::msg::widgets_panel_open(),
+            readout: plx_platform::i18n::msg::widgets_reason_open(),
+            detail: std::borrow::Cow::Borrowed(""),
+            no_pass: false,
+        },
         RuntimeFailure::Unknown => ErrorShape {
             kind: FailureKind::Unspecified,
             caption: plx_platform::i18n::msg::widgets_status_failed_c(),
@@ -1138,6 +1376,20 @@ fn with_forced_playback_context(mut shape: ErrorShape, forced: bool) -> ErrorSha
     shape
 }
 
+/// The read-out for [`FailureKind::PreviewNotDirect`]. A preview shows no read-out of its own, so
+/// the wording is the open failure's (the catalog has no narrower "could not prepare playback"
+/// string, and a new one would need every language).
+fn preview_not_direct_shape() -> ErrorShape {
+    ErrorShape {
+        kind: FailureKind::PreviewNotDirect,
+        caption: plx_platform::i18n::msg::widgets_failure_open_c(),
+        panel: plx_platform::i18n::msg::widgets_panel_open(),
+        readout: plx_platform::i18n::msg::widgets_reason_open(),
+        detail: std::borrow::Cow::Borrowed(""),
+        no_pass: false,
+    }
+}
+
 /// The live [`ErrorShape`] for `PlaybackState::Error` (main thread — `route::is_transcoding` and
 /// `route::play_verdict` read main-thread state).
 pub fn error_now(ps: &crate::route::PlaybackSession) -> ErrorShape {
@@ -1150,24 +1402,18 @@ pub fn error_now(ps: &crate::route::PlaybackSession) -> ErrorShape {
     if ps.jail_load_blocked {
         return jail_error_shape();
     }
-    let demux_failed = SHARED
-        .demux_failed
-        .load(std::sync::atomic::Ordering::Acquire);
-    let demux_io_failed = SHARED
-        .demux_io_failed
-        .load(std::sync::atomic::Ordering::Acquire);
+    // The typed verdict, not the sentence: a refused preview is ours, not the server's, and must
+    // not read as `DecisionRefused`.
+    if crate::route::play_refused_as_preview(ps) {
+        return preview_not_direct_shape();
+    }
     with_forced_playback_context(error_shape(
         SHARED.demux_no_video.load(Relaxed),
         crate::route::is_transcoding(ps),
         playing_subscription(&ps),
-        crate::route::play_verdict(ps),
-        runtime_failure(
-            demux_failed,
-            demux_io_failed,
-            SHARED.load_failed.load(Relaxed),
-            // The refused start's cause: an abandoned Load exists only after the budget fired.
-            SHARED.load_timed_out.load(Relaxed) || ps.native_start_refused,
-        ),
+        crate::route::play_verdict(ps).as_deref(),
+        // The cause a released Engine left behind, else the live worker signals.
+        crate::route::engine_failure(ps).unwrap_or_else(|| live_runtime_failure(ps)),
     ), crate::route::forced_direct_play(ps))
 }
 
@@ -1216,7 +1462,7 @@ fn failtest_arm(ps: &crate::route::PlaybackSession) -> Option<ErrorShape> {
         // verdict sentence for a video format the engine cannot take, through the real resolver.
         "policy" => with_forced_playback_context(
             error_shape(false, false, sub,
-                Some(crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video).text()),
+                Some(&crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Video).text()),
                 RuntimeFailure::Unknown),
             true,
         ),
@@ -1435,6 +1681,8 @@ impl Diag {
             2 => "AC3 PLUS",
             3 => "AAC",
             4 => "DTS",
+            5 => "PCM (decoded in the app)",
+            6 => "OPUS",
             _ => "NONE (needAudio:false)",
         }
     }
@@ -1557,8 +1805,9 @@ pub fn seek_display_ns() -> i64 {
 /// heartbeat's `pos=`, which `tests/run.py` grades real playback progress from — feeding it an
 /// intended position would let a seek that never lands read as playback that climbed.
 ///
-/// `appkit/player_hud.rs` deliberately does NOT call this: it needs the same outer two rungs with the
-/// live scrub preview between them, so its expression is a superset rather than a caller.
+/// `appkit/player_hud/state.rs::display_pos_ns` deliberately does NOT call this: it needs the same
+/// outer two rungs with the live scrub preview between them, so its expression is a superset
+/// rather than a caller.
 pub fn intended_pos_ns(ps: &crate::route::PlaybackSession) -> i64 {
     let t = seek_display_ns();
     if loading(ps) && t >= 0 {
@@ -1577,7 +1826,6 @@ pub fn intended_pos_ns(ps: &crate::route::PlaybackSession) -> i64 {
 /// transcode with that source audio at the current position next tick.
 pub fn request_audio_switch(ps: &crate::route::PlaybackSession, _sid: i64) {
     crate::route::request_user_route_intent(ps, crate::route::UserRouteIntent::Retranscode);
-    SHARED.sub_cues.lock().unwrap().clear(); // the fresh transcode carries no embedded subs
 }
 /// request a NATIVE audio-track switch (direct-play, NO transcode): feed the 0-based `audio_idx`
 /// audio stream from the same MKV with codec `codec`. The pump reloads direct-play at the current
@@ -1588,18 +1836,204 @@ pub fn request_audio_track(ps: &mut crate::route::PlaybackSession, audio_idx: i3
     crate::route::request_user_route_intent(ps, crate::route::UserRouteIntent::NativeAudioReload);
 }
 /// Everything a native audio switch needs BEFORE its direct-play reload, without queueing one:
-/// the Load payload codec, the demuxer's stream index, and the old track's embedded cues gone.
+/// the Load payload codec and the demuxer's stream index.
 /// A claimed action that owes a displaced pick its reload (issue #266) stages it here and runs
 /// the reload itself, so no second intent is queued mid-claim.
 pub fn stage_native_audio(ps: &mut crate::route::PlaybackSession, audio_idx: i32, codec: &str) {
     crate::route::set_stream_acodec(ps, codec); // the reload's Load payload uses this audio codec
     SHARED.desired_audio_idx.store(audio_idx, Relaxed);
-    SHARED.sub_cues.lock().unwrap().clear();
 }
 /// reset to the default (best) audio stream — called on a new item so a prior track choice
 /// does not leak across items (desired_audio_idx persists across seeks, not across items).
 pub fn reset_audio_track() {
     SHARED.desired_audio_idx.store(-1, Relaxed);
+}
+
+/// Normal speed, in the thousandths every playback-rate value here is counted in.
+pub const RATE_NORMAL: i32 = 1000;
+/// The speeds the player offers, slowest first: the same seven as Plex Web's Playback Speed.
+pub const PLAY_RATES: [i32; 7] = [500, 750, RATE_NORMAL, 1250, 1500, 1750, 2000];
+
+/// A speed as a multiplier with no trailing zeros (`0.5×`, `1.25×`, `2×`, `1×`). The numerals are
+/// not localized — Plex Web's are not either.
+pub fn rate_name(permille: i32) -> String {
+    let whole = permille / 1000;
+    let frac = format!("{:03}", permille % 1000);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() { format!("{whole}×") } else { format!("{whole}.{frac}×") }
+}
+
+/// The viewer's playback speed, in thousandths (1500 = 1.5x).
+pub fn play_rate_permille() -> i32 {
+    SHARED.play_rate_permille.load(Relaxed)
+}
+/// The speed the pipeline on screen is actually running at: [`play_rate_permille`] once a Load
+/// has applied it, 1x before that, and 1x for good if LG refused it.
+pub fn applied_rate_permille() -> i32 {
+    SHARED.applied_rate_permille.load(Relaxed)
+}
+
+/// **Change the playback speed of the item on screen.**
+///
+/// The speed is done in the APP, not the pipeline (LG's own `SetPlayRate` cannot work on a
+/// buffer-feed pipeline; `crate::speed_audio`'s module doc). A Load fixes it for its whole
+/// session: the payload declares PCM audio, the demuxer decodes and time-stretches the sound
+/// (`ff::SpeedDecoder`), and every timestamp crossing to the pipeline is divided by the speed
+/// ([`to_sink_ns`]). A change is therefore a reload at the viewer's position — a seek to where they
+/// already are, which `SHARED.rate_reload` makes a full reload in every seek mode — the same shape
+/// as a native audio-track switch, and while the speed is not 1x every direct-play seek reloads
+/// too (`pump::seek_must_reload`), so each session starts on a fresh timeline.
+///
+/// Returns whether anything was requested: picking the speed already set does nothing.
+pub fn set_play_rate(ps: &crate::route::PlaybackSession, permille: i32) -> bool {
+    if !PLAY_RATES.contains(&permille) || permille == play_rate_permille() {
+        return false;
+    }
+    if permille != RATE_NORMAL && !speed_offer(ps).contains(&permille) {
+        log(&format!("rate: {permille} not offered for this playback"));
+        return false;
+    }
+    SHARED.play_rate_permille.store(permille, Relaxed);
+    log(&format!("rate: {permille} requested"));
+    if !is_started() {
+        return true; // nothing on screen: the next Load applies it
+    }
+    SHARED.rate_reload.store(true, Relaxed);
+    request_seek(intended_pos_ns(ps).max(0));
+    true
+}
+plx_base::devtrig::latched_flag!(
+    /// `/tmp/plxnative-noaudio` — a video-only Load (`needAudio:false`, no audio ES fed), the dev A/B
+    /// that isolates the audio path. Latched: [`speed_offer`] runs every frame while the More menu
+    /// is open and the pump's speed check every tick, and a `devtrig::flag` read is a `stat(2)`
+    /// syscall per call.
+    pub(crate) fn no_audio_armed = "noaudio";
+);
+
+/// **The speeds this playback can offer** (Normal included), or none when speed is unavailable:
+/// a trailer preview, segmented HLS (not wired), audio the bundled FFmpeg cannot decode
+/// (`ff::speed_decoder_available`), a television that has already failed a PCM session
+/// ([`speed_unsupported`]), or a stream whose fed rate would pass the frame rate the Load can
+/// declare ([`engine::speed_fps_ceiling_now`]). The menu offers exactly these, and a Load plays
+/// only one of them.
+pub fn speed_offer(ps: &crate::route::PlaybackSession) -> Vec<i32> {
+    if crate::route::is_preview(ps) || crate::route::is_segmented_hls(ps) || speed_unsupported() {
+        return Vec::new();
+    }
+    let codec = crate::route::stream_acodec(ps);
+    if !no_audio_armed() && !crate::ff::speed_decoder_available(&codec) {
+        return Vec::new();
+    }
+    speeds_within(crate::route::stream_fps(ps), engine::speed_fps_ceiling_now(ps))
+}
+
+/// The most frames per second a speed may ask the decoder to show: at speed `r` a `fps` source is
+/// fed at `fps * r` (every frame, closer together), and 60 is what every Load envelope this app
+/// declares can carry. It is the ceiling when the device's own table says nothing tighter; a
+/// measured decoder row below it lowers it ([`engine::speed_fps_ceiling`]). 24p reaches 2x there;
+/// 50p and 60p offer nothing above 1x.
+pub const SPEED_MAX_FPS: f64 = 60.5;
+
+/// [`PLAY_RATES`] a `fps` source can play without being fed faster than `max_fps`: the ceiling for
+/// this playback, [`SPEED_MAX_FPS`] or a measured decoder row's lower rate. An unknown rate (0) is
+/// treated as film, the common case for a file whose rate PMS did not report.
+pub fn speeds_within(fps: f64, max_fps: f64) -> Vec<i32> {
+    let fps = if fps > 0.0 { fps } else { 24.0 };
+    PLAY_RATES.iter().copied().filter(|r| fps * *r as f64 / 1000.0 <= max_fps).collect()
+}
+
+/// **The speed a Load is about to play at**: the viewer's, if this playback offers it, else 1x —
+/// and a refusal puts the viewer's speed back to Normal so the menu does not claim a speed the
+/// picture is not playing at.
+pub(crate) fn session_rate_for(ps: &crate::route::PlaybackSession) -> i32 {
+    let want = play_rate_permille();
+    if want == RATE_NORMAL || crate::route::is_preview(ps) {
+        return RATE_NORMAL;
+    }
+    let offer = speed_offer(ps);
+    let rate = session_rate(want, &offer);
+    if rate != want {
+        SHARED.play_rate_permille.store(RATE_NORMAL, Relaxed);
+        log(&format!("speed: {want} not offered here ({offer:?}) -> 1x"));
+    }
+    rate
+}
+
+/// [`session_rate_for`]'s rule, pure.
+pub fn session_rate(want: i32, offer: &[i32]) -> i32 {
+    if offer.contains(&want) { want } else { RATE_NORMAL }
+}
+
+/// **A television that did not take this session's PCM.** Latched for the life of the process:
+/// the same set will refuse the next one too.
+pub fn speed_unsupported() -> bool {
+    SHARED.speed_unsupported.load(Relaxed)
+}
+
+/// What the pipeline said it set up for a speed session's audio, from its audio-info callback
+/// (`audio/x-raw … <kHz> <channels> …`). 48 kHz stereo is what the payload declared; anything
+/// else means the declaration was not understood — measured: `"sampleRate":48000` came back as
+/// 44.099998 and the audio drifted and resynced every few seconds.
+pub(crate) fn note_speed_audio_report(b: &[u8]) {
+    if applied_rate_permille() == RATE_NORMAL || !b.starts_with(b"audio/") {
+        return;
+    }
+    let text = String::from_utf8_lossy(b);
+    let mut f = text.split_whitespace();
+    let kind = f.next().unwrap_or("");
+    let khz: f64 = f.nth(2).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let channels: i32 = f.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ok = kind == "audio/x-raw" && (khz - 48.0).abs() < 0.01 && channels == 2;
+    SHARED.speed_audio_verdict.store(if ok { SPEED_AUDIO_OK } else { SPEED_AUDIO_BAD }, Relaxed);
+    log(&format!("speed: pipeline audio {kind} {khz} kHz x{channels} -> {}", if ok { "ok" } else { "NOT what was declared" }));
+}
+/// What the pipeline reported for this speed session's audio, for the Stats for nerds read-out:
+/// `None` before any report, `Some(true)` for the declared 48 kHz stereo, `Some(false)` otherwise.
+pub fn speed_audio_report() -> Option<bool> {
+    match SHARED.speed_audio_verdict.load(Relaxed) {
+        SPEED_AUDIO_OK => Some(true),
+        SPEED_AUDIO_BAD => Some(false),
+        _ => None,
+    }
+}
+pub(crate) const SPEED_AUDIO_UNKNOWN: u8 = 0;
+pub(crate) const SPEED_AUDIO_OK: u8 = 1;
+pub(crate) const SPEED_AUDIO_BAD: u8 = 2;
+
+/// **The safety net**: this television did not take a speed session's PCM (`why`). Latch speed off
+/// ([`speed_unsupported`]), put the viewer's speed back to Normal, and reload at their position —
+/// the same reload a speed change is, which now lands at 1x on the TV's own audio path.
+pub(crate) fn fall_back_from_speed(ps: &crate::route::PlaybackSession, why: &str) {
+    log(&format!("speed: FALLING BACK to 1x — {why}; speed is off until the app restarts"));
+    SHARED.speed_unsupported.store(true, Relaxed);
+    SHARED.play_rate_permille.store(RATE_NORMAL, Relaxed);
+    SHARED.rate_reload.store(true, Relaxed);
+    request_seek(intended_pos_ns(ps).max(0));
+}
+
+/// **Film time to the pipeline's timeline.** At speed `r` the pipeline still plays at its own 1x,
+/// so every timestamp the app hands it — a fed AU, a seek or decode position — is divided by `r`;
+/// the frames then arrive `r` times closer together and the picture runs `r` times faster.
+/// Identity at 1x, which is every playback that has not picked a speed.
+pub fn to_sink_ns(ns: i64) -> i64 {
+    scale_ns(ns, RATE_NORMAL, applied_rate_permille())
+}
+/// The inverse, for every timestamp the pipeline reports back (a presented frame).
+pub fn from_sink_ns(ns: i64) -> i64 {
+    scale_ns(ns, applied_rate_permille(), RATE_NORMAL)
+}
+fn scale_ns(ns: i64, num: i32, den: i32) -> i64 {
+    if num == den || den <= 0 {
+        return ns;
+    }
+    (ns as i128 * num as i128 / den as i128) as i64
+}
+
+/// Back to 1x — called on a new item, like [`reset_audio_track`]: a speed is a choice about what
+/// is playing, and Plex Web's resets the same way.
+pub fn reset_play_rate() {
+    SHARED.play_rate_permille.store(RATE_NORMAL, Relaxed);
+    SHARED.rate_reload.store(false, Relaxed);
 }
 /// reset the subtitle selection to Off — called on a NEW item. Like desired_audio_idx, the
 /// subtitle selection PERSISTS across seeks/reloads (it is no longer cleared in reset_session),
@@ -1621,7 +2055,6 @@ pub fn set_audio_track(idx: i32) {
 /// re-burns (or drops) it. No-op-ish if not transcoding (the caller gates on that).
 pub fn request_transcode_refresh(ps: &crate::route::PlaybackSession) {
     crate::route::request_user_route_intent(ps, crate::route::UserRouteIntent::Retranscode);
-    SHARED.sub_cues.lock().unwrap().clear(); // burned/absent in the fresh transcode
 }
 
 /// Restart the current stream at the current movie position so a fresh demux worker captures a
@@ -1665,7 +2098,6 @@ pub fn request_original_recovery(ps: &crate::route::PlaybackSession) {
         ps,
         crate::route::UserRouteIntent::RecoverOriginal(crate::route::RecoveryCause::ManualOriginal),
     );
-    SHARED.sub_cues.lock().unwrap().clear();
 }
 
 // ---- client-rendered subtitles (direct-play only; a transcode carries no subs) ----
@@ -1673,11 +2105,9 @@ pub fn request_original_recovery(ps: &crate::route::PlaybackSession) {
 pub fn desired_sub_idx() -> i32 {
     SHARED.desired_sub_idx.load(Relaxed)
 }
-/// select a subtitle track by index (-1 = off). Does NOT clear the cue store: the demuxer
-/// pushes cues for EVERY text track regardless of selection, so the buffered region's cues for
-/// the newly-selected track are already present and the switch shows immediately. Clearing here
-/// would reintroduce the ~10-20s buffer-gap delay (the demuxer runs well ahead of the playhead).
-/// A new item / transcode re-point clears the store via reset_session / the pump.
+/// select a subtitle track by index (-1 = off). Does NOT clear the buffered subtitle
+/// cues: the demuxer runs well ahead of the playhead, so clearing here would reintroduce the
+/// ~10-20s buffer-gap delay. A new item / transcode re-point clears them via reset_session / the pump.
 pub fn request_subtitle(idx: i32) {
     SHARED.desired_sub_idx.store(idx, Relaxed);
     if idx < 0 {
@@ -1689,8 +2119,10 @@ pub fn request_subtitle(idx: i32) {
 /// The tone client-rendered subtitles are drawn in. A [`crate::route::LiveCell`] rather than a field
 /// of [`SHARED`] because it OUTLIVES a playback — it is a preference, not session state
 /// (the same reasoning as the quality cell in `route::prefs`) — and `reset_session` must not put a viewer back on white
-/// between two episodes. Restored by `route::restore_all`; written by [`set_subtitle_tone`] through
-/// the one write door (`route::choose`).
+/// between two episodes. Restored by `route::restore_profile_rows` (at boot, and when the seat
+/// changes: the seated profile's own tone, else the install's older one); written by
+/// [`set_subtitle_tone`] through the one write door (`route::choose`), which saves it as the seated
+/// profile's own.
 ///
 /// Seeded to white, which is what every build before the preference drew.
 pub(crate) static SUBTITLE_TONE: crate::route::LiveCell<plx_plex::plex::session::SubtitleTone> =
@@ -1725,9 +2157,11 @@ pub(crate) fn subtitle_offset_ns() -> i64 {
 }
 
 /// **The content time whose cue is on screen at playhead `now_ns`**: the playhead minus the
-/// offset, so a +2 s offset shows at 12 s the cue authored for 10 s. Every lookup — embedded text,
-/// image sets, the sidecar — goes through this one subtraction; saturating, so no offset can wrap
-/// a timestamp at either end of `i64`.
+/// offset, so a +2 s offset shows at 12 s the cue authored for 10 s. Image-set lookups (and the
+/// image store's prune) go through this subtraction; saturating, so no offset can wrap a
+/// timestamp at either end of `i64`. Embedded TEXT is sampled at the playhead [`subtitle_draw`]
+/// returns and a sidecar at [`sidecar_clock_ns`]'s (the playhead plus the side reader's measured
+/// remux delta); the screen subtracts the viewer's offset from both positions itself.
 ///
 /// The sidecar holds its whole file, so any offset in its range is exact there. An EMBEDDED track
 /// only has the cues the demuxer has read, which is why [`subtitle_offset_range_ms`] gives it no
@@ -1741,13 +2175,63 @@ pub fn subtitle_clock_ns(now_ns: i64) -> i64 {
     now_ns.saturating_sub(subtitle_offset_ns())
 }
 
+/// **What the client draws for the selected subtitle, and the playhead to draw it at**: the source
+/// and the position in nanoseconds the caller samples its render clock from. `None` while the server
+/// burns the selection or the stream is loading. The viewer's timing offset is NOT applied here: the
+/// caller subtracts it after sampling ([`subtitle_offset_ms`]), so it composes with this.
+///
+/// An embedded track is drawn at the playhead as it stands: the side reader already moved its cues
+/// onto the remux clock. A sidecar is in FILE time, so over a remux it is drawn at
+/// [`sidecar_clock_ns`].
+pub fn subtitle_draw(ps: &crate::route::PlaybackSession) -> Option<(std::sync::Arc<ass::Source>, i64)> {
+    if crate::route::subtitles_burned(ps) || loading(ps) {
+        return None;
+    }
+    let playhead = playpos_ns();
+    if let Some(source) = sidecar::ass_source(false) {
+        return Some((source, sidecar_clock_ns(ps, playhead)));
+    }
+    ass_source::selected(desired_sub_idx()).map(|source| (source, playhead))
+}
+
+/// **The file-time position a SIDECAR is asked for at playhead `playhead_ns`.**
+///
+/// A sidecar's timestamps are the Part's. On a direct play the playhead is file time. Over a remux
+/// it is not: PMS starts the remux on a Part keyframe EARLIER than or at the requested offset — not
+/// always the last one (a 917 s request started on 914.914 s while 916.916 s existed; see
+/// `ff_subside`'s `sidecar_clock_at_917…` test) — but the engine labels that first frame with the
+/// REQUESTED offset (`disp_base`), so the playhead runs ahead of the content by the snap (measured:
+/// 0.6 s to 2.2 s on one file) and the sidecar drew early. The side reader measures that constant
+/// (`ff::subside`, `delta = part_time − playhead`) and this adds it, so the renderer is asked for
+/// the content time actually on screen. The viewer's timing offset is subtracted after this, by the
+/// caller, and composes with it.
+///
+/// Moved only when ALL hold: the selection is a sidecar, the app draws it over a live remux
+/// ([`crate::route::SubtitlePresenter::ClientOverRemux`]) and the reader matched this run's first
+/// keyframe byte for byte ([`subside::exact_delta_ns`]). Never for an embedded track — the reader
+/// has moved its cues by `-delta` already, so adding it here too would correct them twice — and
+/// never from an ASSUMED delta, which was measured 2.002 s wrong (see `ff_subside`'s
+/// `sidecar_clock_at_917…` test). **Off the reader's gate** (a remote link, a Part above the
+/// bitrate bound) nothing is measured, nothing is shifted, and a sidecar is drawn exactly as
+/// before; so is a run whose scan found no byte-exact match. **Before the measurement lands**
+/// (right after every remux start: the mirror is cleared and stays clear until this run's scan
+/// reads the Part up to the anchor) nothing is shifted either: the sidecar sits at the old early
+/// position for that moment, then the position drops by the snap, which `ass_source::Clock::sample`
+/// treats as a break and rewinds, so a cue already shown early can appear a second time once.
+pub fn sidecar_clock_ns(ps: &crate::route::PlaybackSession, playhead_ns: i64) -> i64 {
+    if !crate::route::sidecar_over_remux(ps) {
+        return playhead_ns;
+    }
+    subside::exact_delta_ns().map_or(playhead_ns, |delta| playhead_ns.saturating_add(delta))
+}
+
 /// The oldest cue end a store must still hold: the LATEST delay ([`SUBTITLE_OFFSET_LATEST_MS`])
 /// plus two seconds behind the playhead, whatever the offset is NOW. A positive offset makes the
 /// subtitle clock trail the playhead, and the demuxer never republishes a cue it has read, so a
 /// floor that followed the current offset (2 s of history at offset 0) left nothing for a delay
 /// raised mid-playback to show until the window had refilled. A negative offset (sidecar only)
 /// reads ahead of the playhead, which this floor never prunes. What bounds memory is each store's
-/// cap and its eviction order ([`push_subtitle_text`], [`SUB_BITMAP_BUDGET`]), not this floor.
+/// budget and eviction order ([`SUB_BITMAP_BUDGET`]), not this floor.
 fn subtitle_floor_ns() -> i64 {
     subtitle_floor_for(
         SHARED.playpos_ns.load(Relaxed),
@@ -1808,7 +2292,9 @@ fn clamp_subtitle_offset_ms(offset_ms: i64) -> i32 {
 /// as two bits — a PREFERENCE, like [`SUBTITLE_TONE`], so it outlives a playback. Only the
 /// resolve's `ResolveEnv::snapshot` reads it, on the main thread, and it reaches the wire only
 /// through `route::desired_audio`: with no Plex Pass (or an unknown one) nothing reads it at all.
-/// Restored by `route::restore_all`; written through the one write door (`route::choose`).
+/// Restored by `route::restore_profile_rows` (the seated profile's own pair, else the install's
+/// older one); written through the one write door (`route::choose`), which saves it as the seated
+/// profile's own.
 pub(crate) static AUDIO_ENHANCEMENTS: crate::route::LiveCell<plx_plex::plex::AudioEnhancements> =
     crate::route::LiveCell::new("audio enhancements preference");
 
@@ -1817,8 +2303,8 @@ pub fn audio_enhancements() -> plx_plex::plex::AudioEnhancements {
     AUDIO_ENHANCEMENTS.get()
 }
 
-/// Restore the persisted preference without writing it back — what `route::restore_all` does for
-/// boot, the credentials handoff and a profile switch.
+/// Restore the persisted preference without writing it back — what `route::restore_profile_rows`
+/// does at boot and whenever the seat changes.
 pub fn restore_audio_enhancements(a: plx_plex::plex::AudioEnhancements) {
     AUDIO_ENHANCEMENTS.set(a);
 }
@@ -1840,8 +2326,8 @@ pub fn request_audio_enhancement(ps: &mut crate::route::PlaybackSession, a: plx_
     plx_machine::idle::invalidate();
 }
 
-/// Restore the persisted preference without writing it back (what `route::restore_all` does for
-/// boot, the credentials handoff and a profile switch).
+/// Restore the persisted preference without writing it back (what `route::restore_profile_rows`
+/// does at boot and whenever the seat changes).
 pub fn restore_subtitle_tone(tone: plx_plex::plex::session::SubtitleTone) {
     SUBTITLE_TONE.set(tone);
 }
@@ -1878,105 +2364,6 @@ pub fn reclamp_subtitle_offset() {
     SUBTITLE_OFFSET_MS.store(clamp_subtitle_offset_ms(subtitle_offset_ms()), Relaxed);
 }
 
-/// The text store's hard cap, a runaway guard that an ordinary file never reaches. The store
-/// holds every text track (the demux pushes them all) from `subtitle_floor_ns` — 32 s behind the
-/// playhead at EVERY offset — to the demuxer's read position. The read-ahead is bounded by the
-/// A/V queues (`engine::AQ_VIDEO_BYTES` 10 MiB, `AQ_AUDIO_BYTES` 1 MiB); even a 2 Mbit/s encode
-/// with 192 kbit/s audio fills them in about 42 s, so the window is at most 32 + 42 = 74 s. A
-/// dense dialogue track runs about one cue per second at its peak: 3 text tracks x 74 s x 1
-/// cue/s = 222 cues, under half the cap. Eviction is oldest first, i.e. history no delay is
-/// reading at an ordinary offset.
-const SUB_TEXT_CAP: usize = 512;
-
-/// push a ready (already-clean) subtitle cue into the shared store, tagged with its 0-based
-/// track index (the demux pushes for every text track).
-/// Bounded by TIME rather than a fixed count: since every track is pushed regardless of
-/// selection, drop cues more than the latest delay behind the playhead (`subtitle_floor_ns`)
-/// and keep the demuxer's forward window. [`SUB_TEXT_CAP`] guards against a runaway.
-pub fn push_subtitle_text(track: i32, start_ns: i64, end_ns: i64, text: String) {
-    if text.is_empty() {
-        return;
-    }
-    let mut cues = SHARED.sub_cues.lock().unwrap();
-    let floor = subtitle_floor_ns();
-    cues.retain(|c| c.end_ns >= floor);
-    if cues.len() >= SUB_TEXT_CAP {
-        cues.remove(0);
-    }
-    cues.push(SubCue {
-        track,
-        start_ns,
-        end_ns,
-        text,
-    });
-}
-/// demux (D-thread) pushes a subtitle cue (content-time ns) for track `track`. Called for
-/// EVERY plain-text track so a mid-play switch is instant; only the selected track's cues are logged.
-pub fn push_subtitle_cue(
-    track: i32,
-    start_ns: i64,
-    end_ns: i64,
-    payload: &[u8],
-) {
-    let text = sub_text(payload);
-    if text.is_empty() {
-        return;
-    }
-    if track == SHARED.desired_sub_idx.load(Relaxed) {
-        // LENGTH, never the dialogue. This line used to carry 34 characters of what the viewer
-        // was watching — the most sensitive thing the event log has ever held, in a file that gets
-        // photographed into public issue threads. `len=` answers every question the text answered
-        // for triage (did a cue arrive, at what time, was it empty, is the track the right one)
-        // without being viewing content.
-        log(&format!(
-            "sub cue [{}..{}ms] len={}",
-            start_ns / 1_000_000,
-            end_ns / 1_000_000,
-            text.chars().count()
-        ));
-    }
-    push_subtitle_text(track, start_ns, end_ns, text);
-}
-/// the selected track's subtitle text active at `now_ns`, or None (also None when off).
-pub fn active_subtitle(now_ns: i64) -> Option<String> {
-    active_subtitle_span(now_ns).map(|(text, _, _)| text)
-}
-
-/// [`active_subtitle`] with the cue's `(start_ns, end_ns)` in the subtitle clock (the clock
-/// [`subtitle_clock_ns`] converts the playhead to).
-pub fn active_subtitle_span(now_ns: i64) -> Option<(String, i64, i64)> {
-    let sel = SHARED.desired_sub_idx.load(Relaxed);
-    if sel < 0 {
-        return None;
-    }
-    let cues = SHARED.sub_cues.lock().unwrap();
-    let lookup_ns = subtitle_clock_ns(now_ns);
-    cues.iter()
-        .rev()
-        .find(|c| c.track == sel && lookup_ns >= c.start_ns && lookup_ns < c.end_ns)
-        .map(|c| (c.text.clone(), c.start_ns, c.end_ns))
-}
-
-/// **The IDENTITY of the text cue active at `now_ns`** — its start, or 0 for none.
-///
-/// [`active_subtitle`] clones the cue's `String`, which is right for the draw and wrong for the
-/// per-frame motion report that has to run whether or not the frame draws (spec §8.3): a subtitle
-/// appearing or vanishing is a whole-screen content change with no spring behind it, and before
-/// phase 9 nothing reported it because the player route presented unconditionally. `start_ns` is a
-/// sufficient identity — two cues of one track cannot share a start.
-pub fn subtitle_cue_id(now_ns: i64) -> i64 {
-    let sel = SHARED.desired_sub_idx.load(Relaxed);
-    if sel < 0 {
-        return 0;
-    }
-    let cues = SHARED.sub_cues.lock().unwrap();
-    let lookup_ns = subtitle_clock_ns(now_ns);
-    cues.iter()
-        .rev()
-        .find(|c| c.track == sel && lookup_ns >= c.start_ns && lookup_ns < c.end_ns)
-        .map_or(0, |c| c.start_ns)
-}
-
 /// **The image-subtitle store's byte ceiling**, which must hold the window a delayed caption
 /// needs: from the history floor (`subtitle_floor_ns`: 60 s of the latest delay,
 /// `SUBTITLE_OFFSET_LATEST_MS`, + 2 s behind the playhead, retained at EVERY offset so a raised
@@ -2009,7 +2396,7 @@ pub const SUB_BITMAP_BUDGET: usize = 40 * 1024 * 1024;
 /// subtitles are on (so a switch between image tracks is instant — see ff.rs) and pushes each
 /// display set here; the renderer (M) reads the selected track's active one for the playpos. A
 /// new display-set supersedes any still-open cue on the same track (PGS signals the end via a
-/// later CLEAR or a superseding set, both handled here). Bounded by time like the text store, and
+/// later CLEAR or a superseding set, both handled here). Bounded by time (`subtitle_floor_ns`) and
 /// by [`SUB_BITMAP_BUDGET`].
 ///
 /// `cw`/`ch` are the stream's authoring canvas (0 = the decoder never declared one) and every
@@ -2103,46 +2490,6 @@ pub fn bitmap_by_key(key: i64) -> Option<(i32, i32, Vec<SubRect>)> {
         .find(|c| c.track == sel && c.start_ns == key)
         .map(|c| (c.cw, c.ch, c.rects.clone()))
 }
-/// Extract plain caption text, stripping markup and normalizing line breaks.
-/// ASS/SSA never enters this path: the native renderer receives its complete script/events.
-fn sub_text(payload: &[u8]) -> String {
-    let s = String::from_utf8_lossy(payload);
-    let mut out = String::with_capacity(s.len());
-    let mut ch = s.chars().peekable();
-    while let Some(c) = ch.next() {
-        match c {
-            '<' => {
-                while let Some(x) = ch.next() {
-                    if x == '>' {
-                        break;
-                    }
-                }
-            } // <i></i>
-            '{' => {
-                while let Some(x) = ch.next() {
-                    if x == '}' {
-                        break;
-                    }
-                }
-            } // {\an8}
-            '\\' => match ch.peek() {
-                Some('N') | Some('n') => {
-                    ch.next();
-                    out.push('\n');
-                }
-                Some('h') => {
-                    ch.next();
-                    out.push(' ');
-                }
-                _ => out.push('\\'),
-            },
-            '\r' => {}
-            _ => out.push(c),
-        }
-    }
-    out.trim().to_string()
-}
-
 pub use plx_base::eventlog::log; // event-log sink (crate-wide single copy in lib.rs)
 
 fn find(h: &[u8], n: &[u8]) -> bool {
@@ -2219,8 +2566,8 @@ pub fn vplane_take() -> (u32, u32) {
 /// webOS 4.10.2 (2026-08-21), it is a **~5 Hz position tick**: a 1080p H264 direct play, a 4K HEVC
 /// direct play and a visibly stuttering Dolby Vision direct play all deliver it 5 times a second,
 /// 201 ms apart, to the millisecond. So [`frames`](crate::player::shared::Shared::frames) counts
-/// TICKS, not frames — which is what `pump`'s `frames >= 2` gate really means (≈400 ms of
-/// playback, not two pictures) and what `app::diagnostics` really shows.
+/// TICKS, not frames — which is what `pump`'s ACB bind gate (`frames >= 2`, one tick while a
+/// paused preroll is open) really means (≈400 ms of playback, not two pictures) and what `app::diagnostics` really shows.
 ///
 /// The consequence for diagnosis: this callback can say the pipeline still believes it is
 /// presenting, and cannot say the picture is smooth. The video plane's real cadence is not
@@ -2239,7 +2586,7 @@ pub extern "C" fn sf_on_event(epoch: c_uint, ty: c_int, num: i64, s: *const c_ch
             23 => shared::NativeEventClass::UnloadCompleted,
             _ => shared::NativeEventClass::Other,
         };
-        SHARED.with_native_session(epoch, class, num, || sf_on_event_inner(ty, num, s));
+        SHARED.with_native_session_scoped(epoch, class, num, |scope| sf_on_event_inner(ty, num, s, scope));
     }));
 }
 /// The two libpf frame counters a callback type can name, once the webOS 4 vs 5+ numbering
@@ -2264,7 +2611,22 @@ fn sink_counter_kind(ty: c_int, major: u32) -> Option<SinkCounter> {
     }
 }
 
-fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
+/// The raw callback type [`sink_counter_kind`] reads as the displayed-frame counter on this major,
+/// found through it so the two cannot drift apart.
+fn displayed_counter_type(major: u32) -> c_int {
+    (46..=49)
+        .find(|&ty| sink_counter_kind(ty, major) == Some(SinkCounter::Displayed))
+        .unwrap_or(0)
+}
+
+fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char, scope: shared::EventScope) {
+    if scope == shared::EventScope::Release {
+        // The lifecycle evidence of an object being released after the main thread reset the
+        // session state (`UNLOADCOMPLETED` arrives ~110 ms into the off-frame Unload): log it, but
+        // let nothing reach the census, error latch or load verdict the NEXT session owns.
+        log(&format!("smp_cb type={ty} num={num} (release evidence, not counted)"));
+        return;
+    }
     if ty != 0 {
         // The diagnostics census, beside the log line that already records every event. A COUNT is
         // what the read-out needs: "Load completed and then nothing ever called us" is the sharpest
@@ -2275,7 +2637,7 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
         // Latch the FIRST error, with the callback index it arrived at. Sticky, because a later
         // healthy callback must not erase the one event that explains the session — and the index
         // separates "refused immediately" from "died after a long healthy run". Only `ty == 18`:
-        // it is the one value this project has ever acted on, and it sits below the 0x1c point
+        // it is the one ERROR type this project has ever acted on, and it sits below the 0x1c point
         // where the numbering shifts between webOS 4 and 5+, so it means the same on both. Naming
         // any higher type would be a confident lie on the firmware we cannot test.
         //
@@ -2307,8 +2669,14 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
         // 46/47 on this set are 48/49 on a webOS 5+ set. The harness reads THIS line, never
         // the raw type.
         match sink_counter_kind(ty, plx_platform::tv::device::info().major) {
-            Some(SinkCounter::Displayed) => log(&format!("sink: displayed={num} (type={ty})")),
+            Some(SinkCounter::Displayed) => {
+                SHARED.dg_sink_displayed_cb.fetch_add(1, Relaxed);
+                log(&format!("sink: displayed={num} (type={ty})"));
+            }
             Some(SinkCounter::Dropped) => log(&format!("sink: dropped={num} (type={ty})")),
+            None if (46..=49).contains(&ty) => {
+                SHARED.dg_sink_other_cb.fetch_add(1, Relaxed);
+            }
             None => {}
         }
         // **A refusal before the first picture is a VERDICT, not a statistic.** Until 2026-09-03
@@ -2320,22 +2688,46 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
         // and the failure read-out — the one screen built to survive a phone photograph — never
         // ran, for ~70 s, on the failure it most exists for. Publishing the same flag the
         // synchronous refusal publishes (`threads::load_thread` on `sf_load == 0`) hands it to the
-        // pump's existing `load_failed` arm: HLS rollback if one is pending, else `Error` with
-        // `FailureKind::TvPipeline`.
+        // pump's existing `load_failed` arm, whose failed-open ladder (`recovery::OpenRecovery`)
+        // picks: the HLS rollback if one is pending, else the conversion of a stream the attempt can
+        // do without (the DTS of #695), else the cold Auto Original's HLS contingency, else `Error`
+        // with `FailureKind::TvPipeline`.
         //
         // Scoped to `!seen_frame` — SESSION-scoped, never `frames == 0`, which a seek zeroes (see
         // player/CLAUDE.md, "`frames` is SEEK-scoped"). A `loadCompleted` already received is NOT
         // an exemption: a completed Load is the pipeline accepting a declaration, and a refusal
         // that lands after it but before any picture is still a session that never started. A
-        // type=18 after a picture stays diagnostic-only here: whether that shape exists, and what
-        // it means mid-play, is unmeasured, and the lab could not say whether 18 is the only
-        // refusal type either — so the `num` is logged rather than filtered on.
+        // type=18 after a picture stays diagnostic-only here except for the one number that has
+        // been measured (the decoder release, below): what the others mean mid-play is unmeasured,
+        // and the lab could not say whether 18 is the only refusal type either — so their `num` is
+        // logged rather than filtered on.
         if ty == 18 && !SHARED.seen_frame.load(Relaxed) {
             log(&format!(
                 "smp: Load refused by the pipeline before any picture (type=18 num={num}) — failing the source"
             ));
+            SHARED.note_refusal_path(shared::RefusalPath::Async);
             SHARED.load_failed.store(true, std::sync::atomic::Ordering::Release);
+            if num == AUDIO_CODEC_NOT_SUPPORTED && crate::ff::native_audio::fed().is_some() {
+                SHARED.native_audio_refused.store(true, std::sync::atomic::Ordering::Release);
+            }
+        } else if ty == 18 && num == DECODER_REVOKED_BY_POLICY {
+            // **After a picture, ONE number is measured: the decoder taken back.** A paused direct
+            // play left until the screensaver came on (dev set, 2026-10-13) got exactly this, with
+            // no app-switch edge, and the pipeline refused every Play after it for good — so this
+            // is not a statistic either. The app loop parks the session the way an app switch does
+            // and rebuilds it on the viewer's next press (`take_decoder_revoked`). Every other
+            // number after a picture stays diagnostic-only, as above.
+            log("smp: the pipeline released the video decoder (type=18 num=600) — parking the session");
+            SHARED.decoder_revoked.store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+    // The pipeline's end-of-stream (`Shared::pipeline_eos`): only after a picture, where it can
+    // mean the film was played out.
+    if ty == PIPELINE_END_OF_STREAM
+        && SHARED.seen_frame.load(Relaxed)
+        && !SHARED.pipeline_eos.swap(true, Relaxed)
+    {
+        log("smp: the pipeline reached end-of-stream");
     }
     if ty == 0 {
         // a POSITION UPDATE — map fed pts -> real content position.
@@ -2364,6 +2756,7 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
             SHARED.dg_vpres_gap.fetch_max(gap, Relaxed);
         }
         SHARED.frames.fetch_add(1, Relaxed);
+        SHARED.dg_pos_ticks.fetch_add(1, Relaxed);
         SHARED.seen_frame.store(true, Relaxed); // session-scoped: unlike `frames`, a seek won't clear it
         // the rebuild an audio pick asked for has put its picture up: the switch is over
         let _ = SHARED.audio_switch.compare_exchange(
@@ -2372,6 +2765,8 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
             Relaxed,
             Relaxed,
         );
+        // back from the pipeline's timeline to film time (`from_sink_ns`; identity at 1x)
+        let num = from_sink_ns(num);
         SHARED.pres_fed.store(num, Relaxed); // raw fed pts, for the feed-ahead throttle
         SHARED.playpos_ns.store(
             num - SHARED.pts_shift.load(Relaxed) + SHARED.disp_base.load(Relaxed),
@@ -2386,6 +2781,7 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
     if let Some(fps_milli) = source_fps_milli(b) {
         SHARED.video_fps_milli.store(fps_milli, Relaxed);
     }
+    note_speed_audio_report(b);
     if find(b, b"\"video\"") {
         if let Some(aspect) = video_geometry::source_aspect(b) {
             SHARED.video_aspect.store(aspect.pack(), std::sync::atomic::Ordering::Release);
@@ -2431,14 +2827,12 @@ fn sf_on_event_inner(ty: c_int, num: i64, s: *const c_char) {
 #[no_mangle]
 pub extern "C" fn acb_on_event(ev: c_long, reply: *const c_char) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let r = if reply.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(reply) }
-                .to_string_lossy()
-                .into_owned()
+        let (code, binding_error) = if reply.is_null() { (None, false) } else {
+            let text = unsafe { CStr::from_ptr(reply) }.to_string_lossy();
+            let code = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|value| value.get("errorCode").and_then(serde_json::Value::as_i64));
+            (code, text.contains("ERROR_06"))
         };
-        log(&format!("acb_cb ev={ev} reply={r}"));
+        log(&format!("acb_cb ev={ev} errorCode={code:?} ERROR_06={binding_error}"));
     }));
 }
 
@@ -2459,7 +2853,7 @@ pub fn every_failure_row() -> Vec<(FailureKind, FailureContext, Vec<FailureActio
     use FailureKind as K;
     let kinds = [K::DecisionRefused, K::PlaybackPolicy, K::NoVideoTranscodeTarget, K::NoVideoTrack,
         K::MediaSource, K::PlaybackInterrupted, K::TvPipeline, K::LoadTimeout,
-        K::JailMissingRtkmem, K::Unspecified];
+        K::ReleaseTimeout, K::JailMissingRtkmem, K::ResolveFailed, K::PreviewNotDirect, K::Unspecified];
     let mut out = Vec::new();
     for kind in kinds {
         for forced in [false, true] {
@@ -2479,6 +2873,133 @@ pub fn every_failure_row() -> Vec<(FailureKind, FailureContext, Vec<FailureActio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The speeds a source can be offered: everything up to 2x for film, nothing above 1x for 60p
+    /// (it would ask the decoder for more than 60 fps), and a Load plays only an offered speed.
+    #[test]
+    fn a_session_plays_only_an_offered_speed() {
+        assert_eq!(speeds_within(23.976, SPEED_MAX_FPS), PLAY_RATES.to_vec());
+        assert_eq!(speeds_within(0.0, SPEED_MAX_FPS), PLAY_RATES.to_vec(), "unknown is treated as film");
+        assert_eq!(speeds_within(30.0, SPEED_MAX_FPS), PLAY_RATES.to_vec());
+        assert_eq!(speeds_within(50.0, SPEED_MAX_FPS), vec![500, 750, 1000]);
+        assert_eq!(speeds_within(59.94, SPEED_MAX_FPS), vec![500, 750, 1000]);
+        assert_eq!(session_rate(1500, &PLAY_RATES), 1500);
+        assert_eq!(session_rate(1500, &[500, 750, 1000]), RATE_NORMAL, "not offered");
+        assert_eq!(session_rate(1500, &[]), RATE_NORMAL, "speed unavailable");
+    }
+
+    /// A speed reads as its multiplier with no trailing zeros, for every speed the player offers.
+    #[test]
+    fn a_rate_is_named_by_its_multiplier() {
+        let names: Vec<String> = PLAY_RATES.iter().map(|r| rate_name(*r)).collect();
+        assert_eq!(names, ["0.5×", "0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×"]);
+    }
+
+    /// The safety net's evidence: the pipeline's audio-info report for a speed session. 48 kHz
+    /// stereo raw is what the payload declared; the 44.1 a mis-declared rate produced, or any
+    /// compressed type, is not. At 1x the report is not judged at all.
+    #[test]
+    fn the_pipeline_audio_report_judges_a_speed_session() {
+        let _serial = plx_base::testlock::serial();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SHARED.applied_rate_permille.store(RATE_NORMAL, Relaxed);
+                SHARED.speed_audio_verdict.store(SPEED_AUDIO_UNKNOWN, Relaxed);
+            }
+        }
+        let _restore = Restore;
+        let verdict = |rate: i32, report: &[u8]| {
+            SHARED.applied_rate_permille.store(rate, Relaxed);
+            SHARED.speed_audio_verdict.store(SPEED_AUDIO_UNKNOWN, Relaxed);
+            note_speed_audio_report(report);
+            SHARED.speed_audio_verdict.load(Relaxed)
+        };
+        // both are the 3.9.3 set's own strings, from its event log
+        let good = b"audio/x-raw (null) (null) 48.000000 2 (null) 0 0 0 0 (null) 0 (null) 0 ";
+        let drift = b"audio/x-raw (null) (null) 44.099998 2 (null) 0 0 0 0 (null) 0 (null) 0 ";
+        assert_eq!(verdict(1500, good), SPEED_AUDIO_OK);
+        assert_eq!(verdict(1500, drift), SPEED_AUDIO_BAD);
+        assert_eq!(verdict(1500, b"audio/mpeg (null) (null) 0.000000 0 (null)"), SPEED_AUDIO_BAD);
+        assert_eq!(verdict(RATE_NORMAL, drift), SPEED_AUDIO_UNKNOWN, "1x is never judged");
+        assert_eq!(verdict(1500, b"{\"video\":1}"), SPEED_AUDIO_UNKNOWN, "not an audio report");
+    }
+
+    /// The timeline conversion: at 1.5x a fed timestamp is two thirds of the film time it stands
+    /// for, the presented one comes back as film time, and at 1x nothing changes.
+    #[test]
+    fn the_pipeline_timeline_is_film_time_divided_by_the_speed() {
+        let _serial = plx_base::testlock::serial();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SHARED.applied_rate_permille.store(RATE_NORMAL, Relaxed);
+            }
+        }
+        let _restore = Restore;
+        SHARED.applied_rate_permille.store(RATE_NORMAL, Relaxed);
+        assert_eq!(to_sink_ns(7_000_000_000), 7_000_000_000);
+        SHARED.applied_rate_permille.store(1500, Relaxed);
+        assert_eq!(to_sink_ns(3_000_000_000), 2_000_000_000);
+        assert_eq!(from_sink_ns(2_000_000_000), 3_000_000_000);
+        SHARED.applied_rate_permille.store(500, Relaxed);
+        assert_eq!(to_sink_ns(3_000_000_000), 6_000_000_000, "half speed spreads frames out");
+        // a long film at a fractional speed survives the round trip within a nanosecond
+        SHARED.applied_rate_permille.store(1750, Relaxed);
+        let t = 9_876_543_210_123;
+        assert!((from_sink_ns(to_sink_ns(t)) - t).abs() <= 2);
+    }
+
+    /// **A speed change is a seek to where the viewer already is, marked to reload**, and only a
+    /// real change on the ladder is one: the speed already set, or a value Plex Web does not offer,
+    /// asks for nothing. With nothing on screen the speed is only remembered for the next Load.
+    #[test]
+    fn a_speed_change_requests_a_reload_at_the_viewers_position() {
+        let _serial = plx_base::testlock::serial();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                reset_play_rate();
+                SHARED.reset_session();
+                TX.reset();
+                crate::ff::force_speed_decoder_for_test(false);
+                SHARED.speed_unsupported.store(false, Relaxed);
+            }
+        }
+        let _restore = Restore;
+        let ps = crate::route::PlaybackSession::IDLE;
+        SHARED.reset_session();
+        TX.reset();
+        crate::ff::force_speed_decoder_for_test(true);
+
+        assert!(set_play_rate(&ps, 1250), "not started: remembered for the next Load");
+        assert_eq!(play_rate_permille(), 1250);
+        assert_eq!(seek_pending(), -1, "with nothing on screen there is nothing to reload");
+        assert!(!SHARED.rate_reload.load(Relaxed));
+
+        TX.started.store(true, Relaxed);
+        SHARED.playpos_ns.store(42_000_000_000, Relaxed);
+        assert!(set_play_rate(&ps, 1500));
+        assert_eq!(play_rate_permille(), 1500);
+        assert_eq!(seek_pending(), 42_000_000_000, "a seek to the viewer's own position");
+        assert!(SHARED.rate_reload.load(Relaxed), "marked so an in-place seek mode reloads it");
+
+        TX.seek_to_ns.store(-1, Relaxed);
+        SHARED.rate_reload.store(false, Relaxed);
+        assert!(!set_play_rate(&ps, 1500), "the speed already set asks for nothing");
+        assert!(!set_play_rate(&ps, 1300), "off the ladder");
+        assert_eq!(seek_pending(), -1);
+        assert_eq!(play_rate_permille(), 1500);
+
+        reset_play_rate();
+        assert_eq!(play_rate_permille(), RATE_NORMAL, "a new item starts at 1x");
+
+        // a television that failed a PCM session offers no speed at all
+        SHARED.speed_unsupported.store(true, Relaxed);
+        assert!(speed_offer(&ps).is_empty());
+        assert!(!set_play_rate(&ps, 1500), "nothing is offered after the fallback");
+        assert_eq!(play_rate_permille(), RATE_NORMAL);
+    }
 
     // The jail/rtkmem refusal (no Engine ever built, `state()` deriving `Error`, and the
     // refusal retiring on route exit) is exercised by
@@ -2523,6 +3044,26 @@ mod tests {
         assert!(server.readout.contains("server"));
     }
 
+    /// Scheme #695, row 10 and "Force: anything else is not played": a Force play the TV refuses after
+    /// Load (error 601, which names no codec) reads out the same policy refusal as the planner's
+    /// up-front one, naming the codec the Load was fed.
+    #[test]
+    fn forced_tv_refusal_after_load_names_the_codec_like_the_up_front_one() {
+        use plx_plex::plex::serverinfo::Subscription as Sub;
+        let mut ps = crate::route::PlaybackSession::default();
+        crate::route::name_refused_forced_audio(&mut ps, "dca");
+        let verdict = crate::route::play_verdict(&ps).expect("a verdict").to_owned();
+        let up_front = crate::route::PlayVerdict::Forced(crate::route::ForcedFailure::Audio {
+            codec: plx_data::metadata::friendly_codec("dca"),
+        });
+        assert_eq!(verdict, up_front.text());
+        assert!(verdict.contains("DTS"), "{verdict}");
+        let shape = with_forced_playback_context(
+            error_shape(false, false, Sub::No, Some(&verdict), RuntimeFailure::TvPipeline), true);
+        assert_eq!(shape.kind, FailureKind::PlaybackPolicy);
+        assert_eq!(shape.detail, verdict);
+    }
+
     /// **Each cause converts to its own telemetry class, under the code it always had.** The class
     /// enum is telemetry's and the match that fills it is this layer's, so a copy-paste that sent
     /// two causes to one class would merge two dashboard series without any compile error. (The
@@ -2540,6 +3081,9 @@ mod tests {
             (K::TvPipeline, "tv_pipeline"),
             (K::JailMissingRtkmem, "jail_missing_rtkmem"),
             (K::LoadTimeout, "load_timeout"),
+            (K::ReleaseTimeout, "release_timeout"),
+            (K::ResolveFailed, "resolve_failed"),
+            (K::PreviewNotDirect, "preview_not_direct"),
             (K::Unspecified, "unspecified"),
         ];
         for (kind, code) in table {
@@ -2748,6 +3292,111 @@ mod tests {
             !failed(),
             "a seek zeroes `frames`; the refusal predicate must read `seen_frame`, not that"
         );
+        SHARED.retire_native_session(epoch);
+        SHARED.reset_session();
+    }
+
+    /// **`type=18 num=200` is a native AUDIO refusal only when the session fed audio natively.**
+    /// A C1 refuses every Vorbis Load with it (2026-10-21); the same number on an AC3 file, or any
+    /// other `num` (601 is a resource allocation error), is not evidence about the audio, and
+    /// after a picture it is a statistic.
+    #[test]
+    fn a_native_audio_refusal_is_flagged_only_for_audio_fed_natively_before_a_picture() {
+        use std::sync::atomic::Ordering::Acquire;
+        let _guard = plx_base::testlock::serial();
+        let native = || {
+            crate::ff::native_audio::reset();
+            crate::ff::native_audio::publish_fed(crate::ff::native_audio::Kind::Opus, 2);
+        };
+        let flagged = || SHARED.native_audio_refused.load(Acquire);
+        let refuse = |epoch: u32, num: i64| sf_on_event(epoch, 18, num, c"Audio Codec Not Supported".as_ptr());
+
+        // Native audio fed, num 200, no picture: flagged (and the Load is failed as ever).
+        SHARED.reset_session();
+        native();
+        let epoch = SHARED.begin_native_session().expect("session");
+        refuse(epoch, 200);
+        assert!(flagged() && SHARED.load_failed.load(Acquire));
+        SHARED.retire_native_session(epoch);
+
+        // Another number, or no native audio: not flagged.
+        SHARED.reset_session();
+        native();
+        let epoch = SHARED.begin_native_session().expect("session");
+        refuse(epoch, 601);
+        assert!(!flagged() && SHARED.load_failed.load(Acquire));
+        SHARED.retire_native_session(epoch);
+        SHARED.reset_session();
+        crate::ff::native_audio::reset();
+        let epoch = SHARED.begin_native_session().expect("session");
+        refuse(epoch, 200);
+        assert!(!flagged(), "the audio was not fed natively");
+        SHARED.retire_native_session(epoch);
+
+        // After a picture: a statistic, not a verdict.
+        SHARED.reset_session();
+        native();
+        let epoch = SHARED.begin_native_session().expect("session");
+        sf_on_event(epoch, 0, 7_000_000_000, std::ptr::null());
+        refuse(epoch, 200);
+        assert!(!flagged());
+        SHARED.retire_native_session(epoch);
+        SHARED.reset_session();
+        crate::ff::native_audio::reset();
+    }
+
+    /// **The pipeline's end-of-stream is reported once there is a picture.** C1 event log,
+    /// 2026-10-20: the film's audio ran 3 s past its last video frame, the clock stopped at 5894 s
+    /// of 5897 s after the EOS, and `smp_cb type=28 num=1 str=true` was the only sign the
+    /// pipeline had finished. Before a picture it means nothing the app can act on.
+    #[test]
+    fn the_pipelines_end_of_stream_is_noted_after_a_picture() {
+        let _guard = plx_base::testlock::serial();
+        SHARED.reset_session();
+        let epoch = SHARED.begin_native_session().expect("session");
+        sf_on_event(epoch, 28, 1, c"true".as_ptr());
+        assert!(!SHARED.pipeline_eos.load(Relaxed), "not before a picture");
+        sf_on_event(epoch, 0, 7_000_000_000, std::ptr::null());
+        sf_on_event(epoch, 28, 1, c"true".as_ptr());
+        assert!(SHARED.pipeline_eos.load(Relaxed), "the pipeline said it reached the end");
+        request_seek(1_000_000_000);
+        assert!(!SHARED.pipeline_eos.load(Relaxed), "a seek back from the end un-ends it");
+        SHARED.retire_native_session(epoch);
+        SHARED.reset_session();
+        assert!(!SHARED.pipeline_eos.load(Relaxed));
+    }
+
+    /// **The decoder taken back from an established session is the one `type=18` after a picture
+    /// that acts.** Device log, 2026-10-13: a paused direct play under the screensaver got
+    /// `type=18 num=600 "VDEC resource is released by policy action"`, no app-switch edge, and
+    /// `Starfish refused Play` on every press after it. It raises `decoder_revoked` once, for the
+    /// app loop to park the session; before a picture it is still a Load refusal, and any other
+    /// number after a picture is still diagnostic only.
+    #[test]
+    fn a_decoder_released_after_a_picture_is_reported_once_and_nothing_else_is() {
+        let _guard = plx_base::testlock::serial();
+        let released = c"{\"errorCode\":600,\"errorText\":\"VDEC resource is released by policy action\"}".as_ptr();
+        let failed = || SHARED.load_failed.load(std::sync::atomic::Ordering::Acquire);
+
+        SHARED.reset_session();
+        let _ = take_decoder_revoked();
+        let epoch = SHARED.begin_native_session().expect("session");
+        sf_on_event(epoch, 0, 7_000_000_000, std::ptr::null());
+        sf_on_event(epoch, 18, 601, c"Resource Allocation Error".as_ptr());
+        assert!(!take_decoder_revoked(), "another number after a picture stays diagnostic");
+        sf_on_event(epoch, 18, 600, released);
+        assert!(!failed(), "an established session is not a Load refusal");
+        assert!(take_decoder_revoked(), "the release is reported");
+        assert!(!take_decoder_revoked(), "…once");
+        sf_on_event(epoch, 18, 600, released);
+        SHARED.retire_native_session(epoch);
+        SHARED.reset_session();
+        assert!(!take_decoder_revoked(), "a reset session forgets an unread release");
+
+        let epoch = SHARED.begin_native_session().expect("session");
+        sf_on_event(epoch, 18, 600, released);
+        assert!(failed(), "before any picture it is still the Load refusal it always was");
+        assert!(!take_decoder_revoked());
         SHARED.retire_native_session(epoch);
         SHARED.reset_session();
     }
@@ -3000,7 +3649,7 @@ mod tests {
         sf_on_event(epoch, 0, 8_000_000_000, std::ptr::null());
         assert_eq!(SHARED.frames.load(std::sync::atomic::Ordering::Acquire), 0);
         assert!(SHARED.commit_native_presentation_probe(epoch, |num| {
-            sf_on_event_inner(0, num, std::ptr::null())
+            sf_on_event_inner(0, num, std::ptr::null(), shared::EventScope::Live)
         }));
         assert_eq!(SHARED.frames.load(std::sync::atomic::Ordering::Acquire), 1);
         assert_eq!(
@@ -3221,6 +3870,23 @@ mod tests {
                 assert!(!e.no_pass);
             }
         }
+    }
+
+    /// **Sentry PLX-NATIVE-1G.** A hero preview whose resolve is refused for not being a direct
+    /// play (`plan.rs`: "preview: refused - not a direct play") installs a plan with no URL and
+    /// `PlayVerdict::PreviewNeedsDirectPlay`. It used to carry no verdict and read `unspecified`;
+    /// the read-out now takes its kind from the typed verdict, not from "no plan".
+    #[test]
+    fn a_preview_refused_for_not_being_a_direct_play_reports_preview_not_direct() {
+        let _g = plx_base::testlock::serial();
+        let mut ps = crate::route::PlaybackSession::default();
+        crate::route::resolve_refused_preview_for_test(&mut ps);
+        let e = error_now(&ps);
+        assert_eq!(e.kind.code(), "preview_not_direct", "{:?}", e.kind);
+        assert_ne!(e.kind, FailureKind::Unspecified);
+        assert!(e.detail.is_empty(), "no server sentence rides a refusal that is ours");
+        let cx = FailureContext { forced: false, can_retry: true, repair_idle: false, other_copy: false };
+        assert_eq!(failure_actions(e.kind, cx), vec![FailureAction::Back], "same item, same refusal: no Try Again");
     }
 
     /// A terminal runtime failure already knows which subsystem stopped: the media source,
@@ -3533,106 +4199,86 @@ mod tests {
         rect(0, 0, 1024, (bytes / per_row) as i32)
     }
 
-    /// One second, in the cue stores' unit. The offset is set in MILLISECONDS and every cue is in
+    /// One second, in the cue store's unit. The offset is set in MILLISECONDS and every cue is in
     /// NANOSECONDS; mixing the two is how this test once put a 1 000 ns cue under a 1 s offset.
     const SEC: i64 = 1_000_000_000;
 
-    /// A positive offset draws a cue later, a negative one earlier, by exactly the offset.
+    /// A positive offset reads the subtitle clock later, a negative one earlier, by exactly the
+    /// offset (the clock every store and the libass source share).
     #[test]
-    fn subtitle_offset_shifts_text_lookup_in_both_directions() {
+    fn subtitle_offset_shifts_the_subtitle_clock_in_both_directions() {
         let _g = plx_base::testlock::serial();
-        SHARED.sub_cues.lock().unwrap().clear();
         SHARED.playpos_ns.store(0, Relaxed);
-        SHARED.desired_sub_idx.store(0, Relaxed);
         set_subtitle_offset(0);
-        push_subtitle_text(0, SEC, 2 * SEC, "cue".into());
-
-        assert_eq!(active_subtitle(SEC + SEC / 2).as_deref(), Some("cue"));
+        assert_eq!(subtitle_clock_ns(5 * SEC), 5 * SEC);
 
         set_subtitle_offset(1_000);
-        assert_eq!(active_subtitle(SEC + SEC / 2), None, "a positive offset delays the caption");
-        assert_eq!(active_subtitle(2 * SEC + SEC / 2).as_deref(), Some("cue"));
-        assert_eq!(active_subtitle(3 * SEC), None, "…and ends it as late as it started it");
+        assert_eq!(subtitle_clock_ns(5 * SEC), 4 * SEC, "a positive offset delays the caption");
 
-        // only a sidecar takes an advance (`subtitle_offset_range_ms`); the subtraction is the
-        // one every store shares, so the embedded lookup still proves its direction
+        // only a sidecar takes an advance (`subtitle_offset_range_ms`)
         sidecar::select_without_fetch_for_test(42);
         set_subtitle_offset(-1_000);
-        assert_eq!(active_subtitle(SEC / 2).as_deref(), Some("cue"), "a negative one advances it");
-        assert_eq!(active_subtitle(SEC + SEC / 2), None);
+        assert_eq!(subtitle_clock_ns(5 * SEC), 6 * SEC, "a negative one advances it");
 
         set_subtitle_offset(0);
         sidecar::reset();
-        SHARED.sub_cues.lock().unwrap().clear();
-        SHARED.desired_sub_idx.store(-1, Relaxed);
     }
 
-    /// **A delayed cue is still in the store when its moment comes.** Both stores prune cues more
-    /// than two seconds behind the playhead on every push; under a +5 s offset the cue on screen
+    /// **A delayed set is still in the store when its moment comes.** The store prunes sets more
+    /// than two seconds behind the playhead on every push; under a +5 s offset the set on screen
     /// at playhead 6.5 s is the one authored for 1.5 s, which the playhead-only floor had already
     /// thrown away when the next cue arrived.
     #[test]
-    fn a_delayed_cue_survives_the_prune_until_the_offset_has_shown_it() {
+    fn a_delayed_set_survives_the_prune_until_the_offset_has_shown_it() {
         let _g = plx_base::testlock::serial();
-        SHARED.sub_cues.lock().unwrap().clear();
         SHARED.sub_bitmaps.lock().unwrap().clear();
         SHARED.desired_sub_idx.store(0, Relaxed);
         set_subtitle_offset(5_000);
         SHARED.playpos_ns.store(0, Relaxed);
-        push_subtitle_text(0, SEC, 2 * SEC, "early".into());
         push_subtitle_bitmap(0, SEC, 1920, 1080, vec![rect(0, 0, 8, 8)]);
         close_subtitle_bitmap(0, 2 * SEC);
 
         // the playhead reaches 6.5 s and the demuxer pushes the next cues, which prunes
         SHARED.playpos_ns.store(6 * SEC + SEC / 2, Relaxed);
-        push_subtitle_text(0, 9 * SEC, 10 * SEC, "later".into());
         push_subtitle_bitmap(0, 9 * SEC, 1920, 1080, vec![rect(0, 0, 8, 8)]);
 
         let now = 6 * SEC + SEC / 2;
-        assert_eq!(active_subtitle(now).as_deref(), Some("early"), "text");
         assert_eq!(active_bitmap_key(now), Some(SEC), "image");
 
         set_subtitle_offset(0);
         SHARED.playpos_ns.store(0, Relaxed);
-        SHARED.sub_cues.lock().unwrap().clear();
         SHARED.sub_bitmaps.lock().unwrap().clear();
         SHARED.desired_sub_idx.store(-1, Relaxed);
     }
 
     /// **Raising the delay mid-playback finds the cues already read.** The demuxer never
-    /// republishes a cue, so the stores must hold the whole window the LARGEST delay could ask
+    /// republishes a cue, so the store must hold the whole window the LARGEST delay could ask
     /// for whatever the offset is now: a viewer at offset 0 who steps to +60 s wants the cue
     /// authored 60 s ago at once, not after the window has refilled. A floor that followed the
     /// current offset kept 2 s of history at 0 and blanked every raised delay.
     #[test]
-    fn raising_the_delay_mid_playback_finds_the_cues_already_read() {
+    fn raising_the_delay_mid_playback_finds_the_sets_already_read() {
         let _g = plx_base::testlock::serial();
-        SHARED.sub_cues.lock().unwrap().clear();
         SHARED.sub_bitmaps.lock().unwrap().clear();
         SHARED.desired_sub_idx.store(0, Relaxed);
         set_subtitle_offset(0);
         SHARED.playpos_ns.store(SEC, Relaxed);
-        push_subtitle_text(0, SEC, 2 * SEC, "early".into());
         push_subtitle_bitmap(0, SEC, 1920, 1080, vec![rect(0, 0, 8, 8)]);
         close_subtitle_bitmap(0, 2 * SEC);
 
         // playback goes on at offset 0 and the demuxer pushes the next cues, which prunes
         SHARED.playpos_ns.store(61 * SEC + SEC / 2, Relaxed);
-        push_subtitle_text(0, 62 * SEC, 63 * SEC, "later".into());
         push_subtitle_bitmap(0, 62 * SEC, 1920, 1080, vec![rect(0, 0, 8, 8)]);
 
         // the viewer steps straight to the latest delay: the clock is back at 1.5 s
         set_subtitle_offset(SUBTITLE_OFFSET_LATEST_MS);
         let now = 61 * SEC + SEC / 2;
-        let text = active_subtitle(now);
         let image = active_bitmap_key(now);
 
         set_subtitle_offset(0);
         SHARED.playpos_ns.store(0, Relaxed);
-        SHARED.sub_cues.lock().unwrap().clear();
         SHARED.sub_bitmaps.lock().unwrap().clear();
         SHARED.desired_sub_idx.store(-1, Relaxed);
-        assert_eq!(text.as_deref(), Some("early"), "text: a raised delay finds the cue read at offset 0");
         assert_eq!(image, Some(SEC), "image: a raised delay finds the set read at offset 0");
     }
 
@@ -3946,7 +4592,9 @@ mod native_failure_regressions {
 }
 
 /// The two halves of "the playbar jumps on a seek", reported on an LG C3 (webOS 23), where
-/// in-place seeking is disabled and every seek is a reload.
+/// before #568 every seek was a reload. The guard still applies to every reload-based seek: `Reload`
+/// mode (a refused native `Seek`, `sendSegment=0`, an untested old-ABI release), a stuck in-place
+/// seek's reload, and every seek at a speed other than 1x.
 #[cfg(test)]
 mod seek_hud_regressions {
     use super::*;

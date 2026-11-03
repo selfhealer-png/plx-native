@@ -55,25 +55,17 @@
     "value": "After a moment on a title, play its trailer with sound.",
     "description": "Settings, account, onboarding or privacy UI: settings.trailers.detail"
   },
-  "settings.watchlist.title": {
-    "value": "Watchlist on Home",
-    "description": "Settings toggle: show a Home shelf of the plex.tv Watchlist titles your servers hold"
-  },
-  "settings.watchlist.detail": {
-    "value": "Show your Plex Watchlist titles that your servers have.",
-    "description": "Settings detail line under settings.watchlist.title"
-  },
   "settings.resolution.title": {
     "value": "Interface resolution",
-    "description": "Settings row: the size the interface is drawn at; lower is smoother on older TVs"
+    "description": "Settings row: the size the interface is drawn at; lower is smoother but the text is softer"
   },
   "settings.resolution.detail": {
     "value": "Lower is smoother. Applies after restarting.",
-    "description": "Settings detail line under settings.resolution.title"
+    "description": "Settings detail line under settings.resolution.title; the choice takes effect at the next launch"
   },
   "settings.resolution.auto": {
     "value": "Automatic",
-    "description": "Value of settings.resolution.title: chosen from the TV's webOS version"
+    "description": "Value of settings.resolution.title: the native 1920x1080 size, the same on every TV"
   },
   "settings.about.title": {
     "value": "About PlxNative",
@@ -88,7 +80,7 @@
     "description": "Settings, account, onboarding or privacy UI: settings.about.detail"
   },
   "settings.root.copy": {
-    "value": "Manage this television and your Plex profile. Audio and subtitle language preferences sync with your Plex account; playback defaults and the app language apply to this television.",
+    "value": "Manage this television and your Plex profile. Audio and subtitle language preferences sync with your Plex account; playback settings belong to each profile, and the app language applies to this television.",
     "description": "Settings, account, onboarding or privacy UI: settings.root.copy"
   },
   "settings.libraries.count": {
@@ -239,11 +231,11 @@
     "description": "Settings, account, onboarding or privacy UI: settings.consent.product.title"
   },
   "settings.consent.crash.body": {
-    "value": "If PlxNative crashes, or signing in fails, it can send technical details that help find and fix the problem. Reports may include the signal, code addresses, thread information and device compatibility details, or which sign-in step failed and how the connection answered, plus a random crash report identifier, created when you turn this on and deleted when you turn it off or sign out, so that repeated crashes under one crash report identifier are counted once rather than once each. They never include titles, Plex accounts, searches, server names or addresses, tokens, subtitle text, or the product analytics identifier.",
+    "value": "If PlxNative crashes, or signing in fails, it can send technical details that help find and fix the problem. Reports may include the signal, code addresses, thread information and device compatibility details, or which sign-in step failed and how the connection answered, plus a random crash report identifier, created when you turn this on and deleted when you turn it off or sign out, so that repeated crashes under one crash report identifier are counted once rather than once each. Whether each app session ended normally is also sent. They never include titles, Plex accounts, searches, server names or addresses, tokens, subtitle text, or the product analytics identifier.",
     "description": "Settings, account, onboarding or privacy UI: settings.consent.crash.body"
   },
   "settings.consent.product.body": {
-    "value": "PlxNative can share which screens and features are used and broad sign-in and playback outcomes. Reports carry a random Analytics ID, created when you turn this on and deleted when you turn it off or sign out, and can include the app version, webOS version, television model and SoC, and whether a selected server is local, remote or relayed. They never include titles, Plex accounts, searches, server names or addresses, tokens, subtitle text, or exact viewing history.",
+    "value": "PlxNative can share which screens and features are used, how smoothly they respond, and broad sign-in and playback outcomes. Reports carry a random Analytics ID, created when you turn this on and deleted when you turn it off or sign out, and can include the app version, webOS version, television model and SoC, and whether a selected server is local, remote or relayed. They never include titles, Plex accounts, searches, server names or addresses, tokens, subtitle text, or exact viewing history.",
     "description": "Settings, account, onboarding or privacy UI: settings.consent.product.body"
   },
   "settings.consent.crash.row": {
@@ -471,7 +463,7 @@
     "description": "Settings, account, onboarding or privacy UI: settings.legal.privacy.local"
   },
   "settings.legal.privacy.local_body": {
-    "value": "PlxNative stores your Plex account token and a separate token for each server you use. For every profile you have switched to on this television, it also keeps that profile's own server access token(s) and, for a PIN-protected profile, a one-way check computed from that PIN rather than the PIN itself. It also keeps the addresses and identifiers of those servers, the profile names and pictures on your account (pictures and other downloaded artwork are cached as bounded files for reuse across restarts), your Home library choices, your recent searches, your playback quality, Direct Play and app language preferences, and local technical logs: an event log and an error-output log, each emptied every time the app launches, a crash log that is kept until the television restarts, and a bounded storage status snapshot. It also stores your answers to the two optional-reporting questions, the random Crash report ID if you turned crash reports on, the random Analytics ID if you turned product analytics on, any report waiting to be sent, and a marker recording how much of the crash log has already been read. It keeps no bookmark of its own for where you stopped watching: playback position is held by your Plex Media Server. Delete all local data in Settings signs out and removes PlxNative data from this television.",
+    "value": "PlxNative stores your Plex account token and a separate token for each server you use. For every profile you have switched to on this television, it also keeps that profile's own server access token(s) and, for a PIN-protected profile, a one-way check computed from that PIN rather than the PIN itself. It also keeps the addresses and identifiers of those servers, the profile names and pictures on your account (pictures and other downloaded artwork are cached as bounded files for reuse across restarts), your Home library choices, your recent searches, your playback quality, Direct Play and app language preferences, and local technical logs: an event log and an error-output log, each emptied every time the app launches, a crash log that is kept until the television restarts, and a bounded storage status snapshot. It also stores your answers to the two optional-reporting questions, the random Crash report ID if you turned crash reports on, when the app session in progress started and was last active, the random Analytics ID if you turned product analytics on, any report waiting to be sent, and a marker recording how much of the crash log has already been read. It keeps no bookmark of its own for where you stopped watching: playback position is held by your Plex Media Server. Delete all local data in Settings signs out and removes PlxNative data from this television.",
     "description": "Settings, account, onboarding or privacy UI: settings.legal.privacy.local_body"
   },
   "settings.legal.privacy.crashes": {
@@ -479,7 +471,7 @@
     "description": "Settings, account, onboarding or privacy UI: settings.legal.privacy.crashes"
   },
   "settings.legal.privacy.crashes_body": {
-    "value": "If enabled, technical crash details are sent to Sentry in Germany. They can include the signal, code addresses, thread information and device compatibility details. Each report carries a random Crash report ID created on this television when you turned crash reports on, so that repeated crashes under one Crash report ID are counted once rather than once each. It is not derived from your Plex account, your television or anything about you, and it is never sent with product analytics. Settings shows it as your Crash report ID while crash reports are on.",
+    "value": "If enabled, technical crash details are sent to Sentry in Germany. They can include the signal, code addresses, thread information and device compatibility details. Each report carries a random Crash report ID created on this television when you turned crash reports on, so that repeated crashes under one Crash report ID are counted once rather than once each. It is not derived from your Plex account, your television or anything about you, and it is never sent with product analytics. Settings shows it as your Crash report ID while crash reports are on. While crash reports are on, a small record of each app session is also sent to Sentry with that ID: when it started, how long it lasted and whether it ended normally or in a crash, with no content or account details.",
     "description": "Settings, account, onboarding or privacy UI: settings.legal.privacy.crashes_body"
   },
   "settings.legal.privacy.analytics": {
@@ -487,7 +479,7 @@
     "description": "Settings, account, onboarding or privacy UI: settings.legal.privacy.analytics"
   },
   "settings.legal.privacy.analytics_body": {
-    "value": "If enabled, screen and feature events and broad sign-in and playback outcomes are sent to PostHog in Germany with a random Analytics ID created when you turned product analytics on. Settings shows that identifier as your Analytics ID while product analytics is on. Sign-in events from before you answered are held in memory and sent only if you choose to share.",
+    "value": "If enabled, screen and feature events, how smoothly each screen responds, and broad sign-in and playback outcomes are sent to PostHog in Germany with a random Analytics ID created when you turned product analytics on. Settings shows that identifier as your Analytics ID while product analytics is on. Sign-in events from before you answered are held in memory and sent only if you choose to share.",
     "description": "Settings, account, onboarding or privacy UI: settings.legal.privacy.analytics_body"
   },
   "settings.legal.privacy.excluded": {
@@ -589,6 +581,10 @@
     "value": "\n\nHandled playback error (only when error reporting is on):\n",
     "description": "Settings, account, onboarding or privacy UI: settings.consent.preview.handled"
   },
+  "settings.consent.preview.recovered": {
+    "value": "\n\nRecovered playback refusal (only when error reporting is on):\n",
+    "description": "Heading in the crash-report preview above the sample of a recovered-refusal report. Privacy disclosure: keep the condition exact."
+  },
   "settings.consent.analytics.absent": {
     "value": "NO ANALYTICS ID\n\nProduct analytics is off, so this installation has no analytics identifier and is sending no analytics events.\n\nAn identifier is created only when you turn product analytics on, and deleting it is what turning it off does. If you had analytics on before and want events from that period deleted, write to {contact} — but note that the identifier they carry was destroyed when analytics was turned off, so it can no longer be looked up from this television.\n\nCrash reports do not use this identifier. They carry a separate Crash report ID, shown on its own row while crash reports are on.",
     "description": "Settings, account, onboarding or privacy UI: settings.consent.analytics.absent",
@@ -677,6 +673,10 @@
   },
   "settings.playback.subtitle_size.extra_large": {
     "value": "Extra Large",
+    "description": "Subtitle size picker option: a larger client-rendered caption size, one step below Huge."
+  },
+  "settings.playback.subtitle_size.huge": {
+    "value": "Huge",
     "description": "Subtitle size picker option: the largest client-rendered caption size."
   },
   "settings.playback.subtitle_position": {
@@ -694,6 +694,22 @@
   "settings.playback.subtitle_position.high": {
     "value": "High",
     "description": "Subtitle position picker option: the caption sits near the top of the safe area."
+  },
+  "settings.playback.hdr_overlay": {
+    "value": "HDR overlay brightness",
+    "description": "Settings row title and picker title: how bright the player's controls and subtitles are drawn while the picture is HDR or Dolby Vision."
+  },
+  "settings.playback.hdr_overlay.full": {
+    "value": "100%",
+    "description": "HDR overlay brightness picker option: the controls and subtitles are drawn at full brightness during HDR, as in SDR (no dimming)."
+  },
+  "settings.playback.hdr_overlay.three_quarters": {
+    "value": "75%",
+    "description": "HDR overlay brightness picker option (the default): the controls and subtitles are drawn at three quarters of full brightness during HDR."
+  },
+  "settings.playback.hdr_overlay.half": {
+    "value": "50%",
+    "description": "HDR overlay brightness picker option: the controls and subtitles are drawn at half brightness during HDR."
   },
   "settings.playback.next_episode": {
     "value": "Next episode",
@@ -765,9 +781,23 @@
     "value": "Saved to this Plex profile and shared with your other Plex apps. Changes may take time to affect playback; selections already made for an item still take priority.",
     "description": "Settings, consent or sign-in UI: settings.audio.account_note"
   },
-  "settings.playback.copy": {
-    "value": "Playback defaults for this television. Changes here apply to the next playback.",
-    "description": "Explanation under the title of the Video & playback page itself. Each picker opened from it has its own explanation (settings.playback.<field>.copy), so this one is about the page as a whole, not about any single setting."
+  "settings.playback.copy_profile": {
+    "value": "Playback settings for {profile}. Changes here apply to the next playback.",
+    "description": "Explanation under the title of the Video & playback page itself while a profile is seated. {profile} is that profile's name exactly as the profile chip shows it (a user-chosen Plex name, any length, never declined or translated), so the sentence must keep it as a bare noun: the Spanish, French and Belarusian strings say 'the profile {profile}' so the name never has to decline or elide. Each picker opened from the page has its own explanation (settings.playback.<field>.copy), so this one is about the page as a whole, not about any single setting.",
+    "args": {
+      "profile": "str"
+    }
+  },
+  "settings.playback.copy_profile_forced": {
+    "value": "Playback settings for {profile}.",
+    "description": "The profile sentence of the Video & playback page's explanation while a profile is seated AND Force Direct Play is on. It is a full sentence ending in a period, and settings.playback.force_note follows it as the next sentence of the same paragraph (the text view draws no line break, so nothing here may rely on one). It is settings.playback.copy_profile without its second sentence, which does not fit the column beside the Force note for a long profile name in the longer languages. It is the only place Settings names the profile under Force. {profile} is the name exactly as the profile chip shows it (a user-chosen Plex name, any length, never declined or translated), so the sentence must keep it as a bare noun: the Spanish, French and Belarusian strings say 'the profile {profile}' so the name never has to decline or elide.",
+    "args": {
+      "profile": "str"
+    }
+  },
+  "settings.playback.unseated": {
+    "value": "Choose a profile to change this",
+    "description": "Explanation under the title of the Video & playback page while NO profile is seated (a normal session always has one, because Settings is opened through a profile; a developer-token run and a controlled replay have none, see session::Seat): replaces settings.playback.copy_profile. The page's rows then show the values every profile starts from, dimmed and unopenable, because a pick must belong to a profile; 'this' is those rows."
   },
   "settings.playback.quality.copy": {
     "value": "The highest quality a video plays at. Larger files are converted by your Plex server to fit. Also available in the player's More menu.",
@@ -784,6 +814,10 @@
   "settings.playback.subtitle_position.copy": {
     "value": "How high subtitles sit on the picture. Picture and styled subtitles keep their own position. Also under Style in the player's Subtitles menu.",
     "description": "Explanation under the title of the Subtitle position picker. Picture subtitles (PGS, VobSub) and styled (ASS/SSA) subtitles carry their own geometry, so the setting does not reach them; the same control is the Position row under Style on the Subtitles tab of the player's track menu."
+  },
+  "settings.playback.hdr_overlay.copy": {
+    "value": "How bright the player's controls and subtitles are during HDR and Dolby Vision, when the TV draws them much brighter. Lower it if they dazzle. 100% leaves them as they are.",
+    "description": "Explanation under the title of the HDR overlay brightness picker. A television raises graphics white in an HDR picture, so the on-screen controls and the subtitles look far brighter than in SDR; this scales their colours down, only while the playing picture is HDR or Dolby Vision. It never changes an SDR picture."
   },
   "settings.playback.next_episode.copy": {
     "value": "Up Next countdown shows a Next episode button when the credits start. After credits lets them play, then starts the next episode. Off closes the player instead.",
@@ -1007,11 +1041,13 @@
   },
   "settings.login.unknown_device": {
     "value": "unknown set",
-    "description": "Settings, consent or sign-in UI: settings.login.unknown_device"
+    "translate": false,
+    "description": "Support line on a failure or sign-in screen: the device model when the TV did not report one. Codes only; shown in English."
   },
   "settings.login.your_servers": {
     "value": "your servers",
-    "description": "Settings, consent or sign-in UI: settings.login.your_servers"
+    "translate": false,
+    "description": "Support line on a failure or sign-in screen: the server scope of the failed request. Codes only; shown in English."
   },
   "settings.language.saving": {
     "value": "Saving language…",
@@ -1159,6 +1195,10 @@
     "value": "webOS release",
     "description": "Placeholder in the consent screen's payload preview, shown between angle brackets where a real report carries a random or device-specific value. Name what the value is; lower case."
   },
+  "settings.consent.placeholder.webos_build": {
+    "value": "webOS firmware build",
+    "description": "Placeholder in the consent screen's payload preview, shown between angle brackets where a real report carries a random or device-specific value. Name what the value is; lower case."
+  },
   "settings.consent.placeholder.webos_codename": {
     "value": "webOS release codename",
     "description": "Placeholder in the consent screen's payload preview, shown between angle brackets where a real report carries a random or device-specific value. Name what the value is; lower case."
@@ -1210,5 +1250,187 @@
   "settings.consent.placeholder.webos_codename_short": {
     "value": "webOS codename",
     "description": "Placeholder shown inside angle brackets in the data preview, standing for the TV software's release codename."
+  },
+  "settings.hud.title": {
+    "value": "Player HUD",
+    "description": "Settings > Playback row and page title: the look of the playback controls (the player HUD)."
+  },
+  "settings.hud.copy": {
+    "value": "Choose how the playback controls look. Packages copied to this TV's HUD folder are listed here.",
+    "description": "Settings > Playback > Player HUD: the line under the page title."
+  },
+  "settings.hud.classic": {
+    "value": "Classic",
+    "description": "Settings > Playback > Player HUD: the name of the built-in HUD."
+  },
+  "settings.hud.builtin": {
+    "value": "Built-in",
+    "description": "Settings > Playback > Player HUD: the trust label of the HUD that ships with the app."
+  },
+  "settings.hud.unreviewed": {
+    "value": "Unreviewed",
+    "description": "Settings > Playback > Player HUD: the trust label of a package nobody has reviewed (a file copied to the TV)."
+  },
+  "settings.hud.until_restart": {
+    "value": "Installed until restart",
+    "description": "Settings > Playback > Player HUD: a package that only the temporary storage took, which a restart clears."
+  },
+  "settings.hud.unfit_language": {
+    "value": "Doesn't fit in {language}",
+    "description": "Settings > Playback > Player HUD: a package that does not fit in the current language (its text does not fit, or drawing it costs more than the HUD allows there), so the built-in HUD is drawn. {language} is the language's own name.",
+    "args": {
+      "language": "str"
+    }
+  },
+  "settings.hud.newer_format": {
+    "value": "Made for a newer PlxNative",
+    "description": "Settings > Playback > Player HUD: a package in a format this app version cannot read yet."
+  },
+  "settings.hud.older_format": {
+    "value": "Uses an older HUD format",
+    "description": "Settings > Playback > Player HUD: a package in a format this app version no longer reads."
+  },
+  "settings.hud.app_range": {
+    "value": "Not for this version",
+    "description": "Settings > Playback > Player HUD: a package that says it does not run on this app release."
+  },
+  "settings.hud.cant_install": {
+    "value": "Can't install this file",
+    "description": "Settings > Playback > Player HUD: a file in the HUD folder that cannot be installed (not a valid package, too large, or changed since it was listed)."
+  },
+  "settings.hud.already": {
+    "value": "Already installed",
+    "description": "Settings > Playback > Player HUD: a file in the HUD folder whose package is installed already, or an equal or newer version of it is."
+  },
+  "settings.hud.not_saved": {
+    "value": "Couldn't save it: the storage is read-only",
+    "description": "Settings > Playback > Player HUD: an install that no storage location on the TV accepted."
+  },
+  "settings.hud.folder": {
+    "value": "In the HUD folder",
+    "description": "Settings > Playback > Player HUD: the header over the files found in the HUD folder on the TV."
+  },
+  "settings.hud.install": {
+    "value": "Install",
+    "description": "Settings > Playback > Player HUD: the action word on a file in the HUD folder, and the confirming answer of the install question."
+  },
+  "settings.hud.install_question": {
+    "value": "Install this HUD?",
+    "description": "Settings > Playback > Player HUD: the question before an unreviewed file is installed."
+  },
+  "settings.hud.install_body": {
+    "value": "This file was copied to the TV and has not been reviewed. It changes how the playback controls look.",
+    "description": "Settings > Playback > Player HUD: the body of the install question."
+  },
+  "settings.hud.remove": {
+    "value": "Remove",
+    "description": "Settings > Playback > Player HUD: the action word on an installed package's removal row."
+  },
+  "settings.hud.address": {
+    "value": "Install from address",
+    "description": "Settings > Playback > Player HUD: Row that asks for an address to install a HUD package from. A row title."
+  },
+  "settings.hud.address_hint": {
+    "value": "Type gh:owner/repo or an https:// address",
+    "description": "Settings > Playback > Player HUD: The detail line of the install-from-address row: what to type. gh:owner/repo, gh:owner/repo@tag and https:// are typed as they are."
+  },
+  "settings.hud.address_form": {
+    "value": "Use gh:owner/repo, gh:owner/repo@tag or an https:// address.",
+    "description": "Settings > Playback > Player HUD: The line under the page title when the typed address is not one of the accepted forms. The forms are typed as they are."
+  },
+  "settings.hud.address_lan": {
+    "value": "A plain http:// address must be a device on your home network, like 192.168.1.20.",
+    "description": "Settings > Playback > Player HUD: The line under the page title when a plain http:// address was typed that is not a device on the home network (a private address such as 192.168.1.20)."
+  },
+  "settings.hud.fetching": {
+    "value": "Downloading…",
+    "description": "Settings > Playback > Player HUD: The detail line of the install-from-address row while the package is downloading."
+  },
+  "settings.hud.fetch_not_found": {
+    "value": "Nothing at that address",
+    "description": "Settings > Playback > Player HUD: The line under the page title when the address answered that there is nothing there (HTTP 404)."
+  },
+  "settings.hud.fetch_unreachable": {
+    "value": "Couldn't connect to that address",
+    "description": "Settings > Playback > Player HUD: The line under the page title when the TV could not connect to the typed address."
+  },
+  "settings.hud.fetch_certificate": {
+    "value": "The TV's certificate check failed for that address",
+    "description": "Settings > Playback > Player HUD: The line under the page title when the TV's own certificate check refused the typed address's certificate."
+  },
+  "settings.hud.too_large": {
+    "value": "That file is too large",
+    "description": "Settings > Playback > Player HUD: The line under the page title when the file is larger than a HUD package may be."
+  },
+  "settings.hud.not_a_hud": {
+    "value": "That isn't a HUD package",
+    "description": "Settings > Playback > Player HUD: The line under the page title when the file is not a HUD package (it does not parse as one)."
+  },
+  "settings.hud.offer_body": {
+    "value": "This package was downloaded from an address and has not been reviewed. It changes how the playback controls look.",
+    "description": "Settings > Playback > Player HUD: The body of the install question for a package downloaded from an address."
+  },
+  "settings.hud.offer_from": {
+    "value": "From {host}",
+    "description": "Settings > Playback > Player HUD: The prompt line naming where a downloaded package came from. {host} is the address's host name.",
+    "args": {
+      "host": "str"
+    }
+  },
+  "settings.hud.offer_dev": {
+    "value": "Development source",
+    "description": "Settings > Playback > Player HUD: The prompt label for a package fetched over plain http:// from a device on the home network (a development source)."
+  },
+  "settings.trace.section": {
+    "value": "Diagnostics",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.section"
+  },
+  "settings.trace.title": {
+    "value": "Record playback diagnostics",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.title"
+  },
+  "settings.trace.detail": {
+    "value": "Local: up to 60s / 8 MiB. May slow playback.",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.detail"
+  },
+  "settings.trace.export": {
+    "value": "Save diagnostic log",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.export"
+  },
+  "settings.trace.export_detail": {
+    "value": "Local recording and app log for support.",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.export_detail"
+  },
+  "settings.trace.delete": {
+    "value": "Delete diagnostic recordings",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.delete"
+  },
+  "settings.trace.off": {
+    "value": "Off",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.off"
+  },
+  "settings.trace.recording": {
+    "value": "Recording",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.recording"
+  },
+  "settings.trace.saved": {
+    "value": "Recorded",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.saved"
+  },
+  "settings.trace.exported": {
+    "value": "Saved",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.exported"
+  },
+  "settings.trace.unavailable": {
+    "value": "Unavailable",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.unavailable"
+  },
+  "settings.trace.failed": {
+    "value": "Failed",
+    "description": "Opt-in local playback diagnostic recording; settings.trace.failed"
+  },
+  "settings.trace.saving": {
+    "value": "Saving",
+    "description": "Local playback diagnostics save in progress."
   }
 }

@@ -9,7 +9,7 @@
 //! the ONE struct, owned by `App` as `app.scenarios`, that gathers every arm's own retry counter,
 //! oscillator phase and boot-time latch, so a field used by no production code has exactly one
 //! home instead of living beside `route`/`trail`/`pages` on `App` itself. A field genuine
-//! production code also reads (`t0`, `refresh_hubs_at`) stayed on `App`, as the phase's own
+//! production code also reads (`t0`, `refresh_hubs`) stayed on `App`, as the phase's own
 //! instructions require.
 //!
 //! **Entry points, called from the loop at the exact positions the arms used to sit at:**
@@ -287,10 +287,29 @@ pub(crate) fn arm_overdraw() {
     }
 }
 
-/// `/tmp/plxnative-drawmask=<classes>` — refuse every draw of the named classes.
+/// `/tmp/plxnative-drawmask=<classes>` — refuse every draw of the named classes, or, for the card
+/// class, one PART of its work (`card.interior`, `card.ring`, `card.focus`: `plx_gfx::overdraw`).
 pub(crate) fn arm_drawmask() {
     if let Some(spec) = plx_base::devtrig::read("drawmask") {
         plx_gfx::overdraw::set_mask(&spec);
+    }
+}
+
+/// `/tmp/plxnative-nocardsplit` — draw every resting card WHOLE again, as before the split of a
+/// resting card into its interior and ring (`gfx::draw_tex_core_in`). Unarmed the split is on,
+/// which is the shipped behaviour; present, the very same binary is the control leg of a split
+/// on/off A/B, with the card-path ledger (`plxnative-overdraw`) booking the whole draws as `off`.
+pub(crate) fn arm_cardsplit() {
+    if plx_base::devtrig::flag("nocardsplit") {
+        plx_gfx::overdraw::set_card_split(false);
+    }
+    // `/tmp/plxnative-nopreviewcache` draws the Under posters preview live every frame (as before
+    // `gfx::region_paint`); `/tmp/plxnative-previewsnap` puts the cached quad on whole pixels.
+    if plx_base::devtrig::flag("nopreviewcache") {
+        plx_gfx::overdraw::set_region_cache(false);
+    }
+    if plx_base::devtrig::flag("previewsnap") {
+        plx_gfx::overdraw::set_region_snap(true);
     }
 }
 
@@ -342,15 +361,15 @@ pub(crate) fn arm_noidle() {
     }
 }
 
-/// `/tmp/plxnative-audioenh=off|boost|loudness` — force the PERSISTED Boost Dialog / Normalize
-/// Loudness preference (issue #266) at boot, harness-only.
+/// `/tmp/plxnative-audioenh=off|boost|loudness` — force the Boost Dialog / Normalize Loudness
+/// preference (issue #266) at boot, harness-only.
 ///
 /// Every other boot override here (`dev::playback_quality_override`, `arm_glassload`, …) is
 /// deliberately in-memory-only, so a test can never mutate a real person's saved preference. This
 /// one is the one exception, and on purpose: `player::set_audio_enhancements` is the SAME call a
-/// person's own track-menu pick makes (it both updates the live route and re-persists through the
-/// storage worker), and an on-device harness case needs the persisted value itself pinned before
-/// boot, not just the in-memory copy — one case proves the cold-start "a saved preference turns an
+/// person's own track-menu pick makes (it both updates the live route and, for a seated profile,
+/// re-persists through the storage worker), and an on-device harness case needs its starting value
+/// pinned before boot — one case proves the cold-start "a saved preference turns an
 /// otherwise-direct-playable route into a remux" path (`route::plan`'s cold-start audio branch) by
 /// booting with the preference already ON, and the very next boot must not inherit whatever a
 /// FAILED previous case's toggle left behind. A toggle-based reset cannot promise that: if the
@@ -358,6 +377,26 @@ pub(crate) fn arm_noidle() {
 /// Forcing the value at boot, every time, is what makes a case's starting preference a property of
 /// the manifest instead of of history — the same argument `run_case`'s per-case viewOffset reset
 /// already makes for resume position.
+///
+/// **Whose record it forces (P1a).** The preference is a PROFILE's, so the persisted value is the
+/// SEATED profile's, and it only exists once a profile is seated. The arm runs twice, both through
+/// the same setter. Boot runs it with nobody seated, which sets the live cell alone (the door
+/// refuses to save for nobody). The seat trigger (`app::bridge::SeatWatch`) runs it again right
+/// after the restore of the process's first `Unseated` to `Seated` change, which writes that
+/// profile's record. Whether that second run happens depends on how the harness boots:
+///
+/// * A token-injected boot (the default, `--guest` included, since `tools/tv-session.sh` and
+///   `tests/run.py` both write `plxnative-token`) is a dev-token boot that never seats, so the arm
+///   sets the live value only, and the next dev-token boot reads the fallback rather than a previous
+///   run's pick.
+/// * A `session: stored` case (`offline_play`, `offline_play_v6` and `offline_pick_cached` in
+///   `tests/manifest.json`) skips the token and boots the install's own sign-in, which seats.
+///   `triggers_for_case` still writes `plxnative-audioenh` for it (`off` by default), so the second
+///   run writes that real profile's own record, and under §3.8.4 it records an own value even for
+///   `off`: such a case leaves `audio_enhancements: NONE` in the install's signed-in profile.
+///
+/// Either way no boot inherits what a failed case left: the token boots never persist it, and a
+/// seated boot overwrites it.
 ///
 /// `off` clears both flags; `boost`/`loudness` sets exactly one (never both — no case here needs
 /// both at once, and a value this test-only can grow a second name later without breaking the
@@ -381,6 +420,79 @@ pub(crate) fn arm_audio_enhancements() {
         "audioenh: forced boost_dialog={} normalize_loudness={} by /tmp/plxnative-audioenh",
         a.boost_dialog, a.normalize_loudness,
     ));
+}
+
+/// `/tmp/plxnative-trackmemory=clear` — forget everything the seated profile's track memory holds,
+/// harness-only.
+///
+/// Track memory is the per-profile record a harness case writes without meaning to: a menu pick on
+/// an episode (`route::commit_audio_pick` / `commit_subtitle_pick`) lands in it, and the next case
+/// that plays the same show would then start from the previous case's tracks. `tests/run.py` writes
+/// `clear` for every case beside `plxnative-audioenh`, so a case's starting memory is a property of
+/// the manifest instead of of history, the argument `arm_audio_enhancements` makes for the
+/// preference. An unrecognised value is ignored rather than guessed at.
+///
+/// **It needs a seat, and so does the memory it clears.** The entries are the seated profile's, read
+/// and removed through the memory door (`route::recall_all`, then `route::remember` with a removal:
+/// the same refusal, the same queued delta, never a write around the door), which refuses for nobody.
+/// A dev-token boot never seats, so it neither remembers nor has anything to clear. The seat trigger
+/// (`app::bridge::SeatWatch`) runs this once, right after the restore of the process's first
+/// `Unseated` to `Seated` change and beside `arm_audio_enhancements`, with the profile it seated: a
+/// stored-session boot (the harness's seated cases) or a picker boot.
+pub(crate) fn arm_track_memory(user: &str) {
+    use plx_plex::plex::session::prefs::{MemoryEntry, TrackMemoryEntry};
+    let Some(v) = plx_base::devtrig::read("trackmemory") else { return };
+    let v = v.trim();
+    if let Some(count) = v.strip_prefix("fill") {
+        fill_track_memory(user, count.strip_prefix(':').unwrap_or(""));
+        return;
+    }
+    if v != "clear" {
+        #[cfg(feature = "devtriggers")]
+        plx_base::eventlog::log(&format!("trackmemory: unrecognised value {v:?} — ignored"));
+        return;
+    }
+    let cleared = plx_media::route::recall_all::<TrackMemoryEntry>(user)
+        .into_iter()
+        .filter(|entry| plx_media::route::remember::<TrackMemoryEntry>(user, entry.key(), |_| None))
+        .count();
+    #[cfg(feature = "devtriggers")]
+    plx_base::eventlog::log(&format!("trackmemory: cleared {cleared} shows by /tmp/plxnative-trackmemory"));
+    #[cfg(not(feature = "devtriggers"))]
+    let _ = cleared;
+}
+
+/// `/tmp/plxnative-trackmemory=fill[:N]` — give the seated profile `N` (default and ceiling: the
+/// per-profile cap, 64) remembered shows with every string at its bound, harness-only.
+///
+/// This is what makes the DB8 write cost of a document carrying `track_memory` at its budget
+/// readable from the log (`session: db8 document bytes=… track_memory=…`, then `session: canonical
+/// write took … ms`): one profile's 64 worst-case entries are the household budget's size
+/// (`one_profile_keeps_64_worst_case_entries`), which no sequence of menu picks reaches on a mock with
+/// a handful of shows. The entries are keyed on a machine id no server has, so they never match a
+/// playback, and are written through the same door as a menu pick (`route::remember`), so a seatless
+/// boot refuses them exactly as it refuses a pick. `clear` removes them.
+fn fill_track_memory(user: &str, count: &str) {
+    use plx_plex::plex::session::prefs::{MemoryEntry, TrackMemoryEntry};
+    // The per-profile cap is the ceiling: a larger count would only evict its own first entries.
+    let cap = plx_plex::plex::session::prefs::TRACK_MEMORY_CAP;
+    let wanted = if count.is_empty() { Some(cap) } else { count.parse::<usize>().ok() };
+    let Some(wanted) = wanted.filter(|n| (1..=cap).contains(n)) else {
+        #[cfg(feature = "devtriggers")]
+        plx_base::eventlog::log(&format!("trackmemory: fill count {count:?} is not 1..={cap} — ignored"));
+        return;
+    };
+    let written = (0..wanted as u32)
+        .map(TrackMemoryEntry::worst_case)
+        .filter(|entry| {
+            let value = entry.clone();
+            plx_media::route::remember::<TrackMemoryEntry>(user, entry.key(), move |_| Some(value.clone()))
+        })
+        .count();
+    #[cfg(feature = "devtriggers")]
+    plx_base::eventlog::log(&format!("trackmemory: filled {written} of {wanted} shows by /tmp/plxnative-trackmemory"));
+    #[cfg(not(feature = "devtriggers"))]
+    let _ = written;
 }
 
 /// `/tmp/plxnative-nobudget` — the frame budget's A/B CONTROL LEG (spec §8.1, phase 11).
@@ -652,8 +764,9 @@ pub(crate) fn advance_content_boot(app: &mut App, fr: &Frame) {
                 // needs `credited`/`landed` because it is a list of them; the biography needs the
                 // person's own facts, which the header already has. Requiring the credits here
                 // would be requiring something a headless boot cannot have: they come from
-                // plex.tv, which answers an injected server token 401 (`account: … HTTP 401` in
-                // the event log), so the wait would never end and the trigger would present
+                // the Discover provider: a dev-token boot with no Discover stand-in armed has the
+                // read REFUSED locally (`discover: GET … refused` in the event log), and one with
+                // the mock's stand-in armed gets the credits' 401 (no account token), so the wait would never end and the trigger would present
                 // nothing at all — measured on the simulator, 2026-09-10.
                 && (boot.bio || (p.credited && p.landed)))
         })
@@ -674,7 +787,8 @@ pub(crate) fn advance_content_boot(app: &mut App, fr: &Frame) {
         // door OK on the header uses (`ContentPanel::Bio`) and gated on the same predicate, so the
         // trigger cannot open a sheet an interactive press would have refused. It exists because
         // this sheet has no other headless route: OK on the header only opens it when the prose is
-        // TRUNCATED, and the bio comes from plex.tv, which answers an injected server token 401 —
+        // TRUNCATED, and the bio comes from the Discover provider, which a dev-token boot either
+        // refuses locally (no stand-in armed) or gets only the mock's synthetic prose from —
         // so pair it with `/tmp/plxnative-personbio=<text>` for a boot that has any prose at all.
         let available = app
             .pages
@@ -785,6 +899,110 @@ fn detail_boot_ready(sid: plx_plex::plex::ServerId, rk: &str, want_season: Optio
     loaded: Option<(plx_plex::plex::ServerId, &str, Option<i64>)>, detail_loading: bool, season_loading: bool) -> bool {
     !detail_loading && !season_loading && loaded.is_some_and(|(server, key, season)|
         server == sid && key == rk && want_season.is_none_or(|wanted| season == Some(wanted)))
+}
+
+#[cfg(test)]
+mod track_memory_arm_tests {
+    use super::arm_track_memory;
+    use plx_media::route::{recall_all, remember, seed_memory_for_test, unseed_memory_for_test};
+    use plx_plex::plex::session::prefs::{AudioMemo, TrackMemoryEntry};
+    use plx_plex::plex::session::{self, Session, TempSession};
+
+    const MACHINE: &str = "machine-1";
+
+    fn entry(show: &str) -> TrackMemoryEntry {
+        let japanese = AudioMemo { lang: "jpn".into(), codec: "eac3".into(), channels: 6, ..Default::default() };
+        TrackMemoryEntry::new(MACHINE, show, Some(japanese), None)
+    }
+
+    fn held(user: &str) -> usize {
+        recall_all::<TrackMemoryEntry>(user).len()
+    }
+
+    fn filed() -> usize {
+        session::load().prefs.track_memory.iter().map(|list| list.items.len()).sum()
+    }
+
+    /// **`plxnative-trackmemory=clear` forgets what the SEATED profile remembered, through the door.**
+    /// Each case in the harness starts from empty memory, so a pick one case made is not the next
+    /// case's starting tracks. Armed with `clear` only; another profile's seat clears nothing of
+    /// this one's; the file loses the entries too, not just the mirror.
+    #[test]
+    fn trackmemory_clear_forgets_the_seated_profiles_shows_and_nothing_else() {
+        let _serial = plx_base::testlock::serial();
+        assert!(plx_base::devtrig::ENABLED, "this test arms a dev trigger, which a build without devtriggers cannot");
+        let session = TempSession::new("arm-track-memory");
+        session::save(&Session { client_id: "cid-1".into(), account_token: "acct".into(), ..Default::default() });
+        session.seated("", "acct");
+        seed_memory_for_test::<TrackMemoryEntry>(&session::peek());
+        for show in ["100", "200"] {
+            assert!(remember::<TrackMemoryEntry>("", (MACHINE.to_string(), show.to_string()), move |_| Some(entry(show))));
+        }
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!((held(""), filed()), (2, 2), "setup: two shows remembered, in the mirror and in the file");
+
+        plx_base::devtrig::with_private_triggers(|| {
+            arm_track_memory("");
+            assert_eq!(held(""), 2, "nothing is armed, so nothing is forgotten");
+
+            std::fs::write(plx_base::devtrig::path("trackmemory"), "keep").unwrap();
+            arm_track_memory("");
+            assert_eq!(held(""), 2, "an unrecognised value is ignored, not guessed at");
+
+            std::fs::write(plx_base::devtrig::path("trackmemory"), "clear").unwrap();
+            arm_track_memory("kid");
+            assert_eq!(held(""), 2, "a profile that is not the seated one clears nothing");
+
+            arm_track_memory("");
+            assert_eq!(held(""), 0, "armed with clear, the seated profile's shows are forgotten");
+        });
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(filed(), 0, "and the file forgot them through the same queued update");
+        unseed_memory_for_test::<TrackMemoryEntry>();
+    }
+
+    /// **`plxnative-trackmemory=fill[:N]` writes `N` worst-case shows through the door, and `clear`
+    /// takes them back.** The count defaults to, and is bounded by, the per-profile cap; a count
+    /// outside `1..=CAP` or one that is not a number writes nothing (a guess would put an unplanned
+    /// document size on the set); a profile that is not the seated one gets none.
+    #[test]
+    fn trackmemory_fill_writes_worst_case_shows_through_the_door_and_clear_takes_them_back() {
+        let _serial = plx_base::testlock::serial();
+        assert!(plx_base::devtrig::ENABLED, "this test arms a dev trigger, which a build without devtriggers cannot");
+        let session = TempSession::new("arm-track-memory-fill");
+        session::save(&Session { client_id: "cid-1".into(), account_token: "acct".into(), ..Default::default() });
+        session.seated("", "acct");
+        seed_memory_for_test::<TrackMemoryEntry>(&session::peek());
+        let cap = plx_plex::plex::session::prefs::TRACK_MEMORY_CAP;
+
+        plx_base::devtrig::with_private_triggers(|| {
+            let arm = |value: &str, user: &str| {
+                std::fs::write(plx_base::devtrig::path("trackmemory"), value).unwrap();
+                arm_track_memory(user);
+            };
+            for refused in ["fill:0", &format!("fill:{}", cap + 1), "fill:many", "fill:-3"] {
+                arm(refused, "");
+                assert_eq!(held(""), 0, "{refused:?} is not a count in 1..={cap}, so it fills nothing");
+            }
+            arm("fill:3", "kid");
+            assert_eq!(held(""), 0, "a profile that is not the seated one is given nothing");
+
+            arm("fill:3", "");
+            assert_eq!(held(""), 3, "fill:3 writes three shows");
+            arm("fill", "");
+            assert_eq!(held(""), cap, "a bare fill writes the cap, and the three it overlaps are the same shows");
+            plx_base::storage_worker::drain_for_test();
+            assert_eq!(filed(), cap, "the file holds them too, not only the mirror");
+            assert!(recall_all::<TrackMemoryEntry>("").iter().all(|e| e.audio.is_some() && e.subtitle.is_some()),
+                "each is the worst-case shape, both halves present");
+
+            arm("clear", "");
+            assert_eq!(held(""), 0, "clear takes the filled shows back like any others");
+        });
+        plx_base::storage_worker::drain_for_test();
+        assert_eq!(filed(), 0, "and the file forgot them");
+        unseed_memory_for_test::<TrackMemoryEntry>();
+    }
 }
 
 #[cfg(test)]
@@ -934,7 +1152,7 @@ fn autoplay_arm(app: &mut App, fr: &mut Frame) {
                     snapshot.view().hub(hub).and_then(|h| h.items.get(col))
                 });
                 if let Some(pmm) = pmm {
-                    let requested = plx_media::route::request_play_movie(&mut app.player.session, app.bridge.metadata_mut(), pmm, &crate::app::playback::movie_ctx(pmm));
+                    let requested = plx_media::route::request_play_movie(&mut app.player.session, app.bridge.metadata_mut(), crate::app::playback::start_caps(), pmm, &crate::app::playback::movie_ctx(pmm), None);
                     if requested {
                         // ASYNC (phase 11): nothing here reads `metadata::current()` — the play
                         // plan came from the catalog row itself. The detail is wanted only so the
@@ -942,7 +1160,7 @@ fn autoplay_arm(app: &mut App, fr: &mut Frame) {
                         // `install_landed_detail` calls the same `sync_now_playing` the blocking
                         // load did. So there is nothing to wait for, and no reason to spend two
                         // PMS round trips of the SDL thread on the frame that starts a playback.
-                        app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid: pmm.sid, rk: pmm.rk.to_string() });
+                        app.bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid: pmm.sid, rk: pmm.rk.to_string() });
                     }
                     requested
                 } else {
@@ -985,6 +1203,21 @@ fn grid_library_search_heroidx_arm(app: &mut App, _fr: &mut Frame) {
         if let Some(q) = plx_base::devtrig::read("search") {
             apply_search_boot_trigger(&q, &mut app.pages, &mut app.bridge);
         }
+        // `/tmp/plxnative-watchlist` — boot straight onto the Watchlist page (`SelectTab`, as the
+        // Library and Search triggers above). Pair it with `plxnative-discover=<mock url>` (or a
+        // `plxnative-plextv` redirect, which Discover follows); a dev-token boot with neither armed
+        // has its Discover reads refused, logged at boot as `discover: base=real reads=refused`.
+        // `tools/tv-session.sh --mock-plextv` arms both.
+        if plx_base::devtrig::flag("watchlist") {
+            crate::app::bridge::nav_select_tab(&mut app.pages, AppArg::Watchlist);
+        }
+        // `/tmp/plxnative-catalog=<24 hex>` — boot straight onto the catalog page of that title (a
+        // `ContentArg::Catalog` push over Home, as a Watchlist tile's OK opens it). The page reads
+        // the discover host like the Watchlist page, so pair it with `plxnative-discover=<mock
+        // url>`; a value that is not 24 hex digits arms nothing.
+        if let Some(hex) = plx_base::devtrig::read("catalog").and_then(|v| plx_data::watchlist::decode_hex(v.trim())) {
+            crate::app::bridge::open_catalog(&mut app.pages, hex, None);
+        }
         if let Some(s) = plx_base::devtrig::read("heroidx") {
             if let Ok(n) = s.parse::<c_int>() {
                 app.bridge.home_command(HomeCmd::SelectHero(n));
@@ -1012,11 +1245,18 @@ fn settings_boot_arm(app: &mut App, fr: &mut Frame) {
                 "language" => plx_screens::family::SettingsPage::Language,
                 "contribute" => plx_screens::family::SettingsPage::Contribute,
                 "playback" => plx_screens::family::SettingsPage::Playback,
-                // root → Playback → the Quality picker (`SettingsPage::boot_trail`), so BACK works.
+                // root → Playback → the Quality picker (`SettingsPage::boot_trail`; BACK dismisses the surface, see there).
                 "picker-quality" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::Quality),
                 "picker-next-episode" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::NextEpisode),
                 "picker-deck-press" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::DeckPress),
+                "picker-hdr-overlay" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::HdrOverlay),
+                // root → the Interface resolution picker
+                "picker-resolution" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::UiResolution),
+                "picker-instant-dpad-seeking" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::InstantDpadSeeking),
+                "picker-dolby-vision" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::DolbyVision),
                 "picker-skip-interval" => plx_screens::family::SettingsPage::Picker(plx_screens::family::PickerKind::SkipInterval),
+                // root → Playback → the Player HUD page (`SettingsPage::boot_trail`; BACK dismisses the surface, see there)
+                "player-hud" => plx_screens::family::SettingsPage::PlayerHud,
                 "audio" => plx_screens::family::SettingsPage::AudioSubtitles,
                 _other => {
                     #[cfg(feature = "devtriggers")]
@@ -1137,7 +1377,7 @@ fn detail_arm(app: &mut App, fr: &mut Frame) -> bool {
                         return false;
                     }
                 };
-                app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
+                app.bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
                 #[cfg(feature = "devtriggers")]
                 plx_base::eventlog::log(&format!("plxnative-detail: rk={rk} server={} start", sid.raw()));
                 // A HARD CUT onto the page: at boot there is no outgoing screen to replace, so a
@@ -1171,6 +1411,20 @@ fn collection_arm(app: &mut App, fr: &mut Frame) -> bool {
     #[cfg(feature = "devtriggers")]
     plx_base::eventlog::log(&format!("plxnative-collection: rk={rk} server={} start", sid.raw()));
     true
+}
+
+/// `/tmp/plxnative-hud=<path>` — draw the package at that path instead of the chosen HUD (classic unless a package was picked). Read ONCE, on the first
+/// player frame (`run::refresh_hud`); the file is read here, the bytes are compiled by the owner, and a
+/// file that does not read or compile is remembered ([`DevPackage`]), so it is neither re-read nor
+/// recompiled every frame. Without the `devtriggers` feature the trigger reads as absent.
+pub(crate) fn hud_trigger() -> plx_appkit::player_hud::loaded::DevHud {
+    use plx_appkit::player_hud::loaded::{dev_package_path, DevHud, DevPackage};
+    let Some(value) = plx_base::devtrig::read("hud") else { return DevHud::Off };
+    let Some(path) = dev_package_path(&value) else { return DevHud::Off };
+    let bytes = crate::app::hud_source::read_artifact(std::path::Path::new(path)).map_err(|e| e.to_string());
+    #[cfg(feature = "devtriggers")]
+    plx_base::eventlog::log(&format!("plxnative-hud: path={path} read={}", bytes.as_ref().map_or_else(|e| e.clone(), |b| format!("{} bytes", b.len()))));
+    DevHud::Package(DevPackage::new(path.to_owned(), bytes))
 }
 
 /// `/tmp/plxnative-play=<rk>` — fetch that item and play its leaf, headless. TWO frames at least,
@@ -1211,7 +1465,7 @@ fn play_arm(app: &mut App, fr: &mut Frame) -> bool {
                         return false;
                     }
                 };
-                app.bridge.metadata_mut().run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
+                app.bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::RequestDetail { sid, rk: rk.to_string() });
                 #[cfg(feature = "devtriggers")]
                 plx_base::eventlog::log(&format!("plxnative-play: rk={rk} server={} request", sid.raw()));
                 app.scenarios.play_await = Some((sid, rk.to_string(), fr.now.wrapping_add(12_000)));
@@ -1265,7 +1519,7 @@ fn play_await_tick(app: &mut App, fr: &mut Frame) {
     }
     #[cfg(feature = "devtriggers")]
     plx_base::eventlog::log(&format!("plxnative-play: rk={rk} server={} start", sid.raw()));
-    if plx_media::route::request_play(&mut app.player.session, app.bridge.metadata_mut(), sid, &rk, &part, &vc, &ac, &title, "") {
+    if plx_media::route::request_play(&mut app.player.session, app.bridge.metadata_mut(), crate::app::playback::start_caps(), sid, &rk, &part, &vc, &ac, &title, "", None) {
         let resume = plx_data::metadata::resume_ns(resume_ms, dur_ms);
         crate::app::playback::start_playback(&mut app.player.session,
             &mut app.adapters.player,
@@ -1413,15 +1667,15 @@ fn menu_arm(app: &mut App, fr: &mut Frame) {
             pin_headless_hud(app, fr.now, None);
         }
         if plx_base::devtrig::flag("more") {
-            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { quality: false });
+            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { page: None });
             pin_headless_hud(app, fr.now, None);
         }
         if plx_base::devtrig::flag("info") {
-            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::Info);
+            crate::app::bridge::toggle_player_section(&mut app.pages, plx_appkit::player_hud::command::Section::Info);
             pin_headless_hud(app, fr.now, Some(0));
         }
         if plx_base::devtrig::flag("chapters") {
-            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::Chapters);
+            crate::app::bridge::toggle_player_section(&mut app.pages, plx_appkit::player_hud::command::Section::Chapters);
             pin_headless_hud(app, fr.now, Some(1));
         }
     }
@@ -1437,6 +1691,12 @@ fn menu_arm(app: &mut App, fr: &mut Frame) {
 /// itself, which is the issue #266 PR4 fix this trigger inherits (see
 /// `TrackMenuState::row_for_audio_target`'s doc for that history). An unrecognized name logs a
 /// clear line and commits nothing, same shape as the existing "row already active" no-commit log.
+///
+/// **The pick is a viewer's.** It goes through the menu's own commit, so it carries the pick's
+/// descriptor and `commit_track` remembers it for the show (seated, episode, accepted), exactly as a
+/// press would; `plxnative-trackmemory=clear` ([`arm_track_memory`]) is what keeps one case's pick
+/// out of the next case's starting tracks. [`subtiming_arm`] and the other setup arms commit with no
+/// descriptor and remember nothing.
 fn menupick_arm(app: &mut App, fr: &mut Frame) {
     if !app.scenarios.menupick_tried && matches!(app.route(), AppArg::Player) && fr.now.wrapping_sub(app.t0) > 7000 {
         app.scenarios.menupick_tried = true;
@@ -1591,7 +1851,7 @@ fn moreosc_arm(app: &mut App, fr: &mut Frame) {
     app.scenarios.more_osc.last = fr.now;
     let Some(depth) = crate::app::bridge::player_overlay_mut(&mut app.pages).and_then(|s| s.more_probe()) else {
         if !crate::app::bridge::player_overlay_up(&app.pages) {
-            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { quality: false });
+            crate::app::bridge::open_player_overlay(&mut app.player.session, app.bridge.metadata_view(), &mut app.pages, plx_screens::player::overlay::OverlayKind::More { page: None });
             pin_headless_hud(app, fr.now, None);
         }
         return;
@@ -1755,6 +2015,8 @@ fn subtiming_arm(app: &mut App, fr: &mut Frame) {
             stream_id,
             sidecar_key: None,
             sidecar_codec: String::new(),
+            // A setup commit, not the viewer's choice: it remembers nothing.
+            memo: None,
         },
     );
 }
@@ -2082,15 +2344,20 @@ pub(crate) fn home_osc_tick(app: &mut App, now: u32) {
     }
 }
 
-/// `/tmp/plxnative-libosc` — the Library twin of `homeosc`.
+/// `/tmp/plxnative-libosc` — the Library twin of `homeosc`. Sweeps whichever page of the library
+/// family is up (the grid, its Collections page, its Recommended shelves): all three answer
+/// `LibraryCmd::Sweep`, and `fps:library-collections` is this sweep on the Collections page.
 pub(crate) fn lib_osc_tick(app: &mut App, now: u32) {
-    if app.scenarios.dev.lib_osc && matches!(app.route(), AppArg::Library) && now.wrapping_sub(app.scenarios.lib_osc_last) > 350 {
+    if app.scenarios.dev.lib_osc && app.route().is_library_family() && now.wrapping_sub(app.scenarios.lib_osc_last) > 350 {
         app.scenarios.lib_osc_last = now;
         crate::app::bridge::Bridge::library_command(&mut app.pages, plx_screens::registry::LibraryCmd::Sweep);
     }
 }
 
-/// `/tmp/plxnative-libswitch` — cycle EVERY Library switch on a timer.
+/// `/tmp/plxnative-libswitch` — cycle EVERY Library switch on a timer. The full grid's alone, on
+/// purpose and unlike the sweep above: the switches it cycles (type, sort and filter, the library
+/// plate, Unwatched, the A-Z rail) are the grid header's controls, which the Collections page does
+/// not wear (its header is a crumb) and the Recommended page answers `Handled::No`.
 pub(crate) fn lib_switch_tick(app: &mut App, now: u32) {
     if app.scenarios.dev.lib_switch && matches!(app.route(), AppArg::Library) && now.wrapping_sub(app.scenarios.lib_switch_last) > 1400 {
         app.scenarios.lib_switch_last = now;
@@ -2369,6 +2636,8 @@ fn modal_bench_open(app: &mut App, target: bench::ModalTarget) {
                 anchor: [anchor_rect.x.to_bits(), anchor_rect.y.to_bits(), anchor_rect.w.to_bits(), anchor_rect.h.to_bits()],
                 loaded_episode: false,
                 from_home: true,
+                catalog: None,
+                watchlist: None,
             };
             crate::app::bridge::open_item_menu(&mut app.pages, arg);
         }
@@ -2801,3 +3070,14 @@ pub(crate) fn app_init_value() -> Option<Result<serde_json::Value, &'static str>
 // layer — `auth`, `telemetry`, the login screen — and only read trigger files, so their reads
 // moved down beside them (`auth::scripted`, `telemetry::consent::state_override`,
 // `screens::login::harness_driven`) instead of being reached up into from here.
+
+/// Registry calibration uses the initialized television measurer once, before the frame loop.
+#[cfg(feature = "devtriggers")]
+pub(crate) fn arm_hud_text_metrics() {
+    if !plx_base::devtrig::flag("hud-text-metrics") { return; }
+    let path = plx_base::devtrig::path("hud-text-metrics.json");
+    match crate::hud_tools::dump_metrics(&path) {
+        Ok(count) => plx_base::eventlog::log(&format!("hud-text-metrics: wrote {count} samples")),
+        Err(reason) => plx_base::eventlog::log(&format!("hud-text-metrics: FAILED {reason}")),
+    }
+}

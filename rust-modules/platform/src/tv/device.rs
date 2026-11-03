@@ -9,6 +9,10 @@ use std::sync::OnceLock;
 pub struct Info {
     /// e.g. "4.10.2" — empty when unknown
     pub release: String,
+    /// The exact firmware build, e.g. "6.5.3-47" (nyx's `core_os_release`: the release and the
+    /// build id); falls back to `release` when the file has no such key, empty when unknown. A
+    /// patch within one release changes this and not `release`.
+    pub build: String,
     /// e.g. "goldilocks2-grampians" — webosbrew buckets firmware by this
     pub codename: String,
     /// e.g. "4.1.0"
@@ -22,6 +26,7 @@ pub struct Info {
 static INFO: OnceLock<Info> = OnceLock::new();
 static NO_INFO: Info = Info {
     release: String::new(),
+    build: String::new(),
     codename: String::new(),
     api: String::new(),
     name: String::new(),
@@ -34,6 +39,19 @@ static NO_INFO: Info = Info {
 /// [`publish_info`].
 pub fn info() -> &'static Info {
     INFO.get().unwrap_or(&NO_INFO)
+}
+
+/// Whether a set on firmware `major` is offered the Interface resolution setting (and honours the
+/// stored choice at boot): webOS 1-3 only. `major == 0`, the unknown answer, is NOT 1-3. A pure
+/// function of the number so the boot gate and the Settings row share one rule and both test it
+/// without a television.
+pub const fn offers_ui_resolution(major: u32) -> bool {
+    major >= 1 && major <= 3
+}
+
+/// [`offers_ui_resolution`] for this set, from the published [`info`].
+pub fn ui_resolution_offered() -> bool {
+    offers_ui_resolution(info().major)
 }
 
 /// The boot probe's answer. First write wins, like the `OnceLock` it lands in.
@@ -159,6 +177,14 @@ pub fn publish_probe(probe: Probe) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Interface resolution setting is webOS 1-3; unknown (0) and 4+ are not.
+    #[test]
+    fn the_interface_resolution_is_offered_on_webos_1_to_3_only() {
+        for (major, offered) in [(0, false), (1, true), (2, true), (3, true), (4, false), (5, false), (6, false), (22, false)] {
+            assert_eq!(offers_ui_resolution(major), offered, "major {major}");
+        }
+    }
 
     #[test]
     fn the_probe_code_is_two_closed_words() {

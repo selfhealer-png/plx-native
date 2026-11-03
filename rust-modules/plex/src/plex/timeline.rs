@@ -118,6 +118,11 @@ pub struct QueueRow {
     pub title: String,
     /// `grandparentTitle` — the show, empty for a movie
     pub show_title: String,
+    /// `grandparentRatingKey` — the show's key on this server, empty for a movie
+    pub show_rk: String,
+    /// `viewCount > 0` AS THE QUEUE WAS BUILT, i.e. at play start: what the stop record compares
+    /// the server's later answer against to tell a first watch (fan out) from a rewatch.
+    pub watched: bool,
     /// `parentIndex` — season number (0 for a movie)
     pub season: i64,
     pub index: i64,
@@ -140,8 +145,8 @@ pub struct QueueRow {
 impl QueueRow {
     /// Consume a queue `Metadata` row into its lean projection. BY VALUE: the strings are moved,
     /// not cloned, and the rest of the row's tree is dropped as this returns.
-    fn of(m: super::models::Metadata, sid: super::ServerId) -> QueueRow {
-        // `Media[0]` / `Media[0].Part[0]`, the same pick `Metadata::first_part` makes — by value,
+    pub(super) fn of(m: super::models::Metadata, sid: super::ServerId) -> QueueRow {
+        // `Media[0]` / `Media[0].Part[0]`, the default version, `Metadata::media_version(None)` — by value,
         // so the other versions and their Stream lists die here.
         let (vcodec, acodec, part) = match m.media.into_iter().next() {
             Some(md) => (
@@ -162,7 +167,9 @@ impl QueueRow {
             kind: m.kind,
             title: m.title,
             show_title: m.grandparent_title,
-            season: m.parent_index,
+            show_rk: m.grandparent_rating_key,
+            watched: m.view_count > 0,
+            season: m.parent_index.unwrap_or(0),
             index: m.index,
             thumb: m.thumb,
             poster: m.grandparent_thumb,

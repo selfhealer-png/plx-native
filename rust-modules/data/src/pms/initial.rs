@@ -101,6 +101,7 @@ impl Initial {
         -> Result<(super::PmsState, super::PmsAdapter), &'static str> {
         if !self.validate_boot() { return Err("Home initial state contains work or content"); }
         let state = super::PmsState {
+            ledger: Default::default(),
             published: Some(Arc::new(self.catalog.clone())),
             srcs: Vec::new(),
             seen: self.seen,
@@ -111,6 +112,9 @@ impl Initial {
             fanout: Default::default(),
             deck_ask: None,
             hold: (0, super::HOLD_ROWS - 1),
+            staged_gen: 0,
+            publish_memo: None,
+            jobs: Vec::new(),
         };
         let adapter = super::PmsAdapter {
             next_request: AtomicU32::new(self.next_request),
@@ -122,8 +126,8 @@ impl Initial {
     #[cfg(any(test, feature = "test-support"))]
     pub fn capture(state: &PmsState, adapter: &PmsAdapter) -> Self {
         let sources = state.srcs.iter().map(|s| {
-            let Src { sid, client, token_gen, handle, state, fetching, seq, retry_s, retry_n, last, page, deferred: _, abandoned: _, adoptable: _, stalled: _, edits: _ } = s;
-            Source { sid: *sid, client: client.map(|c| c.instance_gen()), token_gen: *token_gen,
+            let Src { sid, key, handle, state, fetching, seq, retry_s, retry_n, last, page, deferred: _, abandoned: _, adoptable: _, stalled: _, ledger: _, stamp: _, staged: _, quiet: _, quiet_owed: _, quiet_after: _, quiet_fails: _, copies: _, deck_read: _ } = s;
+            Source { sid: *sid, client: key.map(|k| k.instance), token_gen: key.map_or(0, |k| k.token),
                 handle: handle.clone(), state: match state { HubState::Loading => 0, HubState::Ready => 1, HubState::Failed => 2 },
                 fetching: *fetching, seq: *seq, retry_bits: retry_s.to_bits(), retry_n: *retry_n, last: last.clone(), page: page.clone() }
         }).collect();
@@ -191,7 +195,13 @@ fn movies(items: &[Arc<PmsMovie>], w: &mut impl Sink) {
 fn movie(m: &PmsMovie, w: &mut impl Sink) {
     let PmsMovie { sid, sec, title, year, rating, dur_ns, part, thumb, still, art, summary, rk,
         vcodec, acodec, blur, has_blur, kind, resume_ms, show_rk, season_index, show_title,
-        ep_index, unwatched, watched, aired, child_count } = m;
+        ep_index, unwatched, watched, aired, child_count, guid, show_guid,
+        // CONTRACT FREEZE: the caption facts are not in the canonical encoding yet, so every
+        // recorded hash stays what it was. P2 decides whether to hash them (which re-records).
+        subtype: _, smart: _, genre: _, video_resolution: _, hdr: _, audience_rating: _,
+        leaf_count: _, viewed_leaf_count: _, added_at: _,
+        // a listing's versions only feed the item menu's row, which the menu captures at open
+        versions: _, edition: _, sort_info: _ } = m;
     w.u32(sid.raw().into()); w.u64(*sec as u64); w.text(title); w.u32(*year as u32);
     w.text(rating); w.u64(*dur_ns as u64);
     for text in [part, thumb, still, art, summary, rk, vcodec, acodec] { w.text(text); }
@@ -199,6 +209,10 @@ fn movie(m: &PmsMovie, w: &mut impl Sink) {
     w.boolean(*has_blur); w.u32(*kind as u32); w.u64(*resume_ms as u64); w.text(show_rk);
     w.u32(*season_index as u32); w.text(show_title); w.u32(*ep_index as u32);
     w.boolean(*unwatched); w.boolean(*watched); w.text(aired); w.u64(*child_count as u64);
+    for id in [guid, show_guid] {
+        w.boolean(id.is_some());
+        for word in id.unwrap_or_default().chunks(4) { w.u32(u32::from_le_bytes([word[0], word[1], word[2], word[3]])); }
+    }
 }
 
 #[cfg(test)]
