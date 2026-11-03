@@ -1366,7 +1366,7 @@ impl LogicalState for RecommendedScreen {
         c.seq(self.shelves.len());
         for row in &self.shelves {
             // `basis` is what the keys were registered from: derived from the publication, not canon.
-            let Row { id, group, heading, elems, landscape, deck: _, cards, basis: _ } = row;
+            let Row { id, group, heading, more: _, elems, landscape, deck: _, cards, basis: _ } = row;
             c.str(id).u32(group.0);
             c.option(*heading, |c, (group, elem)| { c.u32(group.0).u32(elem); });
             c.bool(*landscape).seq(elems.len());
