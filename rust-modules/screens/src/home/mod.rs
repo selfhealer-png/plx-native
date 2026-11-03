@@ -2342,7 +2342,7 @@ impl HomeScreen {
         {
             let hero_up = self.snap.pos < 0.5;
             let focused_row = self.focused_grid(focus).map(|(row, _)| row).filter(|_| !hero_up);
-            for (row_index, row) in self.rows.iter().enumerate() {
+            for row_index in 0..self.rows.len() {
                 // Keep the whole focused row hoverable while vertical reveal is in flight.
                 // Other partially visible rows must not steal focus as they pass the pointer.
                 let row_focused = focused_row == Some(row_index);
