@@ -231,6 +231,10 @@ pub enum MetadataCmd {
     /// already listed (`Stream::same_subtitle`, under a new id) replaces it rather than joining it.
     AppendPlayingSub { sid: ServerId, rk: String, stream: crate::metadata::Stream },
     MarkSkipped(crate::metadata::Marker),
+    /// The failure read-out is up: ask the other sources about the PLAYING item, once per item, so
+    /// *Another copy* can offer a copy of a leaf whose own page never landed here (an episode played
+    /// from its show's page). `metadata::request_alt_for_playing` says when it asks nothing.
+    AltForPlaying,
     RetirePlaying,
     RetirePlayingItem,
     /// Install the copies resolved for `(sid, rk)` by the alt-sources worker — the Also-Available

@@ -162,6 +162,9 @@ pub struct MetadataState {
     /// [`cached_playing`] refuses it for this item until a page read after the playback lands.
     played_since_load: Option<(plx_plex::plex::ServerId, String)>,
     alt: AltStore,
+    /// The played item the *Another copy* lookup was last asked for ([`request_alt_for_playing`]):
+    /// a failure read-out stays up for many frames, and the question is asked once per item.
+    alt_asked: Option<(plx_plex::plex::ServerId, String)>,
     /// The IO this owner has asked the application to start and the application has not yet taken
     /// (`MetadataStore::take_jobs`): one [`crate::stores::StoreJob::Detail`] per accepted detail
     /// request, one [`crate::stores::StoreJob::MetaSeason`] per season switch, one
@@ -2628,6 +2631,9 @@ pub struct PlayingItem {
     /// The played item's own Plex type (`movie` | `episode` | `track` | `clip` | ...), empty when
     /// the server sent none. Read from the same `type` the detail page's [`Detail::kind`] reads.
     pub kind: String,
+    /// The played item's portable Plex guid (`plex://episode/…`, `plex://movie/…`), empty when the server
+    /// sent none: what the failure read-out's *Another copy* asks the other sources about.
+    pub guid: String,
     pub audio: Vec<Stream>,
     pub subs: Vec<Stream>,
     pub video_fps: f64, // the played leaf's video fps (0 = unknown) — feeds the Load esInfo
@@ -2666,6 +2672,7 @@ impl PlayingItem {
             rk: "rk".into(),
             show_rk: String::new(),
             kind: String::new(),
+            guid: String::new(),
             audio: Vec::new(),
             subs,
             video_fps: 0.0,
@@ -2714,6 +2721,7 @@ fn cached_playing(state: &MetadataState, sid: plx_plex::plex::ServerId, rk: &str
             rk: rk.to_string(),
             show_rk: d.show_rk.clone(),
             kind: d.kind.clone(),
+            guid: d.guid.clone(),
             audio: d.audio.clone(),
             subs: d.subs.clone(),
             video_fps: d.video_fps,
@@ -2819,11 +2827,13 @@ fn playing_item_of(
     // direct-play gate tests it against the device bound — see the field doc)
     let (width, height, bitrate) = media.map_or((0, 0, 0), |m| (m.width, m.height, m.bitrate));
     let kind = it.map(|it| it.kind.clone()).unwrap_or_default();
+    let guid = it.map(|it| it.guid.clone()).unwrap_or_default();
     PlayingItem {
         sid,
         rk: rk.to_string(),
         show_rk,
         kind,
+        guid,
         audio,
         subs,
         video_fps,
@@ -4154,6 +4164,7 @@ pub fn run(state: &mut MetadataState, adapter: &std::sync::Arc<MetadataAdapter>,
             mark_skipped(state, m);
             true
         }
+        MetadataCmd::AltForPlaying => request_alt_for_playing(state, adapter),
         MetadataCmd::RetirePlaying => {
             retire_playing(state);
             true
@@ -4635,6 +4646,30 @@ fn request_alt_sources(
     if !spawned {
         refused.alt_done.store(gen, Ordering::SeqCst);
     }
+}
+
+/// MAIN THREAD. **Ask the other sources about the PLAYING item** — the failure read-out's
+/// *Another copy* for a leaf whose page never landed here: an episode played from its show's page
+/// (the store holds the SHOW's copies, if any) or a resume from Continue Watching. The same lookup a
+/// page landing makes ([`request_alt_sources`]), filed under the played `(server, ratingKey)`.
+///
+/// Asked at most once per played item (`alt_asked`), and not at all when nothing is playing, the
+/// item carries no guid, or the store already holds that item's copies (a film played from its own
+/// page). The one store slot is the page's too, so this replaces a show page's list; that page's
+/// read after playback (`DetailRefreshPhase`) lands and asks for its own again.
+fn request_alt_for_playing(state: &mut MetadataState, adapter: &std::sync::Arc<MetadataAdapter>) -> bool {
+    let Some(p) = state.playing.as_ref() else { return false };
+    let key = (p.sid, p.rk.clone());
+    if p.guid.is_empty()
+        || state.alt_asked.as_ref() == Some(&key)
+        || plx_plex::plex::same_item((state.alt.sid, state.alt.rk.as_str()), (p.sid, &p.rk))
+    {
+        return false;
+    }
+    let (sid, rk, guid) = (p.sid, p.rk.clone(), p.guid.clone());
+    state.alt_asked = Some(key);
+    request_alt_sources(state, adapter, sid, &rk, &guid);
+    true
 }
 
 /// WORKER. One `find_by_guid` per source, projected into rows. Pure of app state apart from the
@@ -6740,5 +6775,52 @@ mod alt_runtime_tests {
         for k in ["show", "season", "artist", "album", "collection"] {
             assert!(!has_runtime(k), "{k}");
         }
+    }
+}
+
+#[cfg(test)]
+mod alt_for_playing_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn playing(sid: u16, rk: &str, guid: &str) -> PlayingItem {
+        PlayingItem {
+            sid: plx_plex::plex::ServerId::from_raw(sid),
+            rk: rk.into(),
+            guid: guid.into(),
+            ..PlayingItem::with_subs(Vec::new())
+        }
+    }
+
+    /// **An episode played from its show's page** (the owner's request after 2026-11-03): the store
+    /// holds the SHOW's copies, so the failure read-out asks the other sources about the EPISODE,
+    /// once, however many frames the read-out stays up.
+    #[test]
+    fn a_failed_episode_asks_the_other_sources_about_itself_once() {
+        let adapter = std::sync::Arc::new(MetadataAdapter::default());
+        let mut state = MetadataState::default();
+        alt_install(&mut state, plx_plex::plex::ServerId::from_raw(0), "show-7", Vec::new());
+        state.playing = Some(playing(0, "ep-71", "plex://episode/abc"));
+        let before = adapter.alt_gen.load(Ordering::SeqCst);
+        assert!(request_alt_for_playing(&mut state, &adapter), "the episode is asked about");
+        assert_eq!(adapter.alt_gen.load(Ordering::SeqCst), before + 1, "one lookup went out");
+        assert!(!request_alt_for_playing(&mut state, &adapter), "the next frame asks nothing");
+        assert_eq!(adapter.alt_gen.load(Ordering::SeqCst), before + 1);
+    }
+
+    /// Nothing to ask: nothing playing, a leaf with no guid, or a film whose own page already
+    /// filed its copies under it.
+    #[test]
+    fn no_lookup_without_a_played_guid_or_when_the_copies_are_already_held() {
+        let adapter = std::sync::Arc::new(MetadataAdapter::default());
+        let mut state = MetadataState::default();
+        assert!(!request_alt_for_playing(&mut state, &adapter), "nothing playing");
+        state.playing = Some(playing(0, "9", ""));
+        assert!(!request_alt_for_playing(&mut state, &adapter), "no guid");
+        alt_install(&mut state, plx_plex::plex::ServerId::from_raw(0), "1587404", Vec::new());
+        state.playing = Some(playing(0, "1587404", "plex://movie/xyz"));
+        let before = adapter.alt_gen.load(Ordering::SeqCst);
+        assert!(!request_alt_for_playing(&mut state, &adapter), "its page already asked");
+        assert_eq!(adapter.alt_gen.load(Ordering::SeqCst), before);
     }
 }

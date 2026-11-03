@@ -3026,6 +3026,12 @@ pub(crate) unsafe fn draw(app: &mut App, fr: &mut Frame) -> (i32, i32, i32, i32)
                         // `PlayerScreen::middle_up` withholds the middle for it: no surface takes the
                         // transport's picture any more, so there is no per-frame fact to hand the page.
                         let busy = plx_appkit::player_hud::busy(&app.player.session);
+                        // A failure read-out offers *Another copy* only for a copy the store holds
+                        // for the PLAYED item; ask the other sources about it (once per item, and
+                        // not when the played film's own page already asked).
+                        if matches!(busy, plx_appkit::player_hud::Busy::Readout(plx_ui::widgets::StatusKind::Failed, _)) {
+                            app.bridge.metadata_run(plx_data::stores::metadata::MetadataCmd::AltForPlaying);
+                        }
                         // Both subtitle paths lift clear of the transport for the same reason and
                         // by the same test — an open track menu counts, since that is exactly when
                         // the user is reading the bottom of the screen. The Timing capsule is the
