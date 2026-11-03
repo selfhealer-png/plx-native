@@ -91,6 +91,7 @@
   "browse.login.instructions": "Scansiona il codice con la fotocamera del telefono, oppure collega la TV manualmente usando indirizzo e codice mostrati qui.",
   "browse.search.placeholder": "Cerca nella libreria",
   "browse.search.one_more": "ancora un carattere",
+  "browse.search.press_ok": "Premi OK per scrivere",
   "browse.search.recents": "RICERCHE RECENTI",
   "browse.search.clear": "Cancella ricerche recenti",
   "browse.search.failed": "La ricerca non ha raggiunto il server",

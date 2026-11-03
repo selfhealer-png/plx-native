@@ -91,6 +91,7 @@
   "browse.login.instructions": "Scanne den Code mit der Kamera deines Smartphones oder verknüpfe diesen Fernseher manuell über die hier angezeigte Adresse und den Code.",
   "browse.search.placeholder": "Mediathek durchsuchen",
   "browse.search.one_more": "noch ein Zeichen",
+  "browse.search.press_ok": "Zum Eingeben OK drücken",
   "browse.search.recents": "LETZTE SUCHANFRAGEN",
   "browse.search.clear": "Letzte Suchanfragen löschen",
   "browse.search.failed": "Die Suche hat den Server nicht erreicht",

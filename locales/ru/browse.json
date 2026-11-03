@@ -91,6 +91,7 @@
   "browse.login.instructions": "Отсканируйте код камерой телефона или привяжите телевизор вручную, используя указанные здесь адрес и код.",
   "browse.search.placeholder": "Поиск в медиатеке",
   "browse.search.one_more": "ещё один символ",
+  "browse.search.press_ok": "Нажмите OK, чтобы ввести",
   "browse.search.recents": "НЕДАВНИЕ ЗАПРОСЫ",
   "browse.search.clear": "Очистить историю поиска",
   "browse.search.failed": "Не удалось выполнить поиск на сервере",

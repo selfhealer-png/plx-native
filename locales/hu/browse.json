@@ -91,6 +91,7 @@
   "browse.login.instructions": "Olvassa be a kódot a telefonja kamerájával, vagy párosítsa a TV-t kézzel az itt látható címmel és kóddal.",
   "browse.search.placeholder": "Keresés a könyvtárban",
   "browse.search.one_more": "még egy karakter",
+  "browse.search.press_ok": "Gépeléshez nyomja meg az OK gombot",
   "browse.search.recents": "LEGUTÓBBI KERESÉSEK",
   "browse.search.clear": "Legutóbbi keresések törlése",
   "browse.search.failed": "A keresés nem érte el a szervert",
