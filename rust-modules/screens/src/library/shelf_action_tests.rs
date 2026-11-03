@@ -162,16 +162,17 @@ fn shelf_activate_and_hold_keep_the_deck_promise_and_engine_item_identity() {
     }
 }
 
-/// #205: a promoted collection shelf keeps its member cards and gains a linked heading — UP from a
-/// card reaches it, LEFT/RIGHT are inert, DOWN returns to that card, OK opens the collection, and
-/// the heading is a hover-focus pointer stop. Every other shelf keeps its plain heading.
+/// Fork-only (upstream rejected a SEE ALL tile, #205): a promoted collection shelf keeps its member
+/// cards and ends in a MORE card, an ordinary card of its row, instead of a linked heading stop.
+/// DOWN and UP go shelf to shelf, RIGHT along the row reaches MORE, OK on it opens the collection,
+/// it names no item, and it is a pointer stop like any card. Every other shelf has no MORE card.
 #[test]
-fn a_collection_shelf_heading_is_a_linked_focus_stop_that_opens_the_collection() {
+fn a_collection_shelf_ends_in_a_more_card_that_opens_the_collection() {
     use plx_ui::focus::Outcome;
-    use plx_ui::screen::{DrawFrame, Hover};
+    use plx_ui::screen::DrawFrame;
     let _guard = plx_base::testlock::serial();
-    let session = plx_plex::plex::session::TempSession::new("library-linked-heading");
-    session.watching("u-library-linked-heading");
+    let session = plx_plex::plex::session::TempSession::new("library-more-card");
+    session.watching("u-library-more-card");
     let stores = plx_data::stores::Stores::default();
     stores.browse.borrow_mut().seed_two_source_table_for_test();
     let mut directory = plx_data::stores::browse::DirectorySnapshot::default();
@@ -183,6 +184,7 @@ fn a_collection_shelf_heading_is_a_linked_focus_stop_that_opens_the_collection()
         browse.seed_named_shelves_for_test(0, &[
             ("movie.recentlyadded.1", "/hubs/sections/1/recentlyAdded", "Recently Added"),
             ("custom.collection.1.50001.50001", "/library/collections/50001/children", "Toy Story Collection"),
+            ("movie.recentlyviewed.1", "/hubs/sections/1/recentlyViewed", "Recently Viewed"),
         ], 5);
     }
     let publication = stores.capture_browse(&mut directory);
@@ -201,53 +203,53 @@ fn a_collection_shelf_heading_is_a_linked_focus_stop_that_opens_the_collection()
     };
     let mut page = RecommendedScreen::new(entry, InstanceId(21), SecKind::Movie);
     page.sync(&cx(&engine));
-    assert_eq!(page.shelves.len(), 2);
-    assert!(page.shelves[0].heading.is_none(), "an ordinary shelf has no linked heading");
-    let (heading_group, heading) = page.shelves[1].heading.expect("the collection shelf is linked");
-    assert_eq!(page.shelves[1].elems.len(), 5, "members stay ordinary cards, no extra tile");
+    assert_eq!(page.shelves.len(), 3);
+    assert!(page.shelves.iter().all(|row| row.heading.is_none()), "no linked heading stop on any shelf");
+    assert!(page.shelves[0].more.is_none() && page.shelves[2].more.is_none(), "an ordinary shelf has no MORE card");
+    let more = page.shelves[1].more.expect("the collection shelf ends in MORE");
+    assert_eq!(page.shelves[1].elems.len(), 6, "five members, then MORE");
+    assert_eq!(page.shelves[1].elems.last(), Some(&more));
     assert_eq!(page.shelves[1].id, "custom.collection.1.50001.50001",
         "the shelf keeps its hub identity for page memory");
+    assert_eq!(Focusable::<TestHost>::group_of(&page, &more, &cx(&engine)), Some(page.shelves[1].group),
+        "MORE is a card of its own row");
+    assert!(page.focused_item(Some(page.key(more)), &cx(&engine)).is_none(), "MORE names no item");
 
     let mut links = Vec::new();
     Screen::<TestHost>::links(&page, &mut links);
-    let card = page.key(page.shelves[1].elems[3]);
-    engine.set(owner, card, Some(page.shelves[1].group), By::Restore);
     let step = |engine: &mut FocusEngine<u32>, dir| engine.move_dir(owner, &page, &links, dir, &cx(engine));
-    let Outcome::Moved { to, .. } = step(&mut engine, Dir::Up) else { panic!("UP must reach the heading") };
-    assert_eq!(to, page.key(heading));
-    assert_eq!(Focusable::<TestHost>::group_of(&page, &heading, &cx(&engine)), Some(heading_group));
-    assert_eq!(step(&mut engine, Dir::Left), Outcome::Nothing);
-    assert_eq!(step(&mut engine, Dir::Right), Outcome::Nothing);
-    let Outcome::Moved { to, .. } = step(&mut engine, Dir::Down) else { panic!("DOWN must return") };
-    assert_eq!(to, card, "DOWN restores the remembered card");
-
-    // Down from the shelf above stops on the heading first.
+    // DOWN from the shelf above enters the collection's cards; UP from the shelf below does too.
     engine.set(owner, page.key(page.shelves[0].elems[1]), Some(page.shelves[0].group), By::Restore);
     let Outcome::Moved { to, .. } = step(&mut engine, Dir::Down) else { panic!("DOWN must move") };
-    assert_eq!(to, page.key(heading));
+    assert!(page.shelves[1].elems.contains(&to.elem), "DOWN lands on the collection's cards");
+    engine.set(owner, page.key(page.shelves[2].elems[0]), Some(page.shelves[2].group), By::Restore);
+    let Outcome::Moved { to, .. } = step(&mut engine, Dir::Up) else { panic!("UP must move") };
+    assert!(page.shelves[1].elems.contains(&to.elem), "UP lands on the collection's cards");
+    // RIGHT from the last member reaches MORE.
+    engine.set(owner, page.key(page.shelves[1].elems[4]), Some(page.shelves[1].group), By::Restore);
+    let Outcome::Moved { to, .. } = step(&mut engine, Dir::Right) else { panic!("RIGHT must reach MORE") };
+    assert_eq!(to, page.key(more));
 
     // OK opens the collection page.
-    engine.set(owner, page.key(heading), Some(heading_group), By::Restore);
     let mut out = Vec::new();
     let mut present = plx_machine::present::Present::new();
-    let handled = page.step(&ScreenEvent::Activate(heading), &cx(&engine),
+    let handled = page.step(&ScreenEvent::Activate(more), &cx(&engine),
         &mut Effects::new(&mut out, MachineId::Instance(InstanceId(21)), &mut present));
     assert_eq!(handled, Handled::Yes);
     let pushed: Vec<_> = out.into_iter().filter_map(|effect| match effect.fx {
         Fx::App(AppFx::Content(crate::registry::ContentReq::Push(arg))) => Some(arg),
-        Fx::App(AppFx::Library(req)) => panic!("the heading must not emit {req:?}"),
+        Fx::App(AppFx::Library(req)) => panic!("MORE must not emit {req:?}"),
         _ => None,
     }).collect();
     assert_eq!(pushed.len(), 1);
     assert!(matches!(&pushed[0], crate::registry::ContentArg::Collection(id)
         if id.rk == "50001" && id.sec == 1 && id.tag == 0 && id.name == "Toy Story Collection"));
 
-    // Pointer: the heading registers a hover-focus stop on its drawn face.
+    // Pointer: MORE registers a stop like the cards beside it.
     page.relayout(engine.current(owner));
     let context = cx(&engine);
     let mut frame = DrawFrame::new(&context, plx_ui::Painter::root());
     page.record_stops(&mut frame);
     let stops = frame.into_stops();
-    let stop = stops.iter().find(|stop| stop.key.elem == heading).expect("heading stop");
-    assert_eq!(stop.hover, Hover::Focus);
+    assert!(stops.iter().any(|stop| stop.key.elem == more), "MORE registers a stop");
 }

@@ -81,9 +81,13 @@ pub(super) struct Row {
     pub(super) id: String,
     pub(super) group: GroupId,
     /// A promoted collection hub's linked heading (`ui::linked_heading`): its one-element group
-    /// and element, registered by the hub's identity like the row's own group. `None` for every
-    /// other hub, which keeps its plain heading.
+    /// and element. **Always `None` in the fork**, whose collection row ends in a MORE card
+    /// ([`Row::more`]) instead; kept so the page's canon keeps its recorded shape.
     pub(super) heading: Option<(GroupId, u32)>,
+    /// A promoted collection hub's trailing MORE card (fork-only; upstream rejected a SEE ALL
+    /// tile, #205): the LAST of `elems`, registered by the hub's identity in the row's own group,
+    /// and opening the collection. `None` for every other hub.
+    pub(super) more: Option<u32>,
     pub(super) elems: Vec<u32>,
     pub(super) landscape: bool,
     /// The Continue Watching deck of poster cards: its band follows
@@ -504,13 +508,17 @@ impl RecommendedScreen {
         let group = self.seat_group(section, shelf, index);
         // A row the store gave its cards up to is its card count in placeholder slots, so it
         // keeps its length, its scroll and its focusability.
-        let elems = (0..shelf.slots()).map(|col| {
+        let mut elems: Vec<u32> = (0..shelf.slots()).map(|col| {
             let identity = match shelf.items.get(col).filter(|item| !item.rk.is_empty()) {
                 Some(item) => LibraryIdentity::Shelf { section: section.clone(), hub: shelf.id.clone(), sid: item.sid, rk: item.rk.clone() },
                 None => LibraryIdentity::ShelfSlot { section: section.clone(), hub: shelf.id.clone(), publication: query, slot: col as u32 },
             };
             self.keys.register(identity, group, col)
         }).collect();
+        // A collection row ends in a MORE card that opens the whole collection: the heading above
+        // it is plain text, so DOWN goes shelf to shelf. It follows the row's last slot.
+        let more = self.seat_more(section, shelf, group);
+        elems.extend(more);
         let cards = cards.unwrap_or_else(|| {
             let mut cards = hub_cards(self.entry, shelf.landscape);
             let saved = self.viewports.iter().find(|view| Some(view.epoch) == epoch && view.section == *section)
@@ -518,15 +526,14 @@ impl RecommendedScreen {
             if let Some((_, x)) = saved { cards.restore_scroll(*x, shelf.slots()); }
             cards
         });
-        let heading = self.seat_heading(section, shelf, index);
-        Row { id: shelf.id.clone(), group, heading, elems, landscape: shelf.landscape, deck: shelf.is_continue && !shelf.landscape, cards, basis: Basis::of(shelf, query) }
+        Row { id: shelf.id.clone(), group, heading: None, more, elems, landscape: shelf.landscape, deck: shelf.is_continue && !shelf.landscape, cards, basis: Basis::of(shelf, query) }
     }
 
-    /// A kept row that stands at another index now: its group and heading keys remember the index
+    /// A kept row that stands at another index now: its group and MORE keys remember the index
     /// (`KeyRegistry::last_place`), and nothing else about it moved.
     fn reseat_row(&mut self, row: &mut Row, section: &LibrarySectionIdentity, shelf: &HubShelf, index: usize) {
         row.group = self.seat_group(section, shelf, index);
-        row.heading = self.seat_heading(section, shelf, index);
+        row.more = self.seat_more(section, shelf, row.group);
     }
 
     fn seat_group(&mut self, section: &LibrarySectionIdentity, shelf: &HubShelf, index: usize) -> GroupId {
@@ -535,13 +542,12 @@ impl RecommendedScreen {
             GroupId(0), index))
     }
 
-    fn seat_heading(&mut self, section: &LibrarySectionIdentity, shelf: &HubShelf, index: usize) -> Option<(GroupId, u32)> {
+    /// A collection row's MORE card: registered by the hub's identity in the row's own group, at
+    /// the column after its last slot. `None` for a hub with no collection to open.
+    fn seat_more(&mut self, section: &LibrarySectionIdentity, shelf: &HubShelf, group: GroupId) -> Option<u32> {
         shelf.link.as_ref().map(|_| {
-            let control = |kind: &str| LibraryIdentity::Control {
-                section: section.clone(), kind: kind.into(), key: shelf.id.clone() };
-            let group = GroupId(self.keys.register(control("shelf-heading-group"), GroupId(0), index));
-            let elem = self.keys.register(control("shelf-heading"), group, 0);
-            (group, elem)
+            self.keys.register(LibraryIdentity::Control {
+                section: section.clone(), kind: "shelf-more".into(), key: shelf.id.clone() }, group, shelf.slots())
         })
     }
 
@@ -861,8 +867,9 @@ impl RecommendedScreen {
             fx.push(Fx::App(AppFx::Content(ContentReq::Back)));
             return Handled::Yes;
         }
-        if let Some(index) = self.shelves.iter().position(|row| row.heading_elem() == Some(elem)) {
-            // OK on a linked heading opens the collection its row lists.
+        if let Some(index) = self.shelves.iter().position(|row| row.more == Some(elem) || row.heading_elem() == Some(elem)) {
+            // OK on a collection row's MORE card opens the collection its row lists. BACK from
+            // that page returns here: the card is an ordinary engine key the return state restores.
             if let Some(link) = H::section_hubs(cx).shelves().get(index).and_then(|shelf| shelf.link.as_ref()) {
                 fx.push(Fx::App(AppFx::Content(ContentReq::Push(ContentArg::Collection(link.clone())))));
             }
@@ -1387,7 +1394,33 @@ pub(super) struct HubSrc<'a> {
 }
 
 impl HubSrc<'_> {
-    fn item(&self, i: usize) -> Option<&plx_data::pms::PmsMovie> { self.shelf?.items.get(i) }
+    fn item(&self, i: usize) -> Option<&plx_data::pms::PmsMovie> {
+        if self.is_more(i) { return None; }
+        self.shelf?.items.get(i)
+    }
+
+    /// Card `i` is a collection row's trailing MORE card, the column after its last slot
+    /// (`RecommendedScreen::seat_more`).
+    fn is_more(&self, i: usize) -> bool {
+        self.shelf.is_some_and(|shelf| shelf.link.is_some() && i == shelf.slots() && i + 1 == self.elems.len())
+    }
+
+    /// The row ends in a MORE card, which IS its way to the rest of the collection: it pages no
+    /// further window in after it.
+    fn ends_in_more(&self) -> bool {
+        self.elems.len().checked_sub(1).is_some_and(|last| self.is_more(last))
+    }
+}
+
+/// The MORE card's face: the neutral collection tile under the shared MORE mark, carrying the
+/// collection's member count where the hub states one.
+fn more_facts(total: usize) -> plx_ui::tile::TileFacts<'static> {
+    plx_ui::tile::TileFacts {
+        kind: plx_ui::tile::TileKind::Collection,
+        title: plx_platform::i18n::msg::browse_action_more(),
+        child_count: total as i64,
+        ..plx_ui::tile::TileFacts::default()
+    }
 }
 
 impl<H: plx_machine::machine::Host<Elem = u32>> CardSource<H> for HubSrc<'_> {
@@ -1399,12 +1432,16 @@ impl<H: plx_machine::machine::Host<Elem = u32>> CardSource<H> for HubSrc<'_> {
     fn elem(&self, i: usize) -> u32 { self.elems.get(i).copied().unwrap_or(0) }
     fn index_of(&self, e: &u32) -> Option<usize> { self.elems.iter().position(|elem| elem == e) }
     /// A card whose item the hub has not published draws nothing (its stop still registers).
-    fn loaded(&self, i: usize) -> bool { self.item(i).is_some() }
-    fn more(&self) -> bool { self.paging && self.shelf.is_some_and(|shelf| shelf.more) }
+    fn loaded(&self, i: usize) -> bool { self.is_more(i) || self.item(i).is_some() }
+    fn more(&self) -> bool { self.paging && !self.ends_in_more() && self.shelf.is_some_and(|shelf| shelf.more) }
     fn page_epoch(&self) -> u32 { self.shelf.map_or(0, |shelf| shelf.epoch) }
-    fn more_after(&self) -> bool { self.shelf.is_some_and(|shelf| shelf.more) }
+    fn more_after(&self) -> bool { !self.ends_in_more() && self.shelf.is_some_and(|shelf| shelf.more) }
     fn more_before(&self) -> bool { self.shelf.is_some_and(|shelf| shelf.offset > 0) }
     fn art(&self, i: usize) -> Art<'_> {
+        if self.is_more(i) {
+            let facts = more_facts(self.shelf.map_or(0, |shelf| shelf.total));
+            return if self.shelf.is_some_and(|shelf| shelf.landscape) { Art::Still(Some(facts)) } else { Art::Poster(Some(facts)) };
+        }
         match (self.item(i), self.shelf) {
             (Some(item), Some(shelf)) if shelf.landscape => Art::Still(Some(tile_facts::of(item))),
             (Some(item), _) => Art::Poster(Some(tile_facts::of(item))),
