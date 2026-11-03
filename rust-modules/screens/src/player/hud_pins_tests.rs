@@ -462,7 +462,7 @@ impl Chaptered {
                 sid: plx_plex::plex::ServerId::from_raw(0),
                 rk: "rk".into(),
                 show_rk: String::new(),
-                kind: String::new(),
+                kind: String::new(), guid: String::new(),
                 audio: Vec::new(),
                 subs: Vec::new(),
                 video_fps: 0.0,
